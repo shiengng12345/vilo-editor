@@ -1,0 +1,477 @@
+name: Vilo P0 native toolchain probe
+"on":
+  workflow_dispatch: {}
+permissions: {}
+concurrency:
+  group: vilo-p0-native-toolchain
+  cancel-in-progress: false
+jobs:
+  native_toolchain:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - name: Bounded existing-toolchain native probe
+        shell: bash --noprofile --norc -euo pipefail {0}
+        run: |
+          env -i \
+            PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+            HOME="${HOME}" RUNNER_TEMP="${RUNNER_TEMP}" PROBE_RUSTUP_HOME="${RUSTUP_HOME-}" \
+            GITHUB_REPOSITORY="${GITHUB_REPOSITORY}" GITHUB_SHA="${GITHUB_SHA}" \
+            GITHUB_RUN_ID="${GITHUB_RUN_ID}" GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT}" \
+            GITHUB_WORKFLOW_REF="${GITHUB_WORKFLOW_REF}" GITHUB_WORKFLOW_SHA="${GITHUB_WORKFLOW_SHA}" \
+            RUNNER_OS="${RUNNER_OS}" RUNNER_ARCH="${RUNNER_ARCH}" \
+            ImageOS="${ImageOS-}" ImageVersion="${ImageVersion-}" \
+            PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+            python3 - <<'VILO_P0_PY'
+          """Draft-only stdlib probe; embedding this source does not authorize a CI run."""
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import resource
+          import selectors
+          import shutil
+          import signal
+          import stat
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          
+          BASELINE_SHA = "8dd255c3eafb5231056fe4e6f601cedd011f1c93"
+          PINNED_VERSION = "1.98.1"
+          PINNED_HOST = "aarch64-apple-darwin"
+          JOB_SECONDS = 180
+          COMMAND_SECONDS = 30
+          EXEC_SECONDS = 5
+          SAMPLE_SECONDS = 0.250
+          RSS_BYTES = 512 * 1024 * 1024
+          ARTIFACT_BYTES = 16 * 1024 * 1024
+          CAPTURE_BYTES = 20 * 1024
+          CONTROL_CAPTURE_BYTES = 4 * 1024
+          REPORT_BYTES = 8 * 1024
+          MIN_FREE_BYTES = 30 * 1024 ** 3
+          RUST_SOURCE = 'fn main() { let n = std::env::args().nth(1).expect("nonce"); println!("vilo_p0_native:{}", n); }\n'
+          
+          
+          class ProbeError(Exception):
+              pass
+          
+          
+          def require_installed(name, installed):
+              if name not in installed:
+                  raise ProbeError("precondition_missing_pinned_toolchain")
+              return name
+          
+          
+          class Probe:
+              def __init__(self):
+                  self.started = time.monotonic()
+                  self.started_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                  self.root = None
+                  self.base = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+                  self.original_home = Path(os.environ["HOME"]).resolve(strict=True)
+                  configured = os.environ.get("PROBE_RUSTUP_HOME", "")
+                  self.rustup_home = Path(configured or self.original_home / ".rustup").resolve()
+                  self.captured = 0
+                  self.command_captured = 0
+                  self.sampler_captured = 0
+                  self.control_captured = 0
+                  self.children = []
+                  self.groups = []
+                  self.records = []
+                  self.receipts = {}
+                  self.peak = None
+                  self.sample_count = 0
+                  self.artifact_entries_disappeared = 0
+                  self.external_signal_uncertain = False
+                  self.report = {
+                      "kind": "vilo_p0_native_toolchain", "baseline_sha": BASELINE_SHA,
+                      "probe_result": "UNKNOWN", "heavy_build_admitted": False,
+                      "process_boundary_validated": False, "vm_destruction_observed": False,
+                      "cleanup": "UNKNOWN", "resource_sample_scope": "controller and observed owned PGIDs only; detached descendants unvalidated",
+                      "not_validated": ["full Rust build/resources", "V02", "V09", "V37/B02", "GUI/Metal device", "VM destruction", "Phase 0"],
+                  }
+          
+              def env(self, toolchain=False):
+                  env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C",
+                         "HOME": str(self.root / "home"), "TMPDIR": str(self.root / "tmp"),
+                         "CARGO_HOME": str(self.root / "cargo"), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1"}
+                  if toolchain:
+                      env.update(RUSTUP_HOME=str(self.rustup_home))
+                  return env
+          
+              def count(self, data, control=False, sampler=False):
+                  if control:
+                      self.control_captured += len(data)
+                      if self.control_captured > CONTROL_CAPTURE_BYTES:
+                          raise ProbeError("control_output_budget")
+                      return
+                  self.captured += len(data)
+                  if sampler:
+                      self.sampler_captured += len(data)
+                  else:
+                      self.command_captured += len(data)
+                  if self.captured > CAPTURE_BYTES:
+                      raise ProbeError("sampler_output_budget" if sampler else "command_output_budget")
+          
+              def meta(self, argv, control=False, sampler=False):
+                  """Small fixed OS metadata only; never a shell, installer or credential command."""
+                  child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, env=self.env(), cwd=self.root,
+                                           start_new_session=True, close_fds=True)
+                  try:
+                      out, err = child.communicate(timeout=1)
+                      self.count(out + err, control=control, sampler=sampler)
+                      if len(out) + len(err) > 4096:
+                          raise ProbeError("metadata_output_budget")
+                      return child.returncode, out.decode("ascii", "strict").strip()
+                  except subprocess.TimeoutExpired:
+                      child.kill()
+                      child.communicate(timeout=1)
+                      raise ProbeError("metadata_timeout")
+                  finally:
+                      if child.poll() is None:
+                          child.kill()
+                          child.wait(timeout=1)
+          
+              def identity(self, pid):
+                  code, value = self.meta(["/bin/ps", "-p", str(pid), "-o", "pid=", "-o", "uid=", "-o", "lstart="], control=True)
+                  pieces = value.split()
+                  if code or len(pieces) < 7 or pieces[:2] != [str(pid), str(os.getuid())]:
+                      raise ProbeError("process_identity_unknown")
+                  return " ".join(pieces)
+          
+              def members(self, pgid, control=False):
+                  code, value = self.meta(["/usr/bin/pgrep", "-g", str(pgid)], control=control, sampler=not control)
+                  if code == 1 and not value:
+                      return []
+                  if code or not re.fullmatch(r"[0-9\s]+", value) or len(value.split()) > 16:
+                      raise ProbeError("process_group_unknown")
+                  return [int(x) for x in value.split()]
+          
+              def sample(self):
+                  if time.monotonic() - self.started > JOB_SECONDS:
+                      raise ProbeError("outer_deadline")
+                  if shutil.disk_usage(self.base).free < MIN_FREE_BYTES:
+                      raise ProbeError("disk_stop_line")
+                  code, pressure = self.meta(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"], sampler=True)
+                  if code or not pressure.isdigit():
+                      raise ProbeError("memory_pressure_unknown")
+                  if int(pressure) >= 4:
+                      raise ProbeError("critical_memory_pressure")
+                  pids = set()
+                  for child, _, _ in self.children:
+                      if child.poll() is None:
+                          pids.update(self.members(child.pid))
+                  rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                  if pids:
+                      code, values = self.meta(["/bin/ps", "-p", ",".join(map(str, sorted(pids))), "-o", "uid=", "-o", "rss="], sampler=True)
+                      rows = [line.split() for line in values.splitlines()]
+                      if code or any(len(row) != 2 or row[0] != str(os.getuid()) or not row[1].isdigit() for row in rows):
+                          raise ProbeError("rss_observation_unknown")
+                      rss += sum(int(row[1]) * 1024 for row in rows)
+                  self.peak = max(self.peak or 0, rss)
+                  self.sample_count += 1
+                  if rss > RSS_BYTES:
+                      raise ProbeError("observed_rss_budget")
+                  size, count = 0, 0
+                  for directory, folders, files in os.walk(self.root, followlinks=False):
+                      for name in folders + files:
+                          path = Path(directory) / name
+                          try:
+                              info = path.lstat()
+                          except FileNotFoundError:
+                              self.artifact_entries_disappeared += 1
+                              continue
+                          count += 1
+                          if stat.S_ISLNK(info.st_mode) or count > 128:
+                              raise ProbeError("artifact_layout_unknown")
+                          if stat.S_ISREG(info.st_mode):
+                              size += info.st_size
+                  if size > ARTIFACT_BYTES:
+                      raise ProbeError("artifact_budget")
+          
+              def spawn(self, argv, label, env=None):
+                  child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, cwd=self.root, env=env or self.env(),
+                                           start_new_session=True, close_fds=True)
+                  self.groups.append(child.pid)
+                  self.children.append((child, None, label))
+                  receipt = {"label": label, "pid": child.pid, "uid": os.getuid(), "birth_identity": None,
+                             "signals": [], "reaped_direct_child": False}
+                  self.records.append(receipt)
+                  self.receipts[child] = receipt
+                  identity = self.identity(child.pid)
+                  self.children[-1] = (child, identity, label)
+                  receipt["birth_identity"] = identity
+                  return child, identity
+          
+              def stop(self, child, identity, label):
+                  actions = []
+                  if child.poll() is None:
+                      if identity is None or self.identity(child.pid) != identity:
+                          raise ProbeError("refuse_signal_identity_unknown")
+                      child.send_signal(signal.SIGTERM)
+                      actions.append("TERM")
+                      self.receipts[child]["signals"].append("TERM")
+                      try:
+                          child.wait(timeout=0.25)
+                      except subprocess.TimeoutExpired:
+                          if self.identity(child.pid) != identity:
+                              raise ProbeError("refuse_kill_identity_changed")
+                          child.kill()
+                          actions.append("KILL")
+                          self.receipts[child]["signals"].append("KILL")
+                          child.wait(timeout=1)
+                  else:
+                      child.wait(timeout=1)
+                  if child in self.receipts:
+                      self.receipts[child]["reaped_direct_child"] = child.returncode is not None
+                  return actions
+          
+              def run(self, argv, label, seconds=COMMAND_SECONDS, env=None, expect_timeout=False, wait_ready=False, failure_code=None):
+                  child, identity = self.spawn(argv, label, env)
+                  sel = selectors.DefaultSelector()
+                  buffers = [bytearray(), bytearray()]
+                  start = time.monotonic()
+                  ready_at = None if wait_ready else start
+                  timed_out, actions = False, []
+                  for i, pipe in enumerate([child.stdout, child.stderr]):
+                      os.set_blocking(pipe.fileno(), False)
+                      sel.register(pipe, selectors.EVENT_READ, i)
+                  try:
+                      while sel.get_map():
+                          now = time.monotonic()
+                          if ready_at is None:
+                              if now - start >= EXEC_SECONDS:
+                                  raise ProbeError("negative_ready_startup_timeout")
+                              remaining = EXEC_SECONDS - (now - start)
+                          else:
+                              remaining = seconds - (now - ready_at)
+                          if remaining <= 0:
+                              timed_out = True
+                              actions = self.stop(child, identity, label)
+                              break
+                          self.sample()
+                          for key, _ in sel.select(min(SAMPLE_SECONDS, remaining)):
+                              chunk = os.read(key.fileobj.fileno(), min(4096, max(1, CAPTURE_BYTES - self.captured + 1)))
+                              if not chunk:
+                                  sel.unregister(key.fileobj)
+                              else:
+                                  self.count(chunk)
+                                  buffers[key.data].extend(chunk)
+                                  if wait_ready and ready_at is None and key.data == 0 and b"\n" in buffers[0]:
+                                      if bytes(buffers[0]) != b"READY\n":
+                                          raise ProbeError("negative_ready_invalid")
+                                      ready_at = time.monotonic()
+                      if child.poll() is None:
+                          child.wait(timeout=max(0.01, (EXEC_SECONDS if ready_at is None else seconds) - (time.monotonic() - (start if ready_at is None else ready_at))))
+                      if timed_out != expect_timeout:
+                          raise ProbeError("unexpected_timeout_result")
+                      if not timed_out and child.returncode != 0:
+                          raise ProbeError(failure_code or "command_nonzero_" + label)
+                      return bytes(buffers[0]), actions
+                  except subprocess.TimeoutExpired:
+                      raise ProbeError("process_exit_timeout")
+                  finally:
+                      first_error_line = bytes(buffers[1]).splitlines()[:1]
+                      excerpt = re.sub(r"[^\x20-\x7e]", "?", first_error_line[0][:160].decode("ascii", "replace")) if first_error_line else ""
+                      self.receipts[child].update(exit_code=child.returncode, timed_out=timed_out,
+                                                 elapsed_seconds=round(time.monotonic() - start, 3),
+                                                 stdout_bytes=len(buffers[0]), stderr_bytes=len(buffers[1]))
+                      if excerpt:
+                          self.receipts[child]["stderr_first_line"] = excerpt
+                      if child.returncode not in (0, None) and not expect_timeout:
+                          self.receipts[child]["stderr_sha256"] = hashlib.sha256(buffers[1]).hexdigest()
+                      if wait_ready:
+                          self.receipts[child].update(ready_observed=ready_at is not None,
+                                                     ready_wait_seconds=None if ready_at is None else round(ready_at - start, 3))
+                      sel.close()
+                      child.stdout.close()
+                      child.stderr.close()
+                      self.stop(child, identity, label + "_finally")
+          
+              def setup(self):
+                  if sys.platform != "darwin" or os.uname().machine != "arm64":
+                      raise ProbeError("runner_platform_mismatch")
+                  self.root = Path(tempfile.mkdtemp(prefix="vilo-p0-native-", dir=self.base))
+                  for name in ["home", "tmp", "cargo"]:
+                      (self.root / name).mkdir(mode=0o700)
+                  self.sample()
+          
+              def execute(self):
+                  source = {key: os.environ.get(key, "")[:256] for key in ["GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW_SHA", "RUNNER_OS", "RUNNER_ARCH", "ImageOS", "ImageVersion"]}
+                  if source["GITHUB_REPOSITORY"] != "shiengng12345/vilo-editor":
+                      raise ProbeError("repository_mismatch")
+                  self.report["source"] = source
+                  self.report["versions"] = {}
+                  os_version, _ = self.run(["/usr/bin/sw_vers", "-productVersion"], "os_version")
+                  self.report["versions"]["macos_version"] = os_version.decode("ascii").strip()[:32]
+                  os_build, _ = self.run(["/usr/bin/sw_vers", "-buildVersion"], "os_build")
+                  self.report["versions"]["macos_build"] = os_build.decode("ascii").strip()[:32]
+                  xcode, _ = self.run(["/usr/bin/xcodebuild", "-version"], "xcode_version")
+                  self.report["versions"]["xcode"] = xcode.decode("ascii").strip()[:128]
+                  sdk, _ = self.run(["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-version"], "sdk_version")
+                  self.report["versions"]["sdk"] = sdk.decode("ascii").strip()[:32]
+                  rustup = self.original_home / ".cargo/bin/rustup"
+                  if not rustup.is_file():
+                      raise ProbeError("precondition_missing_rustup")
+                  installed, _ = self.run([str(rustup), "toolchain", "list"], "rustup_installed", env=self.env(toolchain=True))
+                  names = {line.split()[0] for line in installed.decode("ascii").splitlines() if line.split()}
+                  self.report["installed_toolchains"] = [name[:64] for name in sorted(names)[:8]]
+                  self.report["installed_toolchains_total"] = len(names)
+                  self.report["installed_toolchains_truncated"] = len(names) > 8 or any(len(name) > 64 for name in names)
+                  absent = "0.0.0-vilo-p0-does-not-exist"
+                  try:
+                      require_installed(absent, names)
+                  except ProbeError as error:
+                      if str(error) != "precondition_missing_pinned_toolchain":
+                          raise
+                      self.report["uninstalled_version_refused_without_invocation"] = True
+                  else:
+                      raise ProbeError("negative_version_not_absent")
+                  selected = PINNED_VERSION + "-" + PINNED_HOST
+                  require_installed(selected, names)
+                  rustc_path, _ = self.run([str(rustup), "which", "--toolchain", selected, "rustc"], "rustc_resolve", env=self.env(toolchain=True))
+                  rustc = Path(rustc_path.decode("ascii").strip()).resolve(strict=True)
+                  expected = self.rustup_home / "toolchains" / selected / "bin/rustc"
+                  if rustc != expected.resolve(strict=True) or not rustc.is_file():
+                      raise ProbeError("rustc_path_mismatch")
+                  rust_version, _ = self.run([str(rustc), "-vV"], "rustc_version")
+                  versions = dict(line.split(": ", 1) for line in rust_version.decode("ascii").splitlines() if ": " in line)
+                  if versions.get("release") != PINNED_VERSION or versions.get("host") != PINNED_HOST:
+                      raise ProbeError("rustc_version_mismatch")
+                  self.report["versions"].update(rust_release=versions["release"], host=versions["host"])
+                  metal, _ = self.run(["/usr/bin/xcrun", "--find", "metal"], "metal_find", failure_code="precondition_missing_metal")
+                  discovered = metal.decode("utf-8", "replace").strip()
+                  self.report["metal_discovered_path"] = discovered[:160]
+                  self.report["metal_path_sha256"] = hashlib.sha256(metal).hexdigest()
+                  try:
+                      metal_path = Path(discovered)
+                      if not metal_path.is_absolute() or len(metal) > 1024 or "\n" in discovered or "\x00" in discovered:
+                          raise ProbeError("precondition_missing_metal")
+                      metal_path = metal_path.resolve(strict=True)
+                      if not metal_path.is_file() or not os.access(metal_path, os.X_OK):
+                          raise ProbeError("precondition_missing_metal")
+                  except (OSError, ValueError):
+                      raise ProbeError("precondition_missing_metal")
+                  self.report["metal_resolved_path"] = str(metal_path)[:160]
+                  metal_version, _ = self.run([str(metal_path), "--version"], "metal_version", failure_code="precondition_missing_metal")
+                  self.report["versions"]["metal"] = [line[:128] for line in metal_version.decode("ascii", "replace").strip().splitlines()[:2]]
+                  fixture = self.root / "fixture.rs"
+                  fixture.write_text(RUST_SOURCE, encoding="ascii")
+                  binary = self.root / "fixture"
+                  self.run([str(rustc), "--edition=2024", "--crate-type=bin", str(fixture), "-o", str(binary)], "tiny_rustc_compile")
+                  nonce = os.urandom(8).hex()
+                  actual, _ = self.run([str(binary), nonce], "tiny_native_exec", seconds=EXEC_SECONDS)
+                  if actual != ("vilo_p0_native:" + nonce + "\n").encode():
+                      raise ProbeError("native_output_mismatch")
+                  self.report["fixture_sha256"] = hashlib.sha256(fixture.read_bytes()).hexdigest()
+                  self.report["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+                  control, control_identity = self.spawn([sys.executable, "-c", "import time; time.sleep(15)"], "negative_control")
+                  output, actions = self.run([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print('READY',flush=True); time.sleep(15)"],
+                                             "timeout_negative", seconds=0.75, expect_timeout=True, wait_ready=True)
+                  if output != b"READY\n" or actions != ["TERM", "KILL"]:
+                      raise ProbeError("termination_negative_incomplete")
+                  if control.poll() is not None or self.identity(control.pid) != control_identity:
+                      raise ProbeError("negative_control_not_preserved")
+                  self.report["negative_control_preserved"] = True
+                  self.report["probe_result"] = "OBSERVED_SMALL_NATIVE_EXECUTION"
+          
+              def cleanup(self):
+                  complete = not self.external_signal_uncertain
+                  for child, identity, label in self.children:
+                      try:
+                          self.stop(child, identity, label + "_cleanup")
+                      except (ProbeError, subprocess.TimeoutExpired, OSError):
+                          complete = False
+                      for stream in [child.stdout, child.stderr]:
+                          if stream is not None and not stream.closed:
+                              stream.close()
+                  # PGID checks cannot observe setsid descendants or provider VM destruction.
+                  deadline = time.monotonic() + 3
+                  try:
+                      while any(self.members(group, control=True) for group in self.groups):
+                          if time.monotonic() >= deadline:
+                              complete = False
+                              break
+                          time.sleep(SAMPLE_SECONDS)
+                  except (ProbeError, OSError):
+                      complete = False
+                  complete = complete and not self.external_signal_uncertain
+                  if self.root is not None:
+                      try:
+                          info = self.root.lstat()
+                          safe = self.root.parent == self.base and self.root.name.startswith("vilo-p0-native-") and stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                          if not safe or not complete:
+                              raise ProbeError("refuse_cleanup_unknown_ownership")
+                          shutil.rmtree(self.root)
+                          complete = not self.root.exists()
+                      except (OSError, ProbeError):
+                          complete = False
+                  complete = complete and not self.external_signal_uncertain
+                  self.report["cleanup"] = ("OBSERVED_DIRECT_CHILDREN_PGIDS_AND_OWN_TMP_GONE" if self.root is not None else "NOT_CREATED") if complete else "UNKNOWN"
+                  self.report["disk_free_after_bytes"] = shutil.disk_usage(self.base).free
+                  return complete
+          
+              def finish(self):
+                  self.report.update(observed_peak_rss_lower_bound_bytes=self.peak, sample_count=self.sample_count,
+                                     captured_normal_and_sample_bytes=self.captured, captured_command_bytes=self.command_captured,
+                                     captured_sampler_bytes=self.sampler_captured, captured_control_bytes=self.control_captured,
+                                     sampler_output_counts_toward_budget=True, artifact_entries_disappeared=self.artifact_entries_disappeared,
+                                     external_signal_uncertain=self.external_signal_uncertain,
+                                     started_at_utc=self.started_utc, finished_at_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                     records=self.records[-24:],
+                                     elapsed_seconds=round(time.monotonic() - self.started, 3))
+                  text = json.dumps(self.report, separators=(",", ":"))
+                  if len(text.encode()) > REPORT_BYTES:
+                      text = json.dumps({"kind": "vilo_p0_native_toolchain", "probe_result": "UNKNOWN_REPORT_BUDGET",
+                                         "cleanup": "UNKNOWN_EVIDENCE_BUDGET", "heavy_build_admitted": False,
+                                         "process_boundary_validated": False, "vm_destruction_observed": False,
+                                         "unpublished_report_sha256": hashlib.sha256(text.encode()).hexdigest()})
+                      print(text, flush=True)
+                      return False
+                  print(text, flush=True)
+                  return True
+          
+          
+          def main():
+              probe = None
+              code = 1
+              def interrupted(number, frame):
+                  if probe is not None:
+                      probe.external_signal_uncertain = True
+                      probe.report["cleanup"] = "UNKNOWN"
+                      probe.report["cleanup_uncertainty_reason"] = "external_signal"
+                  raise ProbeError("external_signal_" + str(number))
+              signal.signal(signal.SIGTERM, interrupted)
+              signal.signal(signal.SIGINT, interrupted)
+              try:
+                  probe = Probe()
+                  probe.setup()
+                  probe.execute()
+                  code = 0
+              except (ProbeError, OSError, ValueError, UnicodeError, KeyError, subprocess.SubprocessError) as error:
+                  if probe is not None:
+                      probe.report["error_code"] = str(error) if isinstance(error, ProbeError) else type(error).__name__
+                      probe.report["probe_result"] = "BLOCKED_PRECONDITION" if "precondition_missing" in str(error) else "FAILED_OR_UNKNOWN"
+              finally:
+                  if probe is not None:
+                      try:
+                          if not probe.cleanup():
+                              code = 1
+                      except Exception:
+                          probe.report["cleanup"] = "UNKNOWN"
+                          code = 1
+                      if not probe.finish():
+                          code = 1
+                  else:
+                      print(json.dumps({"kind": "vilo_p0_native_toolchain", "probe_result": "UNKNOWN_SETUP", "cleanup": "UNKNOWN", "heavy_build_admitted": False}), flush=True)
+              return code
+          
+          
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          VILO_P0_PY
