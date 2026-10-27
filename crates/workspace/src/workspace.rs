@@ -176,6 +176,8 @@ use crate::{
 
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 pub const MAX_RECENT_SELECTIONS: usize = 20;
+/// Vilo: width of the VS Code style activity bar left of the left dock.
+const ACTIVITY_BAR_WIDTH: Pixels = px(48.);
 
 /// Which optional window-title variables are actually referenced by the active
 /// template. Used to skip expensive lookups when the template doesn't need them.
@@ -1594,6 +1596,7 @@ pub struct Workspace {
     last_active_center_pane: Option<WeakEntity<Pane>>,
     last_active_view_id: Option<proto::ViewId>,
     status_bar: Entity<StatusBar>,
+    activity_bar: Entity<PanelButtons>,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -1971,7 +1974,7 @@ impl Workspace {
         let left_dock = Dock::new(DockPosition::Left, modal_layer.clone(), window, cx);
         let bottom_dock = Dock::new(DockPosition::Bottom, modal_layer.clone(), window, cx);
         let right_dock = Dock::new(DockPosition::Right, modal_layer.clone(), window, cx);
-        let left_dock_buttons = cx.new(|cx| PanelButtons::new(left_dock.clone(), cx));
+        let activity_bar = cx.new(|cx| PanelButtons::new_activity_bar(left_dock.clone(), cx));
         let bottom_dock_buttons = cx.new(|cx| PanelButtons::new(bottom_dock.clone(), cx));
         let right_dock_buttons = cx.new(|cx| PanelButtons::new(right_dock.clone(), cx));
         let multi_workspace = window
@@ -1981,7 +1984,6 @@ impl Workspace {
         let status_bar = cx.new(|cx| {
             let mut status_bar =
                 StatusBar::new(&center_pane.clone(), multi_workspace.clone(), window, cx);
-            status_bar.add_left_item(left_dock_buttons, window, cx);
             status_bar.add_right_item(right_dock_buttons, window, cx);
             status_bar.add_right_item(bottom_dock_buttons, window, cx);
             status_bar
@@ -2099,6 +2101,7 @@ impl Workspace {
             last_active_center_pane: Some(center_pane.downgrade()),
             last_active_view_id: None,
             status_bar,
+            activity_bar,
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -8642,6 +8645,21 @@ impl Workspace {
             )
     }
 
+    fn render_activity_bar(&self, cx: &App) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        v_flex()
+            .id("activity-bar")
+            .flex_none()
+            .h_full()
+            .w(ACTIVITY_BAR_WIDTH)
+            .py_1()
+            .items_center()
+            .bg(colors.title_bar_background)
+            .border_r_1()
+            .border_color(colors.border)
+            .child(self.activity_bar.clone())
+    }
+
     fn render_dock(
         &self,
         position: DockPosition,
@@ -9740,7 +9758,8 @@ impl Render for Workspace {
                                                 DockPosition::Left => {
                                                     workspace.resize_left_dock(
                                                         e.event.position.x
-                                                            - workspace.bounds.left(),
+                                                            - workspace.bounds.left()
+                                                            - ACTIVITY_BAR_WIDTH,
                                                         window,
                                                         cx,
                                                     );
@@ -9779,6 +9798,7 @@ impl Render for Workspace {
                                                 .flex_row()
                                                 .flex_1()
                                                 .overflow_hidden()
+                                                .child(self.render_activity_bar(cx))
                                                 .children(self.render_dock(
                                                     DockPosition::Left,
                                                     &self.left_dock,
@@ -9842,6 +9862,7 @@ impl Render for Workspace {
                                                         .flex()
                                                         .flex_row()
                                                         .flex_1()
+                                                        .child(self.render_activity_bar(cx))
                                                         .children(self.render_dock(
                                                             DockPosition::Left,
                                                             &self.left_dock,
@@ -9898,6 +9919,7 @@ impl Render for Workspace {
                                         .flex()
                                         .flex_row()
                                         .h_full()
+                                        .child(self.render_activity_bar(cx))
                                         .children(self.render_dock(
                                             DockPosition::Left,
                                             &self.left_dock,
@@ -9965,6 +9987,7 @@ impl Render for Workspace {
                                         .flex()
                                         .flex_row()
                                         .h_full()
+                                        .child(self.render_activity_bar(cx))
                                         .children(self.render_dock(
                                             DockPosition::Left,
                                             &self.left_dock,
@@ -12997,7 +13020,7 @@ mod tests {
             });
         });
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("Zed — root1, root2"));
+        assert_eq!(cx.window_title().as_deref(), Some("Vilo — root1, root2"));
 
         let item = cx.new(|cx| {
             TestItem::new(cx).with_project_items(&[TestProjectItem::new_in_worktree(
@@ -13014,7 +13037,7 @@ mod tests {
         let expected_file_path = path!("/root1/src/one.txt");
         assert_eq!(
             cx.window_title().as_deref(),
-            Some(format!("Zed — root1, root2 — one — {expected_file_path}").as_str())
+            Some(format!("Vilo — root1, root2 — one — {expected_file_path}").as_str())
         );
     }
 
