@@ -5,6 +5,9 @@
 
 use std::ops::Range;
 use std::pin::pin;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use collections::HashSet;
 use editor::{Editor, EditorEvent};
@@ -15,9 +18,13 @@ use gpui::{
 };
 use language::{Buffer, Point, ToPoint as _};
 use project::{
-    Project,
+    Project, ProjectPath,
     search::{SearchQuery, SearchResult},
 };
+use util::paths::PathStyle;
+use util::rel_path::RelPath;
+
+use crate::disk_search::{self, WalkProgress};
 use text::Anchor;
 use ui::{
     IconButton, IconButtonShape, IndentGuideColors, ListItem, ListItemSpacing, Tooltip, prelude::*,
@@ -40,6 +47,8 @@ actions!(
 const SEARCH_PANEL_KEY: &str = "SearchPanel";
 const SEARCH_ON_TYPE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_LINE_PREVIEW_CHARS: usize = 200;
+const MAX_MATCHES: usize = 20_000;
+const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(100);
 /// Characters kept before a match; longer leading context is replaced by "…" so the match stays visible.
 const MAX_CONTEXT_BEFORE_MATCH: usize = 24;
 // VS Code workbench metrics (logical px), scoped to the side bar so the global UI size stays as is.
@@ -59,14 +68,22 @@ pub fn init(cx: &mut App) {
 
 #[derive(Clone)]
 struct MatchLine {
-    range: Range<Anchor>,
+    /// Present for open buffers, so the position follows later edits.
+    anchor: Option<Anchor>,
+    point: Point,
     line_number: u32,
     preview: SharedString,
     highlight: Range<usize>,
 }
 
+enum ResultTarget {
+    Buffer(Entity<Buffer>),
+    /// Found on disk without opening a buffer; opened only when clicked.
+    Path(ProjectPath),
+}
+
 struct FileResult {
-    buffer: Entity<Buffer>,
+    target: ResultTarget,
     icon: Option<SharedString>,
     file_name: SharedString,
     directory: SharedString,
@@ -107,6 +124,10 @@ pub struct SearchPanel {
     position: DockPosition,
     pending_debounce: Option<Task<()>>,
     pending_search: Option<Task<()>>,
+    walk_progress: Option<Arc<WalkProgress>>,
+    search_started: Option<Instant>,
+    search_elapsed: Option<Duration>,
+    _timer: Option<Task<()>>,
     /// Sticky for the whole search: a later status event must not hide that results were cut off.
     limit_reached: bool,
     _subscriptions: Vec<Subscription>,
@@ -155,6 +176,10 @@ impl SearchPanel {
             position: DockPosition::Left,
             pending_debounce: None,
             pending_search: None,
+            walk_progress: None,
+            search_started: None,
+            search_elapsed: None,
+            _timer: None,
             limit_reached: false,
             _subscriptions: subscriptions,
         }
@@ -233,23 +258,62 @@ impl SearchPanel {
         self.collapsed.clear();
         self.selected_row = None;
         self.limit_reached = false;
+        self.search_elapsed = None;
+        if let Some(progress) = self.walk_progress.take() {
+            progress.cancelled.store(true, Ordering::Relaxed);
+        }
         self.rebuild_rows();
         let query = match self.build_query(cx) {
             None => {
                 self.status = Status::Idle;
                 self.pending_search = None;
+                self._timer = None;
                 cx.notify();
                 return;
             }
             Some(Err(_)) => {
                 self.status = Status::InvalidQuery;
                 self.pending_search = None;
+                self._timer = None;
                 cx.notify();
                 return;
             }
             Some(Ok(query)) => query,
         };
         self.status = Status::Searching;
+        self.search_started = Some(Instant::now());
+        self._timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TIMER_TICK).await;
+                let searching = this
+                    .update(cx, |this, cx| {
+                        cx.notify();
+                        matches!(this.status, Status::Searching | Status::WaitingForScan)
+                    })
+                    .unwrap_or(false);
+                if !searching {
+                    break;
+                }
+            }
+        }));
+        let project = self.project.read(cx);
+        // The in-memory test file system has nothing on disk to walk.
+        if project.is_local() && !project.fs().is_fake() {
+            self.run_disk_search(query, cx);
+        } else {
+            self.run_project_search(query, cx);
+        }
+        cx.notify();
+    }
+
+    fn finish_search(&mut self, cx: &mut Context<Self>) {
+        self.status = Status::Done;
+        self.search_elapsed = self.search_started.map(|started| started.elapsed());
+        cx.notify();
+    }
+
+    /// Remote and collaborative projects have no local disk to walk, so they use the project search.
+    fn run_project_search(&mut self, query: SearchQuery, cx: &mut Context<Self>) {
         let search = self
             .project
             .update(cx, |project, cx| project.search(query, cx));
@@ -261,7 +325,7 @@ impl SearchPanel {
                     for result in chunk {
                         match result {
                             SearchResult::Buffer { buffer, ranges } => {
-                                this.push_result(buffer, ranges, cx)
+                                this.push_buffer_result(buffer, ranges, cx)
                             }
                             SearchResult::LimitReached => this.limit_reached = true,
                             SearchResult::WaitingForScan => this.status = Status::WaitingForScan,
@@ -275,16 +339,135 @@ impl SearchPanel {
                     return;
                 }
             }
+            this.update(cx, |this, cx| this.finish_search(cx)).ok();
+        }));
+    }
+
+    /// Searches local worktrees straight from disk instead of waiting for the worktree scan.
+    fn run_disk_search(&mut self, query: SearchQuery, cx: &mut Context<Self>) {
+        let project = self.project.read(cx);
+        let path_style = project.path_style(cx);
+        let roots = project
+            .visible_worktrees(cx)
+            .map(|worktree| {
+                let worktree = worktree.read(cx);
+                disk_search::DiskRoot {
+                    worktree_id: worktree.id(),
+                    abs_path: worktree.abs_path(),
+                }
+            })
+            .collect::<Vec<_>>();
+        // Unsaved edits live only in memory: search those buffers directly and skip their files on disk.
+        let dirty_buffers = project
+            .opened_buffers(cx)
+            .into_iter()
+            .filter(|buffer| buffer.read(cx).is_dirty())
+            .collect::<Vec<_>>();
+        let skip_abs_paths = dirty_buffers
+            .iter()
+            .filter_map(|buffer| {
+                let file = buffer.read(cx).file()?;
+                Some(file.as_local()?.abs_path(cx))
+            })
+            .collect::<HashSet<_>>();
+
+        let progress = Arc::new(WalkProgress::default());
+        self.walk_progress = Some(progress.clone());
+        let candidates = disk_search::walk(
+            roots,
+            query.clone(),
+            path_style,
+            skip_abs_paths,
+            progress.clone(),
+        );
+
+        self.pending_search = Some(cx.spawn(async move |this, cx| {
+            for buffer in dirty_buffers {
+                let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+                let ranges = query.search(&snapshot, None).await;
+                let anchors = ranges
+                    .into_iter()
+                    .map(|range| {
+                        snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end)
+                    })
+                    .collect::<Vec<_>>();
+                if this
+                    .update(cx, |this, cx| this.push_buffer_result(buffer, anchors, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            let mut chunks = pin!(candidates.ready_chunks(64));
+            while let Some(chunk) = chunks.next().await {
+                for candidate in chunk {
+                    let Ok(snapshot) = this.update(cx, |_, cx| {
+                        Buffer::build_snapshot(
+                            text::Rope::from(candidate.text.as_str()),
+                            None,
+                            None,
+                            None,
+                            cx,
+                        )
+                    }) else {
+                        return;
+                    };
+                    let query = query.clone();
+                    let lines = cx
+                        .background_spawn(async move {
+                            let snapshot = snapshot.await;
+                            let ranges = query.search(&snapshot, None).await;
+                            build_match_lines(
+                                &snapshot,
+                                ranges.into_iter().map(|range| {
+                                    (
+                                        snapshot.offset_to_point(range.start),
+                                        snapshot.offset_to_point(range.end),
+                                        None,
+                                    )
+                                }),
+                            )
+                        })
+                        .await;
+                    let target = ProjectPath {
+                        worktree_id: candidate.worktree_id,
+                        path: candidate.rel_path,
+                    };
+                    let reached_limit = this
+                        .update(cx, |this, cx| {
+                            this.push_path_result(target, lines, cx);
+                            this.match_count() >= MAX_MATCHES
+                        })
+                        .unwrap_or(true);
+                    if reached_limit {
+                        progress.cancelled.store(true, Ordering::Relaxed);
+                        this.update(cx, |this, _| this.limit_reached = true).ok();
+                        break;
+                    }
+                }
+                if this
+                    .update(cx, |this, cx| {
+                        this.rebuild_rows();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                if progress.cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
             this.update(cx, |this, cx| {
-                this.status = Status::Done;
-                cx.notify();
+                this.rebuild_rows();
+                this.finish_search(cx);
             })
             .ok();
         }));
-        cx.notify();
     }
 
-    fn push_result(&mut self, buffer: Entity<Buffer>, ranges: Vec<Range<Anchor>>, cx: &App) {
+    fn push_buffer_result(&mut self, buffer: Entity<Buffer>, ranges: Vec<Range<Anchor>>, cx: &App) {
         if ranges.is_empty() {
             return;
         }
@@ -294,41 +477,37 @@ impl SearchPanel {
             .file()
             .and_then(|file| file_icons::FileIcons::get_icon(file.path().as_std_path(), cx));
         let (file_name, directory) = match buffer_ref.file() {
-            Some(file) => {
-                let path = file.path();
-                (
-                    path.file_name().unwrap_or_default().to_string().into(),
-                    path.parent()
-                        .map(|parent| parent.display(file.path_style(cx)).to_string())
-                        .unwrap_or_default()
-                        .into(),
-                )
-            }
+            Some(file) => file_labels(file.path(), file.path_style(cx)),
             None => ("untitled".into(), SharedString::default()),
         };
-        let matches = ranges
-            .into_iter()
-            .map(|range| {
-                let start = range.start.to_point(&snapshot);
-                let end = range.end.to_point(&snapshot);
-                let line_start = Point::new(start.row, 0);
-                let line_end = Point::new(start.row, snapshot.line_len(start.row));
-                let line = snapshot
-                    .text_for_range(line_start..line_end)
-                    .collect::<String>();
-                let match_end_column = (end.row == start.row).then_some(end.column as usize);
-                let (preview, highlight) =
-                    match_preview(&line, start.column as usize, match_end_column);
-                MatchLine {
-                    range,
-                    line_number: start.row + 1,
-                    preview: preview.into(),
-                    highlight,
-                }
-            })
-            .collect();
+        let matches = build_match_lines(
+            &snapshot,
+            ranges.into_iter().map(|range| {
+                (
+                    range.start.to_point(&snapshot),
+                    range.end.to_point(&snapshot),
+                    Some(range.start),
+                )
+            }),
+        );
         self.results.push(FileResult {
-            buffer,
+            target: ResultTarget::Buffer(buffer),
+            icon,
+            file_name,
+            directory,
+            matches,
+        });
+    }
+
+    fn push_path_result(&mut self, target: ProjectPath, matches: Vec<MatchLine>, cx: &App) {
+        if matches.is_empty() {
+            return;
+        }
+        let path_style = self.project.read(cx).path_style(cx);
+        let icon = file_icons::FileIcons::get_icon(target.path.as_std_path(), cx);
+        let (file_name, directory) = file_labels(&target.path, path_style);
+        self.results.push(FileResult {
+            target: ResultTarget::Path(target),
             icon,
             file_name,
             directory,
@@ -373,65 +552,115 @@ impl SearchPanel {
         let Some(search_match) = file.matches.get(match_ix) else {
             return;
         };
-        let buffer = file.buffer.clone();
-        // Anchors follow edits made after the search, so this lands on the current match position.
-        let point = search_match
-            .range
-            .start
-            .to_point(&buffer.read(cx).snapshot());
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        workspace.update(cx, |workspace, cx| {
-            // Reuse an editor already showing this buffer: path-based lookup misses untitled buffers.
-            let existing = workspace.items_of_type::<Editor>(cx).find(|editor| {
-                editor.read(cx).buffer().read(cx).as_singleton().as_ref() == Some(&buffer)
-            });
-            let editor = match existing {
-                Some(editor) => {
-                    workspace.activate_item(&editor, true, true, window, cx);
-                    if !allow_preview && let Some(pane) = workspace.pane_for(&editor) {
-                        pane.update(cx, |pane, _| {
-                            pane.unpreview_item_if_preview(editor.entity_id())
-                        });
-                    }
+        match &file.target {
+            ResultTarget::Buffer(buffer) => {
+                let buffer = buffer.clone();
+                // Anchors follow edits made after the search, so this lands on the current match position.
+                let point = match search_match.anchor {
+                    Some(anchor) => anchor.to_point(&buffer.read(cx).snapshot()),
+                    None => search_match.point,
+                };
+                workspace.update(cx, |workspace, cx| {
+                    // Reuse an editor already showing this buffer: path-based lookup misses untitled buffers.
+                    let existing = workspace.items_of_type::<Editor>(cx).find(|editor| {
+                        editor.read(cx).buffer().read(cx).as_singleton().as_ref() == Some(&buffer)
+                    });
+                    let editor = match existing {
+                        Some(editor) => {
+                            workspace.activate_item(&editor, true, true, window, cx);
+                            if !allow_preview && let Some(pane) = workspace.pane_for(&editor) {
+                                pane.update(cx, |pane, _| {
+                                    pane.unpreview_item_if_preview(editor.entity_id())
+                                });
+                            }
+                            editor
+                        }
+                        // keep_old_preview = true lets a single-click preview replace the previous one.
+                        None => workspace.open_project_item::<Editor>(
+                            None,
+                            buffer,
+                            true,
+                            true,
+                            true,
+                            allow_preview,
+                            window,
+                            cx,
+                        ),
+                    };
+                    editor.update(cx, |editor, cx| {
+                        editor.go_to_singleton_buffer_point(point, window, cx)
+                    });
+                });
+            }
+            ResultTarget::Path(project_path) => {
+                let point = search_match.point;
+                let open_task = workspace.update(cx, |workspace, cx| {
+                    workspace.open_path_preview(
+                        project_path.clone(),
+                        None,
+                        true,
+                        allow_preview,
+                        true,
+                        window,
+                        cx,
+                    )
+                });
+                cx.spawn_in(window, async move |_, cx| {
+                    let item = open_task.await.log_err()?;
+                    let editor = item.downcast::<Editor>()?;
                     editor
-                }
-                // keep_old_preview = true lets a single-click preview replace the previous one.
-                None => workspace.open_project_item::<Editor>(
-                    None,
-                    buffer,
-                    true,
-                    true,
-                    true,
-                    allow_preview,
-                    window,
-                    cx,
-                ),
-            };
-            editor.update(cx, |editor, cx| {
-                editor.go_to_singleton_buffer_point(point, window, cx)
-            });
-        });
+                        .update_in(cx, |editor, window, cx| {
+                            editor.go_to_singleton_buffer_point(point, window, cx)
+                        })
+                        .log_err();
+                    Some(())
+                })
+                .detach();
+            }
+        }
     }
 
     fn summary(&self) -> Option<SharedString> {
         let files = self.results.len();
         let matches = self.match_count();
+        let found = format!(
+            "{matches} result{} in {files} file{}",
+            if matches == 1 { "" } else { "s" },
+            if files == 1 { "" } else { "s" }
+        );
         let text = match self.status {
             Status::Idle => return None,
             Status::InvalidQuery => "Invalid search query".to_string(),
-            Status::WaitingForScan if files == 0 => "Waiting for project scan…".to_string(),
-            Status::Searching if files == 0 => "Searching…".to_string(),
-            Status::Done if files == 0 => "No results found".to_string(),
-            _ if self.limit_reached => {
-                format!("{matches} results in {files} files (limit reached, refine the search)")
+            Status::Searching | Status::WaitingForScan => {
+                let elapsed = self
+                    .search_started
+                    .map_or(0., |started| started.elapsed().as_secs_f32());
+                let searched = self
+                    .walk_progress
+                    .as_ref()
+                    .map(|progress| progress.files_searched.load(Ordering::Relaxed));
+                match searched {
+                    Some(searched) => {
+                        format!("Searching… {elapsed:.1}s · {searched} files searched · {found}")
+                    }
+                    None => format!("Searching… {elapsed:.1}s · {found}"),
+                }
             }
-            _ => format!(
-                "{matches} result{} in {files} file{}",
-                if matches == 1 { "" } else { "s" },
-                if files == 1 { "" } else { "s" }
-            ),
+            Status::Done => {
+                let elapsed = self
+                    .search_elapsed
+                    .map_or(0., |elapsed| elapsed.as_secs_f32());
+                if self.limit_reached {
+                    format!("{found} ({elapsed:.1}s, limit reached, refine the search)")
+                } else if files == 0 {
+                    format!("No results found ({elapsed:.1}s)")
+                } else {
+                    format!("{found} ({elapsed:.1}s)")
+                }
+            }
         };
         Some(text.into())
     }
@@ -825,6 +1054,42 @@ impl Panel for SearchPanel {
         // Unique within the dock; the activity bar applies VS Code's display order.
         4
     }
+}
+
+fn file_labels(path: &RelPath, path_style: PathStyle) -> (SharedString, SharedString) {
+    (
+        path.file_name().unwrap_or_default().to_string().into(),
+        path.parent()
+            .map(|parent| parent.display(path_style).to_string())
+            .unwrap_or_default()
+            .into(),
+    )
+}
+
+/// One preview line per match, from match start/end points and an optional anchor.
+fn build_match_lines(
+    snapshot: &language::BufferSnapshot,
+    matches: impl Iterator<Item = (Point, Point, Option<Anchor>)>,
+) -> Vec<MatchLine> {
+    matches
+        .map(|(start, end, anchor)| {
+            let line_start = Point::new(start.row, 0);
+            let line_end = Point::new(start.row, snapshot.line_len(start.row));
+            let line = snapshot
+                .text_for_range(line_start..line_end)
+                .collect::<String>();
+            let match_end_column = (end.row == start.row).then_some(end.column as usize);
+            let (preview, highlight) =
+                match_preview(&line, start.column as usize, match_end_column);
+            MatchLine {
+                anchor,
+                point: start,
+                line_number: start.row + 1,
+                preview: preview.into(),
+                highlight,
+            }
+        })
+        .collect()
 }
 
 /// Builds the one-line preview shown under a file: leading indentation is
