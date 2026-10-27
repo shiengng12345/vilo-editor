@@ -37,6 +37,7 @@ use crate::{
 };
 
 pub mod branch_diff;
+mod branch_status_item;
 pub mod branch_picker;
 mod commit_context_menu;
 mod commit_modal;
@@ -61,6 +62,7 @@ pub mod text_diff_view;
 pub mod unstaged_diff;
 
 pub use blame_ui::GitBlameStatus;
+pub use branch_status_item::BranchStatusItem;
 pub use conflict_view::MergeConflictIndicator;
 
 pub fn init(cx: &mut App) {
