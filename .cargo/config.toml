@@ -22,3 +22,5 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [env]
 MACOSX_DEPLOYMENT_TARGET = "10.15.7"
+# Upstream's packager switch: disables update polling and manual checks, which would otherwise replace Vilo with official Zed.
+ZED_UPDATE_EXPLANATION = "Vilo is built from source; update it by rebuilding."
