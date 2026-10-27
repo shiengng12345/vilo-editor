@@ -6,6 +6,7 @@ use gpui::{
     Anchor, App, Context, Entity, IntoElement, ParentElement, Render, Subscription, WeakEntity,
     Window, div,
 };
+use language::language_settings::LanguageSettings;
 use ui::{Button, ButtonCommon, ContextMenu, FluentBuilder, LabelSize, PopoverMenu, Tooltip};
 use workspace::{HideStatusItem, StatusItemView, item::ItemHandle};
 
@@ -26,8 +27,9 @@ impl ActiveBufferIndentation {
     }
 
     fn update(&mut self, editor: Entity<Editor>, _: &mut Window, cx: &mut Context<Self>) {
-        self.label = editor.read(cx).active_buffer(cx).map(|_| {
-            let settings = editor.read(cx).buffer().read(cx).language_settings(cx);
+        // The active buffer, not the multibuffer: its settings come from the first excerpt only.
+        self.label = editor.read(cx).active_buffer(cx).map(|buffer| {
+            let settings = LanguageSettings::for_buffer(buffer.read(cx), cx);
             let kind = if settings.hard_tabs {
                 "Tab Size"
             } else {
@@ -112,5 +114,89 @@ impl StatusItemView for ActiveBufferIndentation {
 
     fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use editor::{EditorMode, MultiBuffer, SelectionEffects};
+    use gpui::{AppContext as _, BorrowAppContext as _, TestAppContext, VisualTestContext};
+    use language::{Language, LanguageConfig, Point};
+    use settings::{LanguageSettingsContent, SettingsContent, SettingsStore};
+    use std::{num::NonZeroU32, sync::Arc};
+    use workspace::AppState;
+
+    #[gpui::test]
+    async fn test_label_follows_the_active_buffer(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            settings::init(cx);
+            editor::init(cx);
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, &|settings: &mut SettingsContent| {
+                    settings.project.all_languages.languages.0.extend([
+                        (
+                            "Rust".into(),
+                            LanguageSettingsContent {
+                                tab_size: NonZeroU32::new(4),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "Go".into(),
+                            LanguageSettingsContent {
+                                tab_size: NonZeroU32::new(8),
+                                hard_tabs: Some(true),
+                                ..Default::default()
+                            },
+                        ),
+                    ]);
+                });
+            });
+        });
+        let multi_buffer = cx.update(|cx| {
+            let multi_buffer = MultiBuffer::build_multi(
+                [
+                    ("fn a() {}", vec![Point::row_range(0..1)]),
+                    ("func b() {}", vec![Point::row_range(0..1)]),
+                ],
+                cx,
+            );
+            for buffer in multi_buffer.read(cx).all_buffers() {
+                let name = if buffer.read(cx).text().starts_with("fn ") {
+                    "Rust"
+                } else {
+                    "Go"
+                };
+                let language = Arc::new(Language::new(
+                    LanguageConfig {
+                        name: name.into(),
+                        ..Default::default()
+                    },
+                    None,
+                ));
+                buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
+            }
+            multi_buffer
+        });
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+        });
+        let item = cx.new(|_| ActiveBufferIndentation::new());
+        let label = |item: &Entity<ActiveBufferIndentation>, cx: &mut VisualTestContext| {
+            item.update_in(cx, |item, window, cx| {
+                item.update(editor.clone(), window, cx);
+                item.label.clone()
+            })
+        };
+        assert_eq!(label(&item, cx).as_deref(), Some("Spaces: 4"));
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges([Point::new(1, 0)..Point::new(1, 0)])
+            });
+        });
+        assert_eq!(label(&item, cx).as_deref(), Some("Tab Size: 8"));
     }
 }
