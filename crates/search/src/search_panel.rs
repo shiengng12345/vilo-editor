@@ -13,8 +13,9 @@ use collections::HashSet;
 use editor::{Editor, EditorEvent};
 use futures::StreamExt as _;
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Subscription, Task,
-    WeakEntity, Window, actions, px, uniform_list,
+    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent, Pixels,
+    ScrollStrategy, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, px,
+    uniform_list,
 };
 use language::{Buffer, Point, ToPoint as _};
 use project::{
@@ -28,13 +29,14 @@ use crate::disk_search::{self, WalkProgress};
 use settings::{Settings as _, SettingsLocation};
 use text::Anchor;
 use ui::{
-    IconButton, IconButtonShape, IndentGuideColors, ListItem, ListItemSpacing, Tooltip, prelude::*,
-    rems_from_px,
+    Button, IconButton, IconButtonShape, IndentGuideColors, ListItem, ListItemSpacing, Tooltip,
+    prelude::*, rems_from_px,
 };
 use util::{ResultExt as _, paths::PathMatcher};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    pane::DeploySearch,
 };
 
 actions!(
@@ -103,6 +105,13 @@ enum Status {
 }
 
 #[derive(Clone, Copy)]
+enum ReplaceScope {
+    All,
+    File(usize),
+    Match(usize, usize),
+}
+
+#[derive(Clone, Copy)]
 enum Row {
     File(usize),
     Match(usize, usize),
@@ -115,6 +124,13 @@ pub struct SearchPanel {
     query_editor: Entity<Editor>,
     include_editor: Entity<Editor>,
     exclude_editor: Entity<Editor>,
+    replace_editor: Entity<Editor>,
+    show_replace: bool,
+    replace_status: Option<SharedString>,
+    results_focus: FocusHandle,
+    scroll_handle: UniformListScrollHandle,
+    /// Bumped per search so an in-flight replace never edits a newer result list by index.
+    search_generation: usize,
     case_sensitive: bool,
     whole_word: bool,
     regex: bool,
@@ -148,6 +164,7 @@ impl SearchPanel {
         let query_editor = single_line("Search", window, cx);
         let include_editor = single_line("files to include", window, cx);
         let exclude_editor = single_line("files to exclude", window, cx);
+        let replace_editor = single_line("Replace", window, cx);
 
         let subscriptions = [&query_editor, &include_editor, &exclude_editor]
             .into_iter()
@@ -167,6 +184,12 @@ impl SearchPanel {
             query_editor,
             include_editor,
             exclude_editor,
+            replace_editor,
+            show_replace: false,
+            replace_status: None,
+            results_focus: cx.focus_handle(),
+            scroll_handle: UniformListScrollHandle::new(),
+            search_generation: 0,
             case_sensitive: false,
             whole_word: false,
             regex: false,
@@ -257,6 +280,8 @@ impl SearchPanel {
     }
 
     fn run_search(&mut self, cx: &mut Context<Self>) {
+        self.search_generation += 1;
+        self.replace_status = None;
         self.results.clear();
         self.collapsed.clear();
         self.selected_row = None;
@@ -776,7 +801,8 @@ impl SearchPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = self.selected_row == Some(row_ix);
-        let focused = selected && self.focus_handle.contains_focused(window, cx);
+        let focused = selected && self.results_focus.is_focused(window);
+        let show_replace = self.show_replace;
         let text_size = LabelSize::Custom(rems_from_px(13_f32));
         match row {
             Row::File(file_ix) => {
@@ -813,6 +839,16 @@ impl SearchPanel {
                                     .truncate(),
                             ),
                     )
+                    .when(show_replace, |this| {
+                        this.end_slot_on_hover(
+                            IconButton::new(("search-replace-file", file_ix), IconName::ReplaceAll)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Replace All in File"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.replace(ReplaceScope::File(file_ix), window, cx)
+                                })),
+                        )
+                    })
                     .end_slot(
                         div()
                             .px_1p5()
@@ -848,6 +884,25 @@ impl SearchPanel {
                 .toggle_state(selected)
                 .focused(focused)
                 .tooltip(Tooltip::text(format!("Line {}", search_match.line_number)))
+                .when(show_replace, |this| {
+                    this.end_slot(
+                        IconButton::new(
+                            ElementId::NamedInteger(
+                                "search-replace-match".into(),
+                                ((file_ix as u64) << 32) | match_ix as u64,
+                            ),
+                            IconName::Replace,
+                        )
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Replace"))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.replace(ReplaceScope::Match(file_ix, match_ix), window, cx)
+                            },
+                        )),
+                    )
+                    .show_end_slot_on_hover()
+                })
                 .child(
                     div()
                         .min_w_0()
@@ -872,6 +927,266 @@ impl SearchPanel {
                 )
                 .into_any_element()
             }
+        }
+    }
+
+    /// Replaces matches in place, leaving buffers modified but unsaved (as Zed's project search
+    /// does): one transaction per buffer, so Cmd+Z in a file restores it. Matches are recomputed
+    /// on each buffer's current text right before editing, so stale positions are never edited.
+    fn replace(&mut self, scope: ReplaceScope, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Ok(query)) = self.build_query(cx) else {
+            return;
+        };
+        if matches!(scope, ReplaceScope::All) && self.limit_reached {
+            self.replace_status =
+                Some("Results were cut off; refine the search before replacing all".into());
+            cx.notify();
+            return;
+        }
+        let query = query.with_replacement(self.replace_editor.read(cx).text(cx));
+        let targets = self
+            .results
+            .iter()
+            .enumerate()
+            .filter_map(|(file_ix, file)| {
+                let match_ix = match scope {
+                    ReplaceScope::All => None,
+                    ReplaceScope::File(ix) if ix == file_ix => None,
+                    ReplaceScope::Match(ix, match_ix) if ix == file_ix => Some(match_ix),
+                    _ => return None,
+                };
+                let point = match_ix
+                    .and_then(|match_ix| file.matches.get(match_ix))
+                    .map(|m| m.point);
+                let target = match &file.target {
+                    ResultTarget::Buffer(buffer) => ResultTarget::Buffer(buffer.clone()),
+                    ResultTarget::Path(path) => ResultTarget::Path(path.clone()),
+                };
+                Some((file_ix, match_ix, point, target))
+            })
+            .collect::<Vec<_>>();
+        let project = self.project.clone();
+        let generation = self.search_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            let mut replaced = 0;
+            let mut skipped = 0;
+            let mut unsaved = 0;
+            let mut done = Vec::new();
+            for (file_ix, match_ix, point, target) in targets {
+                let buffer = match target {
+                    ResultTarget::Buffer(buffer) => buffer,
+                    ResultTarget::Path(path) => {
+                        let open = project.update(cx, |project, cx| project.open_buffer(path, cx));
+                        match open.await {
+                            Ok(buffer) => buffer,
+                            Err(error) => {
+                                log::warn!(
+                                    "search panel could not open a file to replace: {error:#}"
+                                );
+                                skipped += 1;
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let (snapshot, read_only, was_dirty) = buffer.read_with(cx, |buffer, _| {
+                    (buffer.snapshot(), buffer.read_only(), buffer.is_dirty())
+                });
+                if read_only {
+                    skipped += 1;
+                    continue;
+                }
+                let ranges = query.search(&snapshot, None).await;
+                let edits = ranges
+                    .into_iter()
+                    .filter(|range| {
+                        point.is_none_or(|point| snapshot.offset_to_point(range.start) == point)
+                    })
+                    .take(if point.is_some() { 1 } else { usize::MAX })
+                    .filter_map(|range| {
+                        let start = snapshot.offset_to_point(range.start);
+                        let end = snapshot.offset_to_point(range.end);
+                        let line_start = snapshot.point_to_offset(Point::new(start.row, 0));
+                        let line = snapshot
+                            .text_for_range(
+                                line_start
+                                    ..snapshot.point_to_offset(Point::new(
+                                        end.row,
+                                        snapshot.line_len(end.row),
+                                    )),
+                            )
+                            .collect::<String>();
+                        let hit = range.start - line_start..range.end - line_start;
+                        let replacement = query.replacement_for(&line, hit)?.into_owned();
+                        Some((
+                            snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
+                            replacement,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                if edits.is_empty() {
+                    continue;
+                }
+                replaced += edits.len();
+                buffer.update(cx, |buffer, cx| {
+                    buffer.edit(edits, None, cx);
+                });
+                // Like VS Code, save files that were clean: once their result rows are removed
+                // nothing else may hold the buffer, and unsaved edits would be dropped with it.
+                if was_dirty {
+                    unsaved += 1;
+                } else {
+                    let save = project.update(cx, |project, cx| project.save_buffer(buffer, cx));
+                    if let Err(error) = save.await {
+                        log::warn!("search panel could not save a replaced file: {error:#}");
+                        skipped += 1;
+                    }
+                }
+                done.push((file_ix, match_ix));
+            }
+            this.update(cx, |this, cx| {
+                if this.search_generation == generation {
+                    this.remove_replaced(done, cx);
+                }
+                let mut status = format!(
+                    "Replaced {replaced} occurrence{}",
+                    if replaced == 1 { "" } else { "s" }
+                );
+                if skipped > 0 {
+                    status.push_str(&format!(
+                        ", {skipped} file(s) read-only or failed to open/save"
+                    ));
+                }
+                if unsaved > 0 {
+                    status.push_str(&format!(", {unsaved} already-modified file(s) left unsaved"));
+                }
+                status.push('.');
+                this.replace_status = Some(status.into());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn remove_replaced(&mut self, mut done: Vec<(usize, Option<usize>)>, cx: &mut Context<Self>) {
+        // Remove from the back so earlier indices stay valid.
+        done.sort_unstable_by(|a, b| b.cmp(a));
+        for (file_ix, match_ix) in done {
+            let Some(file) = self.results.get_mut(file_ix) else {
+                continue;
+            };
+            match match_ix {
+                Some(match_ix) if match_ix < file.matches.len() => {
+                    file.matches.remove(match_ix);
+                    if file.matches.is_empty() {
+                        self.results.remove(file_ix);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.results.remove(file_ix);
+                }
+            }
+        }
+        self.collapsed.clear();
+        self.selected_row = None;
+        self.rebuild_rows();
+        cx.notify();
+    }
+
+    fn open_in_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = |editor: &Entity<Editor>| {
+            Some(editor.read(cx).text(cx)).filter(|text| !text.is_empty())
+        };
+        let action = DeploySearch {
+            query: text(&self.query_editor),
+            included_files: text(&self.include_editor),
+            excluded_files: text(&self.exclude_editor),
+            regex: Some(self.regex),
+            case_sensitive: Some(self.case_sensitive),
+            whole_word: Some(self.whole_word),
+            ..Default::default()
+        };
+        window.dispatch_action(Box::new(action), cx);
+    }
+
+    fn select_row(&mut self, row_ix: usize, cx: &mut Context<Self>) {
+        self.selected_row = Some(row_ix);
+        self.scroll_handle
+            .scroll_to_item(row_ix, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    /// VS Code keys in the result tree: ↑↓ select, Enter previews, Cmd+Enter pins,
+    /// ←→ collapse and expand files, Escape returns to the query.
+    fn handle_results_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let row_count = self.rows.len();
+        let selected = self.selected_row.filter(|ix| *ix < row_count);
+        let handled = match (event.keystroke.key.as_str(), selected) {
+            ("down", None) if row_count > 0 => {
+                self.select_row(0, cx);
+                true
+            }
+            ("down", Some(ix)) => {
+                self.select_row((ix + 1).min(row_count.saturating_sub(1)), cx);
+                true
+            }
+            ("up", Some(0)) | ("escape", _) => {
+                window.focus(&self.query_editor.focus_handle(cx), cx);
+                true
+            }
+            ("up", Some(ix)) => {
+                self.select_row(ix - 1, cx);
+                true
+            }
+            ("enter", Some(ix)) => {
+                match self.rows[ix] {
+                    Row::File(file_ix) => self.toggle_file(file_ix, cx),
+                    Row::Match(file_ix, match_ix) => {
+                        let pin = event.keystroke.modifiers.platform;
+                        self.open_match(file_ix, match_ix, !pin, window, cx);
+                        // Keep focus in the tree so the next match is one keystroke away.
+                        window.focus(&self.results_focus, cx);
+                    }
+                }
+                true
+            }
+            ("left", Some(ix)) => {
+                match self.rows[ix] {
+                    Row::File(file_ix) if !self.collapsed.contains(&file_ix) => {
+                        self.toggle_file(file_ix, cx)
+                    }
+                    Row::Match(file_ix, _) => {
+                        if let Some(parent) = self
+                            .rows
+                            .iter()
+                            .position(|row| matches!(row, Row::File(ix) if *ix == file_ix))
+                        {
+                            self.select_row(parent, cx);
+                        }
+                    }
+                    Row::File(_) => {}
+                }
+                true
+            }
+            ("right", Some(ix)) => {
+                if let Row::File(file_ix) = self.rows[ix]
+                    && self.collapsed.contains(&file_ix)
+                {
+                    self.toggle_file(file_ix, cx);
+                }
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            cx.stop_propagation();
         }
     }
 
@@ -1006,7 +1321,79 @@ impl Render for SearchPanel {
                     .flex_none()
                     .px_3()
                     .gap_1()
-                    .child(self.render_input(&self.query_editor, toggles, window, cx))
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .items_start()
+                            .child(
+                                div().h(INPUT_HEIGHT).flex().items_center().child(
+                                    IconButton::new(
+                                        "search-panel-toggle-replace",
+                                        if self.show_replace {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        },
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Toggle Replace"))
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.show_replace = !this.show_replace;
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            // ↓ from the query moves into the result tree, as in VS Code.
+                                            .capture_key_down(cx.listener(
+                                                |this, event: &KeyDownEvent, window, cx| {
+                                                    if event.keystroke.key == "down"
+                                                        && !this.rows.is_empty()
+                                                    {
+                                                        window.focus(&this.results_focus, cx);
+                                                        this.select_row(0, cx);
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            ))
+                                            .child(self.render_input(
+                                                &self.query_editor,
+                                                toggles,
+                                                window,
+                                                cx,
+                                            )),
+                                    )
+                                    .when(self.show_replace, |this| {
+                                        let replace_all = IconButton::new(
+                                            "search-panel-replace-all",
+                                            IconName::ReplaceAll,
+                                        )
+                                        .shape(IconButtonShape::Square)
+                                        .icon_size(IconSize::XSmall)
+                                        .disabled(!has_results || self.limit_reached)
+                                        .tooltip(Tooltip::text("Replace All"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.replace(ReplaceScope::All, window, cx)
+                                        }))
+                                        .into_any_element();
+                                        this.child(self.render_input(
+                                            &self.replace_editor,
+                                            vec![replace_all],
+                                            window,
+                                            cx,
+                                        ))
+                                    }),
+                            ),
+                    )
                     .when(self.show_filters, |this| {
                         this.child(filter_label("files to include"))
                             .child(self.render_input(&self.include_editor, Vec::new(), window, cx))
@@ -1018,11 +1405,34 @@ impl Render for SearchPanel {
                             .h(ROW_HEIGHT)
                             .justify_between()
                             .child(
-                                Label::new(self.summary().unwrap_or_default())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .single_line()
-                                    .truncate(),
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(self.summary().unwrap_or_default())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .single_line()
+                                            .truncate(),
+                                    )
+                                    .when(has_results, |this| {
+                                        this.child(
+                                            Button::new(
+                                                "search-panel-open-in-editor",
+                                                "Open in editor",
+                                            )
+                                            .label_size(LabelSize::Small)
+                                            .color(Color::Accent)
+                                            .tooltip(Tooltip::text(
+                                                "Open these results in an editor tab",
+                                            ))
+                                            .on_click(
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.open_in_editor(window, cx)
+                                                }),
+                                            ),
+                                        )
+                                    }),
                             )
                             .child(
                                 IconButton::new("search-panel-filters", IconName::Ellipsis)
@@ -1037,33 +1447,49 @@ impl Render for SearchPanel {
                             ),
                     ),
             )
+            .when_some(self.replace_status.clone(), |this, status| {
+                this.child(
+                    div().px_3().child(
+                        Label::new(status)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
             .child(
-                div().flex_1().min_h_0().child(
-                    uniform_list(
-                        "search-panel-results",
-                        row_count,
-                        cx.processor(|this, range: Range<usize>, window, cx| {
-                            range
-                                .map(|row_ix| {
-                                    this.render_row(row_ix, this.rows[row_ix], window, cx)
-                                })
-                                .collect()
-                        }),
-                    )
-                    .with_decoration(
-                        ui::indent_guides(px(INDENT_SIZE), IndentGuideColors::panel(cx))
-                            .with_compute_indents_fn(cx.entity(), |this, range, _, _| {
-                                this.rows[range]
-                                    .iter()
-                                    .map(|row| match row {
-                                        Row::File(_) => 0,
-                                        Row::Match(..) => 1,
+                div()
+                    .id("search-panel-results-container")
+                    .flex_1()
+                    .min_h_0()
+                    .track_focus(&self.results_focus)
+                    .on_key_down(cx.listener(Self::handle_results_key))
+                    .child(
+                        uniform_list(
+                            "search-panel-results",
+                            row_count,
+                            cx.processor(|this, range: Range<usize>, window, cx| {
+                                range
+                                    .map(|row_ix| {
+                                        this.render_row(row_ix, this.rows[row_ix], window, cx)
                                     })
                                     .collect()
                             }),
-                    )
-                    .size_full(),
-                ),
+                        )
+                        .with_decoration(
+                            ui::indent_guides(px(INDENT_SIZE), IndentGuideColors::panel(cx))
+                                .with_compute_indents_fn(cx.entity(), |this, range, _, _| {
+                                    this.rows[range]
+                                        .iter()
+                                        .map(|row| match row {
+                                            Row::File(_) => 0,
+                                            Row::Match(..) => 1,
+                                        })
+                                        .collect()
+                                }),
+                        )
+                        .track_scroll(&self.scroll_handle)
+                        .size_full(),
+                    ),
             )
     }
 }
@@ -1265,6 +1691,118 @@ mod tests {
             let active = pane.active_item().expect("an editor is open");
             assert!(!pane.is_active_preview_item(active.item_id()));
         });
+    }
+
+    async fn init_panel_test(
+        cx: &mut TestAppContext,
+        files: serde_json::Value,
+    ) -> (Entity<SearchPanel>, Entity<Project>, VisualTestContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/dir", files).await;
+        let project = Project::test(fs, ["/dir".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            cx.new(|cx| SearchPanel::new(workspace, window, cx))
+        });
+        (panel, project, cx)
+    }
+
+    fn search(panel: &Entity<SearchPanel>, query: &str, regex: bool, cx: &mut VisualTestContext) {
+        panel.update_in(cx, |panel, window, cx| {
+            panel.regex = regex;
+            panel
+                .query_editor
+                .update(cx, |editor, cx| editor.set_text(query, window, cx));
+            panel.run_search(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn replace(
+        panel: &Entity<SearchPanel>,
+        with: &str,
+        scope: ReplaceScope,
+        cx: &mut VisualTestContext,
+    ) {
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .replace_editor
+                .update(cx, |editor, cx| editor.set_text(with, window, cx));
+            panel.replace(scope, window, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    async fn buffer_text(
+        project: &Entity<Project>,
+        path: &str,
+        cx: &mut VisualTestContext,
+    ) -> (String, bool) {
+        let buffer = project
+            .update(cx, |project, cx| project.open_local_buffer(path, cx))
+            .await
+            .unwrap();
+        buffer.read_with(cx, |buffer, _| (buffer.text(), buffer.is_dirty()))
+    }
+
+    #[gpui::test]
+    async fn test_replace_all_saves_clean_files(cx: &mut TestAppContext) {
+        let (panel, project, mut cx) = init_panel_test(
+            cx,
+            json!({ "one.rs": "let needle = needle;", "two.rs": "needle();" }),
+        )
+        .await;
+        search(&panel, "needle", false, &mut cx);
+        replace(&panel, "pin", ReplaceScope::All, &mut cx);
+
+        assert_eq!(
+            buffer_text(&project, "/dir/one.rs", &mut cx).await,
+            ("let pin = pin;".into(), false)
+        );
+        assert_eq!(
+            buffer_text(&project, "/dir/two.rs", &mut cx).await,
+            ("pin();".into(), false)
+        );
+        panel.read_with(&cx, |panel, _| assert!(panel.results.is_empty()));
+    }
+
+    #[gpui::test]
+    async fn test_replace_single_match_and_capture_groups(cx: &mut TestAppContext) {
+        let (panel, project, mut cx) = init_panel_test(cx, json!({ "one.rs": "a1 b2\nc3" })).await;
+
+        search(&panel, "b2", false, &mut cx);
+        replace(&panel, "B2", ReplaceScope::Match(0, 0), &mut cx);
+        assert_eq!(
+            buffer_text(&project, "/dir/one.rs", &mut cx).await.0,
+            "a1 B2\nc3"
+        );
+
+        search(&panel, r"([a-z])(\d)", true, &mut cx);
+        // Replace only the second match (row 0, "c3" is on row 1): "$2$1" swaps letter and digit.
+        let target = panel.read_with(&cx, |panel, _| {
+            panel.results[0]
+                .matches
+                .iter()
+                .position(|m| m.line_number == 2)
+                .unwrap()
+        });
+        replace(&panel, "$2$1", ReplaceScope::Match(0, target), &mut cx);
+        assert_eq!(
+            buffer_text(&project, "/dir/one.rs", &mut cx).await.0,
+            "a1 B2\n3c"
+        );
     }
 
     #[test]
