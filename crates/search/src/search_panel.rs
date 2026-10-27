@@ -364,18 +364,33 @@ impl SearchPanel {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        // Opening by buffer entity (not path) also works for unsaved, untitled buffers.
         workspace.update(cx, |workspace, cx| {
-            let editor = workspace.open_project_item::<Editor>(
-                None,
-                buffer,
-                true,
-                true,
-                false,
-                allow_preview,
-                window,
-                cx,
-            );
+            // Reuse an editor already showing this buffer: path-based lookup misses untitled buffers.
+            let existing = workspace.items_of_type::<Editor>(cx).find(|editor| {
+                editor.read(cx).buffer().read(cx).as_singleton().as_ref() == Some(&buffer)
+            });
+            let editor = match existing {
+                Some(editor) => {
+                    workspace.activate_item(&editor, true, true, window, cx);
+                    if !allow_preview && let Some(pane) = workspace.pane_for(&editor) {
+                        pane.update(cx, |pane, _| {
+                            pane.unpreview_item_if_preview(editor.entity_id())
+                        });
+                    }
+                    editor
+                }
+                // keep_old_preview = true lets a single-click preview replace the previous one.
+                None => workspace.open_project_item::<Editor>(
+                    None,
+                    buffer,
+                    true,
+                    true,
+                    true,
+                    allow_preview,
+                    window,
+                    cx,
+                ),
+            };
             editor.update(cx, |editor, cx| {
                 editor.go_to_singleton_buffer_point(point, window, cx)
             });
@@ -686,6 +701,77 @@ fn match_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::FakeFs;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use workspace::MultiWorkspace;
+
+    #[gpui::test]
+    async fn test_open_match_preview_and_pin(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/dir",
+            json!({ "one.rs": "let needle = 1;", "two.rs": "fn f() { needle(); }" }),
+        )
+        .await;
+        let project = Project::test(fs, ["/dir".as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            cx.new(|cx| SearchPanel::new(workspace, window, cx))
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .query_editor
+                .update(cx, |editor, cx| editor.set_text("needle", window, cx));
+            panel.run_search(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(panel.read_with(cx, |panel, _| panel.results.len()), 2);
+
+        let item_count = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace.active_pane().read(cx).items_len()
+            })
+        };
+
+        // Single clicks reuse one preview tab.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_match(0, 0, true, window, cx)
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_match(1, 0, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(item_count(cx), 1);
+
+        // Double clicking the same result again pins it without duplicating the tab.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_match(1, 0, false, window, cx)
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_match(1, 0, false, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(item_count(cx), 1);
+        workspace.read_with(cx, |workspace, cx| {
+            let pane = workspace.active_pane().read(cx);
+            let active = pane.active_item().expect("an editor is open");
+            assert!(!pane.is_active_preview_item(active.item_id()));
+        });
+    }
 
     #[test]
     fn test_match_preview() {
