@@ -709,6 +709,39 @@ fn entry_label_size() -> LabelSize {
     LabelSize::Custom(ui::rems_from_px(13_f32))
 }
 
+/// Vilo: VS Code's hover actions on the explorer section header.
+fn render_section_actions() -> impl IntoElement {
+    let action_button =
+        |id: &'static str, icon: IconName, tooltip: &'static str, action: Box<dyn Action>| {
+            IconButton::new(id, icon)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text(tooltip))
+                .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+        };
+    h_flex()
+        .gap_0p5()
+        .pr_1()
+        .child(action_button(
+            "section-new-file",
+            IconName::Plus,
+            "New File...",
+            Box::new(NewFile),
+        ))
+        .child(action_button(
+            "section-new-folder",
+            IconName::FolderAdd,
+            "New Folder...",
+            Box::new(NewDirectory),
+        ))
+        .child(action_button(
+            "section-collapse-all",
+            IconName::ListCollapse,
+            "Collapse Folders in Explorer",
+            Box::new(CollapseAllEntries),
+        ))
+}
+
 impl ProjectPanel {
     fn new(
         workspace: &mut Workspace,
@@ -6088,6 +6121,8 @@ impl ProjectPanel {
             .is_some_and(|selection| selection.entry_id == entry_id);
 
         let file_name = details.filename.clone();
+        // Vilo: the worktree root row doubles as VS Code's section header (e.g. "AUTH").
+        let is_root = details.path.is_empty();
 
         let chevron = details.chevron.clone();
         let mut icon = details.icon.clone();
@@ -6595,6 +6630,9 @@ impl ProjectPanel {
                         ProjectPanelEntrySpacing::Standard => ListItemSpacing::ExtraDense,
                     })
                     .selectable(false)
+                    .when(is_root, |this| {
+                        this.end_slot_on_hover(render_section_actions())
+                    })
                     .when(
                         canonical_path.is_some()
                             || diagnostic_count.is_some()
@@ -6744,11 +6782,13 @@ impl ProjectPanel {
                         }
                     })
                     .child(if show_editor {
-                        h_flex().h(ENTRY_ROW_HEIGHT).w_full().child(self.filename_editor.clone())
-                    } else {
                         h_flex()
                             .h(ENTRY_ROW_HEIGHT)
-                            .map(|this| match self.state.ancestors.get(&entry_id) {
+                            .w_full()
+                            .child(self.filename_editor.clone())
+                    } else {
+                        h_flex().h(ENTRY_ROW_HEIGHT).map(|this| {
+                            match self.state.ancestors.get(&entry_id) {
                                 Some(folded_ancestors) => {
                                     this.children(self.render_folder_elements(
                                         folded_ancestors,
@@ -6767,6 +6807,13 @@ impl ProjectPanel {
                                     ))
                                 }
 
+                                None if is_root => this.child(
+                                    Label::new(file_name.to_uppercase())
+                                        .size(LabelSize::Custom(ui::rems_from_px(11_f32)))
+                                        .weight(FontWeight::SEMIBOLD)
+                                        .single_line()
+                                        .into_any_element(),
+                                ),
                                 None => this.child(
                                     Label::new(file_name)
                                         .size(entry_label_size())
@@ -6778,7 +6825,8 @@ impl ProjectPanel {
                                         )
                                         .into_any_element(),
                                 ),
-                            })
+                            }
+                        })
                     })
                     .on_secondary_mouse_down(cx.listener(
                         move |this, event: &MouseDownEvent, window, cx| {

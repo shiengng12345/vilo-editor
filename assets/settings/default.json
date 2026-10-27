@@ -1002,7 +1002,7 @@
   },
   "outline_panel": {
     // Whether to show the outline panel button in the status bar
-    "button": true,
+    "button": false,
     // Default width of the outline panel.
     "default_width": 300,
     // Where to dock the outline panel. Can be 'left' or 'right'.
