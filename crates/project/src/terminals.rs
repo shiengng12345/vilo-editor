@@ -383,6 +383,7 @@ impl Project {
             self.resolve_directory_environment(&env_shell, path.clone(), remote_client.clone(), cx);
 
         let lang_registry = self.languages.clone();
+        let started = std::time::Instant::now();
         cx.spawn(async move |project, cx| {
             let remote_shell = if let Some(remote_shell_request) = remote_shell_request {
                 let response = remote_shell_request
@@ -403,6 +404,7 @@ impl Project {
             let shell_program = remote_shell.as_ref().map(Shell::program).unwrap_or(shell);
             let shell_kind = ShellKind::new(&shell_program, path_style.is_windows());
             let mut env = env_task.await.unwrap_or_default();
+            log::info!("terminal: environment ready after {:?}", started.elapsed());
             env.extend(settings.env);
 
             let activation_script = maybe!(async {
@@ -423,6 +425,7 @@ impl Project {
             })
             .await
             .unwrap_or_default();
+            log::info!("terminal: toolchain resolved after {:?}", started.elapsed());
 
             let builder = project
                 .update(cx, move |_, cx| {
@@ -460,6 +463,7 @@ impl Project {
                     ))
                 })??
                 .await?;
+            log::info!("terminal: pty spawned after {:?}", started.elapsed());
             project.update(cx, move |this, cx| {
                 let terminal_handle = cx.new(|cx| builder.subscribe(cx));
 
@@ -633,7 +637,17 @@ impl Project {
                         remote_client.clone(),
                         cx,
                     ),
-                    None => project_env.local_directory_environment(&shell, path.clone(), cx),
+                    // Reuse the worktree environment loaded on startup: the same login shell
+                    // under a different key (program path, subdirectory) cost 1–3s per terminal.
+                    // shortcut: a subdirectory's .envrc is not applied here; the interactive shell runs direnv itself.
+                    None => {
+                        let shell = if shell.program() == get_system_shell() {
+                            Shell::System
+                        } else {
+                            shell
+                        };
+                        project_env.worktree_directory_environment(&shell, path.clone(), cx)
+                    }
                 })
         } else {
             Task::ready(None).shared()
