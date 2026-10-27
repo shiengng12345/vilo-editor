@@ -281,8 +281,6 @@ impl From<&dyn PanelHandle> for AnyView {
 /// A container with a fixed [`DockPosition`] adjacent to a certain widown edge.
 /// Can contain multiple panels and show/hide itself with all contents.
 pub struct Dock {
-    /// Vilo: view rendered above the active panel (the left sidebar's icon row).
-    sidebar_header: Option<AnyView>,
     position: DockPosition,
     panel_entries: Vec<PanelEntry>,
     workspace: WeakEntity<Workspace>,
@@ -391,8 +389,6 @@ struct PanelEntry {
 
 pub struct PanelButtons {
     dock: Entity<Dock>,
-    /// Vilo: render as the Cursor/VS Code style icon row at the top of the left sidebar.
-    sidebar_header: bool,
     _settings_subscription: Subscription,
 }
 
@@ -427,11 +423,6 @@ fn resize_panel_entry(
 }
 
 impl Dock {
-    pub fn set_sidebar_header(&mut self, header: AnyView, cx: &mut Context<Self>) {
-        self.sidebar_header = Some(header);
-        cx.notify();
-    }
-
     pub fn new(
         position: DockPosition,
         modal_layer: Entity<ModalLayer>,
@@ -457,7 +448,6 @@ impl Dock {
                 }
             });
             Self {
-                sidebar_header: None,
                 position,
                 workspace: workspace.downgrade(),
                 panel_entries: Default::default(),
@@ -935,6 +925,10 @@ impl Dock {
         }
     }
 
+    pub fn panels(&self) -> impl Iterator<Item = &Arc<dyn PanelHandle>> {
+        self.panel_entries.iter().map(|entry| &entry.panel)
+    }
+
     pub fn panels_len(&self) -> usize {
         self.panel_entries.len()
     }
@@ -1367,23 +1361,12 @@ impl Render for Dock {
                             Axis::Horizontal => this.w_full().h_full(),
                             Axis::Vertical => this.h_full().w_full(),
                         })
-                        .map(|this| match self.sidebar_header.clone() {
-                            Some(header) => this.flex().flex_col().child(header).child(
-                                entry.panel.to_any().cached(
-                                    StyleRefinement::default()
-                                        .v_flex()
-                                        .w_full()
-                                        .flex_1()
-                                        .min_h_0(),
-                                ),
-                            ),
-                            None => this.child(
-                                entry
-                                    .panel
-                                    .to_any()
-                                    .cached(StyleRefinement::default().v_flex().size_full()),
-                            ),
-                        }),
+                        .child(
+                            entry
+                                .panel
+                                .to_any()
+                                .cached(StyleRefinement::default().v_flex().size_full()),
+                        ),
                 )
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())
@@ -1403,15 +1386,7 @@ impl PanelButtons {
         let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
         Self {
             dock,
-            sidebar_header: false,
             _settings_subscription: settings_subscription,
-        }
-    }
-
-    pub fn new_sidebar_header(dock: Entity<Dock>, cx: &mut Context<Self>) -> Self {
-        Self {
-            sidebar_header: true,
-            ..Self::new(dock, cx)
         }
     }
 }
@@ -1422,10 +1397,8 @@ impl Render for PanelButtons {
         let active_index = dock.active_panel_index;
         let is_open = dock.is_open;
         let dock_position = dock.position;
-        let sidebar_header = self.sidebar_header;
 
         let (menu_anchor, menu_attach) = match dock.position {
-            DockPosition::Left if sidebar_header => (Anchor::TopLeft, Anchor::BottomLeft),
             DockPosition::Left => (Anchor::BottomLeft, Anchor::TopLeft),
             DockPosition::Bottom | DockPosition::Right => (Anchor::BottomRight, Anchor::TopRight),
         };
@@ -1565,10 +1538,7 @@ impl Render for PanelButtons {
                             // Include active state in element ID to invalidate the cached
                             // tooltip when panel state changes (e.g., via keyboard shortcut)
                             let button = IconButton::new((name, is_active_button as u64), icon)
-                                .when(sidebar_header, |button| {
-                                    button.icon_size(IconSize::Medium).size(ButtonSize::Large)
-                                })
-                                .when(!sidebar_header, |button| button.icon_size(IconSize::Small))
+                                .icon_size(IconSize::Small)
                                 .toggle_state(is_active_button)
                                 .tab_index(0isize)
                                 .aria_label(icon_tooltip)
@@ -1603,16 +1573,6 @@ impl Render for PanelButtons {
 
         let has_buttons = !buttons.is_empty();
 
-        if sidebar_header {
-            return h_flex()
-                .w_full()
-                .justify_center()
-                .gap_1()
-                .py_1()
-                .children(buttons)
-                .into_any_element();
-        }
-
         h_flex()
             .gap_1()
             .when(
@@ -1625,7 +1585,6 @@ impl Render for PanelButtons {
             .when(has_buttons && dock.position == DockPosition::Left, |this| {
                 this.child(Divider::vertical().color(DividerColor::Border))
             })
-            .into_any_element()
     }
 }
 
