@@ -18,9 +18,9 @@ pub use search_status_button::SEARCH_ICON;
 use crate::project_search::ProjectSearchBar;
 
 pub mod buffer_search;
+mod disk_search;
 pub mod project_search;
 pub(crate) mod search_bar;
-mod disk_search;
 pub mod search_panel;
 pub mod search_status_button;
 pub mod text_finder;

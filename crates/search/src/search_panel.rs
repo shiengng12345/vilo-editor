@@ -129,8 +129,9 @@ pub struct SearchPanel {
     replace_status: Option<SharedString>,
     results_focus: FocusHandle,
     scroll_handle: UniformListScrollHandle,
-    /// Bumped per search so an in-flight replace never edits a newer result list by index.
-    search_generation: usize,
+    /// The query behind `results`; the input may already hold newer, unsearched text.
+    results_query: Option<SearchQuery>,
+    pending_replace: Option<Task<()>>,
     case_sensitive: bool,
     whole_word: bool,
     regex: bool,
@@ -189,7 +190,8 @@ impl SearchPanel {
             replace_status: None,
             results_focus: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
-            search_generation: 0,
+            results_query: None,
+            pending_replace: None,
             case_sensitive: false,
             whole_word: false,
             regex: false,
@@ -280,7 +282,7 @@ impl SearchPanel {
     }
 
     fn run_search(&mut self, cx: &mut Context<Self>) {
-        self.search_generation += 1;
+        self.results_query = None;
         self.replace_status = None;
         self.results.clear();
         self.collapsed.clear();
@@ -308,6 +310,7 @@ impl SearchPanel {
             }
             Some(Ok(query)) => query,
         };
+        self.results_query = Some(query.clone());
         self.status = Status::Searching;
         self.search_started = Some(Instant::now());
         self._timer = Some(cx.spawn(async move |this, cx| {
@@ -621,6 +624,7 @@ impl SearchPanel {
         file_ix: usize,
         match_ix: usize,
         allow_preview: bool,
+        focus_editor: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -648,7 +652,7 @@ impl SearchPanel {
                     });
                     let editor = match existing {
                         Some(editor) => {
-                            workspace.activate_item(&editor, true, true, window, cx);
+                            workspace.activate_item(&editor, true, focus_editor, window, cx);
                             if !allow_preview && let Some(pane) = workspace.pane_for(&editor) {
                                 pane.update(cx, |pane, _| {
                                     pane.unpreview_item_if_preview(editor.entity_id())
@@ -661,7 +665,7 @@ impl SearchPanel {
                             None,
                             buffer,
                             true,
-                            true,
+                            focus_editor,
                             true,
                             allow_preview,
                             window,
@@ -679,7 +683,7 @@ impl SearchPanel {
                     workspace.open_path_preview(
                         project_path.clone(),
                         None,
-                        true,
+                        focus_editor,
                         allow_preview,
                         true,
                         window,
@@ -921,7 +925,7 @@ impl SearchPanel {
                         this.selected_row = Some(row_ix);
                         // Single click previews, double click pins the tab, as in VS Code.
                         let allow_preview = event.click_count() < 2;
-                        this.open_match(file_ix, match_ix, allow_preview, window, cx);
+                        this.open_match(file_ix, match_ix, allow_preview, true, window, cx);
                         cx.notify();
                     }),
                 )
@@ -934,12 +938,20 @@ impl SearchPanel {
     /// does): one transaction per buffer, so Cmd+Z in a file restores it. Matches are recomputed
     /// on each buffer's current text right before editing, so stale positions are never edited.
     fn replace(&mut self, scope: ReplaceScope, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Ok(query)) = self.build_query(cx) else {
+        if self.pending_replace.is_some() {
+            return;
+        }
+        // Replace with the query that produced the visible results, not the possibly newer input text.
+        let Some(query) = self.results_query.clone() else {
             return;
         };
-        if matches!(scope, ReplaceScope::All) && self.limit_reached {
-            self.replace_status =
-                Some("Results were cut off; refine the search before replacing all".into());
+        if matches!(scope, ReplaceScope::All)
+            && (self.limit_reached || !matches!(self.status, Status::Done))
+        {
+            self.replace_status = Some(
+                "Results are incomplete; wait for the search to finish or refine it before replacing all"
+                    .into(),
+            );
             cx.notify();
             return;
         }
@@ -949,30 +961,28 @@ impl SearchPanel {
             .iter()
             .enumerate()
             .filter_map(|(file_ix, file)| {
-                let match_ix = match scope {
+                let search_match = match scope {
                     ReplaceScope::All => None,
                     ReplaceScope::File(ix) if ix == file_ix => None,
-                    ReplaceScope::Match(ix, match_ix) if ix == file_ix => Some(match_ix),
+                    ReplaceScope::Match(ix, match_ix) if ix == file_ix => {
+                        Some(file.matches.get(match_ix)?)
+                    }
                     _ => return None,
                 };
-                let point = match_ix
-                    .and_then(|match_ix| file.matches.get(match_ix))
-                    .map(|m| m.point);
                 let target = match &file.target {
                     ResultTarget::Buffer(buffer) => ResultTarget::Buffer(buffer.clone()),
                     ResultTarget::Path(path) => ResultTarget::Path(path.clone()),
                 };
-                Some((file_ix, match_ix, point, target))
+                Some((search_match.map(|m| (m.anchor, m.point)), target))
             })
             .collect::<Vec<_>>();
         let project = self.project.clone();
-        let generation = self.search_generation;
-        cx.spawn_in(window, async move |this, cx| {
+        self.pending_replace = Some(cx.spawn_in(window, async move |this, cx| {
             let mut replaced = 0;
             let mut skipped = 0;
             let mut unsaved = 0;
-            let mut done = Vec::new();
-            for (file_ix, match_ix, point, target) in targets {
+            let mut failed_saves = Vec::new();
+            for (search_match, target) in targets {
                 let buffer = match target {
                     ResultTarget::Buffer(buffer) => buffer,
                     ResultTarget::Path(path) => {
@@ -989,13 +999,16 @@ impl SearchPanel {
                         }
                     }
                 };
-                let (snapshot, read_only, was_dirty) = buffer.read_with(cx, |buffer, _| {
-                    (buffer.snapshot(), buffer.read_only(), buffer.is_dirty())
-                });
+                let (snapshot, read_only) =
+                    buffer.read_with(cx, |buffer, _| (buffer.snapshot(), buffer.read_only()));
                 if read_only {
                     skipped += 1;
                     continue;
                 }
+                // Anchors track edits made since the search, so a single replace hits the clicked match.
+                let point = search_match.map(|(anchor, point)| {
+                    anchor.map_or(point, |anchor| anchor.to_point(&snapshot))
+                });
                 let ranges = query.search(&snapshot, None).await;
                 let edits = ranges
                     .into_iter()
@@ -1028,25 +1041,42 @@ impl SearchPanel {
                     continue;
                 }
                 replaced += edits.len();
-                buffer.update(cx, |buffer, cx| {
+                // Dirty state is read at edit time: the user may have typed while the search awaited.
+                let was_dirty = buffer.update(cx, |buffer, cx| {
+                    let was_dirty = buffer.is_dirty();
                     buffer.edit(edits, None, cx);
+                    was_dirty
                 });
-                // Like VS Code, save files that were clean: once their result rows are removed
-                // nothing else may hold the buffer, and unsaved edits would be dropped with it.
+                // Like VS Code, save files that were clean: a buffer only held by the result list
+                // would be dropped with its edits once the results refresh.
                 if was_dirty {
                     unsaved += 1;
                 } else {
-                    let save = project.update(cx, |project, cx| project.save_buffer(buffer, cx));
+                    let save =
+                        project.update(cx, |project, cx| project.save_buffer(buffer.clone(), cx));
                     if let Err(error) = save.await {
                         log::warn!("search panel could not save a replaced file: {error:#}");
-                        skipped += 1;
+                        failed_saves.push(buffer);
                     }
                 }
-                done.push((file_ix, match_ix));
             }
-            this.update(cx, |this, cx| {
-                if this.search_generation == generation {
-                    this.remove_replaced(done, cx);
+            this.update_in(cx, |this, window, cx| {
+                // Keep unsaved edits reachable by opening them in an editor.
+                if let Some(workspace) = this.workspace.upgrade() {
+                    for buffer in &failed_saves {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.open_project_item::<Editor>(
+                                None,
+                                buffer.clone(),
+                                true,
+                                false,
+                                true,
+                                false,
+                                window,
+                                cx,
+                            );
+                        });
+                    }
                 }
                 let mut status = format!(
                     "Replaced {replaced} occurrence{}",
@@ -1054,55 +1084,38 @@ impl SearchPanel {
                 );
                 if skipped > 0 {
                     status.push_str(&format!(
-                        ", {skipped} file(s) read-only or failed to open/save"
+                        ", skipped {skipped} read-only or unreadable file(s)"
+                    ));
+                }
+                if !failed_saves.is_empty() {
+                    status.push_str(&format!(
+                        ", {} file(s) failed to save and were opened",
+                        failed_saves.len()
                     ));
                 }
                 if unsaved > 0 {
-                    status.push_str(&format!(", {unsaved} already-modified file(s) left unsaved"));
+                    status.push_str(&format!(
+                        ", {unsaved} already-modified file(s) left unsaved"
+                    ));
                 }
                 status.push('.');
+                this.pending_replace = None;
+                // Re-search instead of patching rows: replacements can create or move matches.
+                this.run_search(cx);
                 this.replace_status = Some(status.into());
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
-    }
-
-    fn remove_replaced(&mut self, mut done: Vec<(usize, Option<usize>)>, cx: &mut Context<Self>) {
-        // Remove from the back so earlier indices stay valid.
-        done.sort_unstable_by(|a, b| b.cmp(a));
-        for (file_ix, match_ix) in done {
-            let Some(file) = self.results.get_mut(file_ix) else {
-                continue;
-            };
-            match match_ix {
-                Some(match_ix) if match_ix < file.matches.len() => {
-                    file.matches.remove(match_ix);
-                    if file.matches.is_empty() {
-                        self.results.remove(file_ix);
-                    }
-                }
-                Some(_) => {}
-                None => {
-                    self.results.remove(file_ix);
-                }
-            }
-        }
-        self.collapsed.clear();
-        self.selected_row = None;
-        self.rebuild_rows();
+        }));
         cx.notify();
     }
 
     fn open_in_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = |editor: &Entity<Editor>| {
-            Some(editor.read(cx).text(cx)).filter(|text| !text.is_empty())
-        };
+        // Empty filters are sent too: `None` would keep the project search's previous filters.
         let action = DeploySearch {
-            query: text(&self.query_editor),
-            included_files: text(&self.include_editor),
-            excluded_files: text(&self.exclude_editor),
+            query: Some(self.query_editor.read(cx).text(cx)),
+            included_files: Some(self.include_editor.read(cx).text(cx)),
+            excluded_files: Some(self.exclude_editor.read(cx).text(cx)),
             regex: Some(self.regex),
             case_sensitive: Some(self.case_sensitive),
             whole_word: Some(self.whole_word),
@@ -1150,9 +1163,8 @@ impl SearchPanel {
                     Row::File(file_ix) => self.toggle_file(file_ix, cx),
                     Row::Match(file_ix, match_ix) => {
                         let pin = event.keystroke.modifiers.platform;
-                        self.open_match(file_ix, match_ix, !pin, window, cx);
-                        // Keep focus in the tree so the next match is one keystroke away.
-                        window.focus(&self.results_focus, cx);
+                        // Leave focus in the tree so the next match is one keystroke away.
+                        self.open_match(file_ix, match_ix, !pin, false, window, cx);
                     }
                 }
                 true
@@ -1379,7 +1391,12 @@ impl Render for SearchPanel {
                                         )
                                         .shape(IconButtonShape::Square)
                                         .icon_size(IconSize::XSmall)
-                                        .disabled(!has_results || self.limit_reached)
+                                        .disabled(
+                                            !has_results
+                                                || self.limit_reached
+                                                || !matches!(self.status, Status::Done)
+                                                || self.pending_replace.is_some(),
+                                        )
                                         .tooltip(Tooltip::text("Replace All"))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.replace(ReplaceScope::All, window, cx)
@@ -1669,20 +1686,20 @@ mod tests {
 
         // Single clicks reuse one preview tab.
         panel.update_in(cx, |panel, window, cx| {
-            panel.open_match(0, 0, true, window, cx)
+            panel.open_match(0, 0, true, true, window, cx)
         });
         panel.update_in(cx, |panel, window, cx| {
-            panel.open_match(1, 0, true, window, cx)
+            panel.open_match(1, 0, true, true, window, cx)
         });
         cx.run_until_parked();
         assert_eq!(item_count(cx), 1);
 
         // Double clicking the same result again pins it without duplicating the tab.
         panel.update_in(cx, |panel, window, cx| {
-            panel.open_match(1, 0, false, window, cx)
+            panel.open_match(1, 0, false, true, window, cx)
         });
         panel.update_in(cx, |panel, window, cx| {
-            panel.open_match(1, 0, false, window, cx)
+            panel.open_match(1, 0, false, true, window, cx)
         });
         cx.run_until_parked();
         assert_eq!(item_count(cx), 1);
@@ -1802,6 +1819,22 @@ mod tests {
         assert_eq!(
             buffer_text(&project, "/dir/one.rs", &mut cx).await.0,
             "a1 B2\n3c"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_results_refresh_after_replace_creates_matches(cx: &mut TestAppContext) {
+        let (panel, project, mut cx) = init_panel_test(cx, json!({ "one.rs": "a a" })).await;
+        search(&panel, "a", false, &mut cx);
+        replace(&panel, "a a", ReplaceScope::Match(0, 0), &mut cx);
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(panel.results[0].matches.len(), 3)
+        });
+        // The second row now points at inserted text; only that occurrence must change.
+        replace(&panel, "b", ReplaceScope::Match(0, 1), &mut cx);
+        assert_eq!(
+            buffer_text(&project, "/dir/one.rs", &mut cx).await,
+            ("a b a".into(), false)
         );
     }
 
