@@ -702,6 +702,13 @@ enum RemovalKind {
     Delete,
 }
 
+/// Vilo: VS Code's explorer uses 13px labels in 22px rows, smaller than Zed's UI-sized labels.
+const ENTRY_ROW_HEIGHT: Pixels = px(22.);
+
+fn entry_label_size() -> LabelSize {
+    LabelSize::Custom(ui::rems_from_px(13_f32))
+}
+
 impl ProjectPanel {
     fn new(
         workspace: &mut Workspace,
@@ -6737,10 +6744,10 @@ impl ProjectPanel {
                         }
                     })
                     .child(if show_editor {
-                        h_flex().h_6().w_full().child(self.filename_editor.clone())
+                        h_flex().h(ENTRY_ROW_HEIGHT).w_full().child(self.filename_editor.clone())
                     } else {
                         h_flex()
-                            .h_6()
+                            .h(ENTRY_ROW_HEIGHT)
                             .map(|this| match self.state.ancestors.get(&entry_id) {
                                 Some(folded_ancestors) => {
                                     this.children(self.render_folder_elements(
@@ -6762,6 +6769,7 @@ impl ProjectPanel {
 
                                 None => this.child(
                                     Label::new(file_name)
+                                        .size(entry_label_size())
                                         .single_line()
                                         .color(filename_text_color)
                                         .when(
@@ -6944,6 +6952,7 @@ impl ProjectPanel {
                         .debug_selector(|| format!("project_panel_path_component_{component}"))
                         .child(
                             Label::new(component)
+                                .size(entry_label_size())
                                 .single_line()
                                 .color(filename_text_color)
                                 .when(bold_folder_labels && !is_file, |this| {
@@ -7042,6 +7051,7 @@ impl ProjectPanel {
             })
             .child(
                 Label::new(delimiter.clone())
+                    .size(entry_label_size())
                     .single_line()
                     .color(filename_text_color),
             )

@@ -12475,9 +12475,9 @@ async fn test_focus_follows_mouse_into_blank_area(cx: &mut gpui::TestAppContext)
         );
     });
 
-    // Hover over the blank space below the last entry in the project panel,
-    // which lives in the right dock by default.
-    cx.simulate_mouse_move(point(px(1800.), px(600.)), None, Modifiers::none());
+    // Hover over the blank space below the last entry in the project panel, which Vilo
+    // docks on the left (as VS Code does), just right of the 48px activity bar.
+    cx.simulate_mouse_move(point(px(150.), px(600.)), None, Modifiers::none());
     cx.executor().advance_clock(Duration::from_millis(200));
     cx.run_until_parked();
 
@@ -12502,6 +12502,9 @@ pub(crate) fn init_test(cx: &mut TestAppContext) {
                     .project_panel
                     .get_or_insert_default()
                     .auto_fold_dirs = Some(false);
+                // Vilo defaults to VS Code's denser rows; keep upstream's geometry for these tests.
+                settings.project_panel.get_or_insert_default().entry_spacing =
+                    Some(settings::ProjectPanelEntrySpacing::Comfortable);
                 settings.project.worktree.file_scan_exclusions =
                     Some(SplicingVec::from(Vec::new()));
                 settings.project.worktree.file_scan_depth = Some(0);
@@ -12524,6 +12527,9 @@ fn init_test_with_editor(cx: &mut TestAppContext) {
                     .project_panel
                     .get_or_insert_default()
                     .auto_fold_dirs = Some(false);
+                // Vilo defaults to VS Code's denser rows; keep upstream's geometry for these tests.
+                settings.project_panel.get_or_insert_default().entry_spacing =
+                    Some(settings::ProjectPanelEntrySpacing::Comfortable);
                 settings.project.worktree.file_scan_exclusions =
                     Some(SplicingVec::from(Vec::new()));
                 settings.project.worktree.file_scan_depth = Some(0);
@@ -12547,6 +12553,9 @@ fn init_test_with_git_ui(cx: &mut TestAppContext) {
                     .project_panel
                     .get_or_insert_default()
                     .auto_fold_dirs = Some(false);
+                // Vilo defaults to VS Code's denser rows; keep upstream's geometry for these tests.
+                settings.project_panel.get_or_insert_default().entry_spacing =
+                    Some(settings::ProjectPanelEntrySpacing::Comfortable);
                 settings.project.worktree.file_scan_exclusions =
                     Some(SplicingVec::from(Vec::new()));
                 settings.project.worktree.file_scan_depth = Some(0);
