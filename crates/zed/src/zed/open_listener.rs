@@ -1494,6 +1494,15 @@ mod tests {
         let request = parse("vilo://channel/some-channel-123", cx);
         assert_eq!(request.join_channel, Some(123));
 
+        // Callers such as the command palette parse pasted links directly.
+        cx.update(|cx| {
+            assert_eq!(
+                parse_zed_link("vilo://channel/some-channel-123", cx),
+                parse_zed_link("zed://channel/some-channel-123", cx),
+            );
+            assert!(parse_zed_link("vilo://channel/some-channel-123", cx).is_some());
+        });
+
         let request = parse("vilo://settings", cx);
         assert!(matches!(
             request.kind,
