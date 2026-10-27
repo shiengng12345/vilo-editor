@@ -18,13 +18,14 @@ use gpui::{
 };
 use language::{Buffer, Point, ToPoint as _};
 use project::{
-    Project, ProjectPath,
+    Project, ProjectPath, WorktreeSettings,
     search::{SearchQuery, SearchResult},
 };
 use util::paths::PathStyle;
 use util::rel_path::RelPath;
 
 use crate::disk_search::{self, WalkProgress};
+use settings::Settings as _;
 use text::Anchor;
 use ui::{
     IconButton, IconButtonShape, IndentGuideColors, ListItem, ListItemSpacing, Tooltip, prelude::*,
@@ -373,10 +374,14 @@ impl SearchPanel {
 
         let progress = Arc::new(WalkProgress::default());
         self.walk_progress = Some(progress.clone());
+        let scan_exclusions = WorktreeSettings::get_global(cx)
+            .file_scan_exclusions
+            .clone();
         let candidates = disk_search::walk(
             roots,
             query.clone(),
             path_style,
+            scan_exclusions,
             skip_abs_paths,
             progress.clone(),
         );

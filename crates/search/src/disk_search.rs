@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use collections::HashSet;
 use ignore::{WalkBuilder, WalkState};
 use project::{WorktreeId, search::SearchQuery};
-use util::paths::PathStyle;
+use util::paths::{PathMatcher, PathStyle};
 use util::rel_path::RelPath;
 
 /// Directories skipped like VS Code's default search.exclude (see also worktree's ignore rules).
@@ -44,6 +44,8 @@ pub(crate) fn walk(
     roots: Vec<DiskRoot>,
     query: SearchQuery,
     path_style: PathStyle,
+    // The worktree's `file_scan_exclusions`, so search skips what the project never scans.
+    scan_exclusions: PathMatcher,
     skip_abs_paths: HashSet<PathBuf>,
     progress: Arc<WalkProgress>,
 ) -> smol::channel::Receiver<DiskCandidate> {
@@ -72,6 +74,7 @@ pub(crate) fn walk(
     let roots = Arc::new(roots);
     let query = Arc::new(query);
     let skip_abs_paths = Arc::new(skip_abs_paths);
+    let scan_exclusions = Arc::new(scan_exclusions);
 
     std::thread::Builder::new()
         .name("vilo-disk-search".into())
@@ -81,6 +84,7 @@ pub(crate) fn walk(
                 let roots = roots.clone();
                 let query = query.clone();
                 let skip_abs_paths = skip_abs_paths.clone();
+                let scan_exclusions = scan_exclusions.clone();
                 let progress = progress.clone();
                 Box::new(move |entry| {
                     if progress.cancelled.load(Ordering::Relaxed) {
@@ -98,7 +102,8 @@ pub(crate) fn walk(
                         let excluded = relative_to_root(&roots, abs_path, path_style).is_some_and(
                             |(_, rel_path)| {
                                 !rel_path.is_empty()
-                                    && query.files_to_exclude().is_match(rel_path.as_ref())
+                                    && (scan_exclusions.is_match(rel_path.as_ref())
+                                        || query.files_to_exclude().is_match(rel_path.as_ref()))
                             },
                         );
                         return if excluded {
@@ -114,7 +119,7 @@ pub(crate) fn walk(
                     else {
                         return WalkState::Continue;
                     };
-                    if !query.match_path(&rel_path) {
+                    if scan_exclusions.is_match(rel_path.as_ref()) || !query.match_path(&rel_path) {
                         return WalkState::Continue;
                     }
                     progress.files_searched.fetch_add(1, Ordering::Relaxed);
@@ -211,7 +216,6 @@ fn decode_utf16(bytes: &[u8], to_unit: fn([u8; 2]) -> u16) -> String {
 mod tests {
     use super::*;
     use project::search::SearchQuery;
-    use util::paths::PathMatcher;
 
     fn query(text: &str) -> SearchQuery {
         SearchQuery::text(
@@ -252,6 +256,7 @@ mod tests {
             }],
             query("SendSmsCode"),
             PathStyle::local(),
+            PathMatcher::default(),
             HashSet::default(),
             progress.clone(),
         );
@@ -303,6 +308,7 @@ mod tests {
             }],
             query,
             PathStyle::local(),
+            PathMatcher::default(),
             HashSet::default(),
             progress.clone(),
         );
