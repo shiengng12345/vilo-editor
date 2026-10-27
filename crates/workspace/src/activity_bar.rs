@@ -52,7 +52,7 @@ impl ActivityBar {
             .icon_label(window, cx)
             .and_then(|label| label.parse::<usize>().ok());
         Some(render_item(
-            panel.persistent_name().into(),
+            format!("activity-bar-{}", panel.persistent_name()).into(),
             icon,
             tooltip.into(),
             action,
@@ -97,6 +97,7 @@ fn render_item(
                         .icon_size(IconSize::Medium)
                         .size(ButtonSize::Large)
                         .toggle_state(is_active)
+                        .tab_index(0isize)
                         .aria_label(tooltip.clone())
                         .tooltip({
                             let action = action.boxed_clone();
@@ -160,7 +161,8 @@ impl Render for ActivityBar {
                         .trigger_with_tooltip(
                             IconButton::new("activity-bar-manage-button", IconName::Settings)
                                 .icon_size(IconSize::Medium)
-                                .size(ButtonSize::Large),
+                                .size(ButtonSize::Large)
+                                .tab_index(0isize),
                             Tooltip::text("Manage"),
                         )
                         .anchor(Anchor::BottomLeft)
