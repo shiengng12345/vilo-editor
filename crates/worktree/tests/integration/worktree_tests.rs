@@ -1991,20 +1991,71 @@ async fn test_open_gitignored_files(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_dependency_dirs_ignored_without_git(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    // No .git and no .gitignore: dependency folders must still be ignored and left unscanned.
+    fs.insert_tree(
+        "/root",
+        json!({
+            "src": { "main.js": "" },
+            "node_modules": { "pkg": { "index.js": "" } },
+            "web": {
+                "bower_components": { "lib": { "lib.js": "" } },
+                "app.js": "",
+            },
+        }),
+    )
+    .await;
+
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.entries(true, 0)
+                .map(|e| (e.path.as_ref(), e.is_ignored))
+                .collect::<Vec<_>>(),
+            &[
+                (rel_path(""), false),
+                (rel_path("node_modules"), true),
+                (rel_path("src"), false),
+                (rel_path("src/main.js"), false),
+                (rel_path("web"), false),
+                (rel_path("web/app.js"), false),
+                (rel_path("web/bower_components"), true),
+            ]
+        );
+    });
+}
+
+// Vilo: node_modules is always ignored by default, so this gitignore round-trip uses `deps`.
+#[gpui::test]
 async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.background_executor.clone());
     fs.insert_tree(
         "/root",
         json!({
-            ".gitignore": "node_modules\n",
+            ".gitignore": "deps\n",
             "a": {
                 "a.js": "",
             },
             "b": {
                 "b.js": "",
             },
-            "node_modules": {
+            "deps": {
                 "c": {
                     "c.js": "",
                 },
@@ -2045,7 +2096,7 @@ async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
     tree.read_with(cx, |tree, _| {
         tree.as_local()
             .unwrap()
-            .refresh_entries_for_paths(vec![rel_path("node_modules/d/d.js").into()])
+            .refresh_entries_for_paths(vec![rel_path("deps/d/d.js").into()])
     })
     .recv()
     .await;
@@ -2063,19 +2114,19 @@ async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
                 (rel_path("a/a.js"), false),
                 (rel_path("b"), false),
                 (rel_path("b/b.js"), false),
-                (rel_path("node_modules"), true),
-                (rel_path("node_modules/c"), true),
-                (rel_path("node_modules/d"), true),
-                (rel_path("node_modules/d/d.js"), true),
-                (rel_path("node_modules/d/e"), true),
-                (rel_path("node_modules/d/f"), true),
+                (rel_path("deps"), true),
+                (rel_path("deps/c"), true),
+                (rel_path("deps/d"), true),
+                (rel_path("deps/d/d.js"), true),
+                (rel_path("deps/d/e"), true),
+                (rel_path("deps/d/f"), true),
             ]
         );
     });
     let read_dir_count_2 = fs.read_dir_call_count();
     assert_eq!(read_dir_count_2 - read_dir_count_1, 2);
 
-    // Update the gitignore so that node_modules is no longer ignored,
+    // Update the gitignore so that deps is no longer ignored,
     // but a subdirectory is ignored
     fs.save("/root/.gitignore".as_ref(), &"e".into(), Default::default())
         .await
@@ -2096,16 +2147,16 @@ async fn test_dirs_no_longer_ignored(cx: &mut TestAppContext) {
                 (rel_path("b"), false),
                 (rel_path("b/b.js"), false),
                 // This directory is no longer ignored
-                (rel_path("node_modules"), false),
-                (rel_path("node_modules/c"), false),
-                (rel_path("node_modules/c/c.js"), false),
-                (rel_path("node_modules/d"), false),
-                (rel_path("node_modules/d/d.js"), false),
+                (rel_path("deps"), false),
+                (rel_path("deps/c"), false),
+                (rel_path("deps/c/c.js"), false),
+                (rel_path("deps/d"), false),
+                (rel_path("deps/d/d.js"), false),
                 // This subdirectory is now ignored
-                (rel_path("node_modules/d/e"), true),
-                (rel_path("node_modules/d/f"), false),
-                (rel_path("node_modules/d/f/f1.js"), false),
-                (rel_path("node_modules/d/f/f2.js"), false),
+                (rel_path("deps/d/e"), true),
+                (rel_path("deps/d/f"), false),
+                (rel_path("deps/d/f/f1.js"), false),
+                (rel_path("deps/d/f/f2.js"), false),
             ]
         );
     });

@@ -35,6 +35,9 @@ pub enum IgnoreKind {
     RepoExclude,
 }
 
+// shortcut: hard-coded VS Code defaults; make this a setting with step C (search.exclude).
+const DEFAULT_IGNORED_DIRS: &[&str] = &["node_modules", "bower_components"];
+
 impl IgnoreStack {
     pub fn none() -> Self {
         Self {
@@ -84,6 +87,16 @@ impl IgnoreStack {
 
     pub fn is_abs_path_ignored(&self, abs_path: &Path, is_dir: bool) -> bool {
         if is_dir && abs_path.file_name() == Some(OsStr::new(".git")) {
+            return true;
+        }
+        // Vilo: like VS Code's default search.exclude, treat dependency folders as ignored even
+        // outside git repos. Ignored directories stay visible but are only loaded when expanded,
+        // so a folder full of node_modules no longer has to be scanned before search can finish.
+        if is_dir
+            && abs_path
+                .file_name()
+                .is_some_and(|name| DEFAULT_IGNORED_DIRS.iter().any(|dir| name == *dir))
+        {
             return true;
         }
 

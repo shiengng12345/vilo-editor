@@ -1,5 +1,4 @@
 use crate::dock::{Dock, PanelHandle};
-use crate::pane::DeploySearch;
 use gpui::{Action, Anchor, Entity, Focusable, Subscription};
 use settings::SettingsStore;
 use std::sync::Arc;
@@ -7,7 +6,8 @@ use ui::{ContextMenu, CountBadge, IconButton, PopoverMenu, Tooltip, prelude::*};
 
 pub const ACTIVITY_BAR_WIDTH: Pixels = px(48.);
 const ACTIVE_INDICATOR_WIDTH: Pixels = px(2.);
-const PROJECT_PANEL_NAME: &str = "Project Panel";
+/// VS Code's activity bar order; other panels follow in dock order.
+const VS_CODE_ORDER: &[&str] = &["Project Panel", "Search Panel", "GitPanel", "DebugPanel"];
 
 /// Vilo: VS Code style activity bar along the left edge of the window.
 ///
@@ -120,18 +120,18 @@ impl Render for ActivityBar {
         let focus_handle = dock.focus_handle(cx);
         let panels = dock.panels().cloned().collect::<Vec<_>>();
 
-        let mut items = Vec::new();
-        let mut search_placed = false;
-        for (index, panel) in panels.iter().enumerate() {
-            items.extend(self.panel_item(index, panel, window, cx));
-            if panel.persistent_name() == PROJECT_PANEL_NAME {
-                items.push(search_item(focus_handle.clone(), cx));
-                search_placed = true;
-            }
-        }
-        if !search_placed {
-            items.insert(0, search_item(focus_handle.clone(), cx));
-        }
+        let mut ordered = panels.iter().enumerate().collect::<Vec<_>>();
+        ordered.sort_by_key(|(index, panel)| {
+            let rank = VS_CODE_ORDER
+                .iter()
+                .position(|name| *name == panel.persistent_name())
+                .unwrap_or(VS_CODE_ORDER.len());
+            (rank, *index)
+        });
+        let mut items = ordered
+            .into_iter()
+            .filter_map(|(index, panel)| self.panel_item(index, panel, window, cx))
+            .collect::<Vec<_>>();
         items.push(render_item(
             "activity-bar-extensions".into(),
             IconName::Blocks,
@@ -189,19 +189,4 @@ impl Render for ActivityBar {
                 ),
             )
     }
-}
-
-// shortcut: Search opens Zed's center project search until the W0.5 search side bar exists,
-// so it never shows the active indicator; switch it to the side bar panel then.
-fn search_item(focus_handle: gpui::FocusHandle, cx: &App) -> AnyElement {
-    render_item(
-        "activity-bar-search".into(),
-        IconName::MagnifyingGlass,
-        "Search".into(),
-        DeploySearch::default().boxed_clone(),
-        false,
-        None,
-        focus_handle,
-        cx,
-    )
 }
