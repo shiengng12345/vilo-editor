@@ -3,7 +3,11 @@ use futures::{FutureExt, StreamExt as _, channel::mpsc, future::Shared};
 use language::Buffer;
 use remote::RemoteClient;
 use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
-use std::{collections::VecDeque, path::Path, sync::Arc};
+use std::{
+    collections::VecDeque,
+    path::Path,
+    sync::{Arc, LazyLock},
+};
 use task::{Shell, shell_to_proto};
 use util::{ResultExt, command::new_command};
 use worktree::Worktree;
@@ -34,6 +38,11 @@ pub enum ProjectEnvironmentEvent {
 }
 
 impl EventEmitter<ProjectEnvironmentEvent> for ProjectEnvironment {}
+
+/// Vilo: each load spawns a login shell (`shell -l -i`); opening a folder with dozens of
+/// repositories used to start them all at once and saturate the CPU for ~20s.
+static SHELL_ENVIRONMENT_LOADS: LazyLock<async_lock::Semaphore> =
+    LazyLock::new(|| async_lock::Semaphore::new(4));
 
 impl ProjectEnvironment {
     pub fn new(
@@ -211,12 +220,14 @@ impl ProjectEnvironment {
                 let tx = self.environment_error_messages_tx.clone();
                 cx.spawn(async move |cx| {
                     let mut shell_env = match cx
-                        .background_spawn(load_directory_shell_environment(
-                            shell,
-                            abs_path.clone(),
-                            load_direnv,
-                            tx,
-                        ))
+                        .background_spawn({
+                            let abs_path = abs_path.clone();
+                            async move {
+                                let _permit = SHELL_ENVIRONMENT_LOADS.acquire().await;
+                                load_directory_shell_environment(shell, abs_path, load_direnv, tx)
+                                    .await
+                            }
+                        })
                         .await
                     {
                         Ok(shell_env) => Some(shell_env),
