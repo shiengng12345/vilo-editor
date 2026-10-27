@@ -15,7 +15,7 @@ use gpui::{
 };
 use language::{Buffer, Point, ToPoint as _};
 use project::{
-    Project, ProjectItem as _,
+    Project,
     search::{SearchQuery, SearchResult},
 };
 use text::Anchor;
@@ -68,7 +68,6 @@ enum Status {
     WaitingForScan,
     Searching,
     Done,
-    LimitReached,
     InvalidQuery,
 }
 
@@ -94,7 +93,10 @@ pub struct SearchPanel {
     rows: Vec<Row>,
     status: Status,
     position: DockPosition,
+    pending_debounce: Option<Task<()>>,
     pending_search: Option<Task<()>>,
+    /// Sticky for the whole search: a later status event must not hide that results were cut off.
+    limit_reached: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -138,7 +140,9 @@ impl SearchPanel {
             rows: Vec::new(),
             status: Status::Idle,
             position: DockPosition::Left,
+            pending_debounce: None,
             pending_search: None,
+            limit_reached: false,
             _subscriptions: subscriptions,
         }
     }
@@ -155,7 +159,7 @@ impl SearchPanel {
     fn schedule_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Replacing the task drops the previous one, so an older query can never
         // overwrite the results of a newer one.
-        self.pending_search = Some(cx.spawn_in(window, async move |this, cx| {
+        self.pending_debounce = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor()
                 .timer(SEARCH_ON_TYPE_DEBOUNCE)
                 .await;
@@ -214,6 +218,7 @@ impl SearchPanel {
     fn run_search(&mut self, cx: &mut Context<Self>) {
         self.results.clear();
         self.collapsed.clear();
+        self.limit_reached = false;
         self.rebuild_rows();
         let query = match self.build_query(cx) {
             None => {
@@ -244,7 +249,7 @@ impl SearchPanel {
                             SearchResult::Buffer { buffer, ranges } => {
                                 this.push_result(buffer, ranges, cx)
                             }
-                            SearchResult::LimitReached => this.status = Status::LimitReached,
+                            SearchResult::LimitReached => this.limit_reached = true,
                             SearchResult::WaitingForScan => this.status = Status::WaitingForScan,
                             SearchResult::Searching => this.status = Status::Searching,
                         }
@@ -257,9 +262,7 @@ impl SearchPanel {
                 }
             }
             this.update(cx, |this, cx| {
-                if this.status != Status::LimitReached {
-                    this.status = Status::Done;
-                }
+                this.status = Status::Done;
                 cx.notify();
             })
             .ok();
@@ -352,29 +355,31 @@ impl SearchPanel {
         let Some(search_match) = file.matches.get(match_ix) else {
             return;
         };
-        let buffer = file.buffer.read(cx);
-        let Some(project_path) = buffer.project_path(cx) else {
-            return;
-        };
+        let buffer = file.buffer.clone();
         // Anchors follow edits made after the search, so this lands on the current match position.
-        let point = search_match.range.start.to_point(&buffer.snapshot());
+        let point = search_match
+            .range
+            .start
+            .to_point(&buffer.read(cx).snapshot());
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let open_task = workspace.update(cx, |workspace, cx| {
-            workspace.open_path_preview(project_path, None, true, allow_preview, true, window, cx)
+        // Opening by buffer entity (not path) also works for unsaved, untitled buffers.
+        workspace.update(cx, |workspace, cx| {
+            let editor = workspace.open_project_item::<Editor>(
+                None,
+                buffer,
+                true,
+                true,
+                false,
+                allow_preview,
+                window,
+                cx,
+            );
+            editor.update(cx, |editor, cx| {
+                editor.go_to_singleton_buffer_point(point, window, cx)
+            });
         });
-        cx.spawn_in(window, async move |_, cx| {
-            let item = open_task.await.log_err()?;
-            let editor = item.downcast::<Editor>()?;
-            editor
-                .update_in(cx, |editor, window, cx| {
-                    editor.go_to_singleton_buffer_point(point, window, cx)
-                })
-                .log_err();
-            Some(())
-        })
-        .detach();
     }
 
     fn summary(&self) -> Option<SharedString> {
@@ -386,7 +391,7 @@ impl SearchPanel {
             Status::WaitingForScan if files == 0 => "Waiting for project scan…".to_string(),
             Status::Searching if files == 0 => "Searching…".to_string(),
             Status::Done if files == 0 => "No results found".to_string(),
-            Status::LimitReached => {
+            _ if self.limit_reached => {
                 format!("{matches} results in {files} files (limit reached, refine the search)")
             }
             _ => format!(
@@ -475,7 +480,10 @@ impl SearchPanel {
                 let preview = search_match.preview.clone();
                 let highlight = search_match.highlight.clone();
                 h_flex()
-                    .id(("search-match", file_ix * 100_000 + match_ix))
+                    .id(ElementId::NamedInteger(
+                        "search-match".into(),
+                        ((file_ix as u64) << 32) | match_ix as u64,
+                    ))
                     .w_full()
                     .pl_6()
                     .pr_1()
@@ -621,7 +629,8 @@ impl Panel for SearchPanel {
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
+        // shortcut: left side only; moving it needs a persisted setting (BACKLOG).
+        position == DockPosition::Left
     }
 
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
