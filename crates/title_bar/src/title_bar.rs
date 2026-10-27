@@ -312,6 +312,7 @@ impl Render for TitleBar {
                 .h_full()
                 .flex_1()
                 .min_w_0()
+                .overflow_x_hidden()
                 .gap_0p5()
                 .map(|title_bar| {
                     let mut render_project_items = title_bar_settings.show_branch_name
@@ -355,8 +356,11 @@ impl Render for TitleBar {
 
         // Vilo: VS Code's command center sits between two equal columns so it stays centered.
         children.push(
-            self.render_command_center(project_name, cx)
-                .into_any_element(),
+            self.render_command_center(
+                project_name.filter(|_| title_bar_settings.show_project_items),
+                cx,
+            )
+            .into_any_element(),
         );
 
         if title_bar_settings.show_onboarding_banner {
@@ -385,6 +389,7 @@ impl Render for TitleBar {
             h_flex()
                 .flex_1()
                 .min_w_0()
+                .overflow_x_hidden()
                 .justify_end()
                 .pr_1()
                 .gap_1()
@@ -548,10 +553,6 @@ impl TitleBar {
         this.observe_diagnostics(cx);
 
         this
-    }
-
-    fn worktree_count(&self, cx: &App) -> usize {
-        self.project.read(cx).visible_worktrees(cx).count()
     }
 
     fn toggle_update_simulation(&mut self, cx: &mut Context<Self>) {
@@ -813,13 +814,14 @@ impl TitleBar {
         let colors = cx.theme().colors().clone();
         let display_name = match &name {
             Some(name) => util::truncate_and_trailoff(name, MAX_PROJECT_NAME_LENGTH),
-            None => "Open Recent Project".to_string(),
+            None => "Search".to_string(),
         };
         let recent_projects = self.recent_projects_menu(cx);
         h_flex()
             .id("command-center")
             .h(px(22.))
             .w(relative(0.38))
+            .min_w(px(120.))
             .max_w(px(600.))
             .flex_shrink(1.)
             .rounded_md()
@@ -829,23 +831,39 @@ impl TitleBar {
             .hover(|this| this.bg(colors.element_hover))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
-                Button::new("command-center-search", display_name)
-                    .full_width()
-                    .label_size(LabelSize::Small)
-                    .start_icon(
+                // A plain row rather than a Button: buttons do not shrink, so a long name
+                // would push the chevron outside the box.
+                h_flex()
+                    .id("command-center-search")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .justify_center()
+                    .gap_1()
+                    .px_2()
+                    .cursor_pointer()
+                    .tab_index(0isize)
+                    .tooltip(|_window, cx| {
+                        Tooltip::for_action(
+                            "Search Files",
+                            &workspace::ToggleFileFinder::default(),
+                            cx,
+                        )
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(workspace::ToggleFileFinder::default()), cx)
+                    })
+                    .child(
                         Icon::new(IconName::MagnifyingGlass)
                             .size(IconSize::Small)
                             .color(Color::Muted),
                     )
-                    .when(name.is_none(), |this| this.color(Color::Muted))
-                    .tab_index(0isize)
-                    .tooltip(Tooltip::text("Search files by name (⌘P)"))
-                    .on_click(|_, window, cx| {
-                        if let Some(action) = cx.build_action("file_finder::Toggle", None).log_err()
-                        {
-                            window.dispatch_action(action, cx);
-                        }
-                    }),
+                    .child(
+                        Label::new(display_name)
+                            .size(LabelSize::Small)
+                            .truncate()
+                            .when(name.is_none(), |this| this.color(Color::Muted)),
+                    ),
             )
             .child(
                 PopoverMenu::new("command-center-recent-projects")
@@ -893,139 +911,6 @@ impl TitleBar {
                 cx,
             ))
         }
-    }
-
-    #[allow(dead_code)]
-    fn render_project_name(
-        &self,
-        name: Option<SharedString>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let workspace = self.workspace.clone();
-
-        let is_project_selected = name.is_some();
-
-        let display_name = if let Some(ref name) = name {
-            util::truncate_and_trailoff(name, MAX_PROJECT_NAME_LENGTH)
-        } else {
-            "Open Recent Project".to_string()
-        };
-
-        let is_sidebar_open = self
-            .multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .map(|mw| mw.read(cx).sidebar_open())
-            .unwrap_or(false)
-            && PlatformTitleBar::is_multi_workspace_enabled(cx);
-
-        let is_threads_list_view_active = self
-            .multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .map(|mw| mw.read(cx).is_threads_list_view_active(cx))
-            .unwrap_or(false);
-
-        if is_sidebar_open && is_threads_list_view_active {
-            return self
-                .render_recent_projects_popover(display_name, is_project_selected, cx)
-                .into_any_element();
-        }
-
-        let focus_handle = workspace
-            .upgrade()
-            .map(|w| w.read(cx).focus_handle(cx))
-            .unwrap_or_else(|| cx.focus_handle());
-
-        let window_project_groups: Vec<_> = self
-            .multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .map(|mw| mw.read(cx).project_group_keys())
-            .unwrap_or_default();
-
-        PopoverMenu::new("recent-projects-menu")
-            .menu(move |window, cx| {
-                Some(recent_projects::RecentProjects::popover(
-                    workspace.clone(),
-                    window_project_groups.clone(),
-                    None,
-                    focus_handle.clone(),
-                    window,
-                    cx,
-                ))
-            })
-            .trigger_with_tooltip(
-                Button::new("project_name_trigger", display_name)
-                    .label_size(LabelSize::Small)
-                    .tab_index(0isize)
-                    .when(self.worktree_count(cx) > 1, |this| {
-                        this.end_icon(
-                            Icon::new(IconName::ChevronDown)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                    })
-                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                    .when(!is_project_selected, |s| s.color(Color::Muted)),
-                move |_window, cx| {
-                    Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent::default(), cx)
-                },
-            )
-            .anchor(gpui::Anchor::TopLeft)
-            .into_any_element()
-    }
-
-    fn render_recent_projects_popover(
-        &self,
-        display_name: String,
-        is_project_selected: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let workspace = self.workspace.clone();
-
-        let focus_handle = workspace
-            .upgrade()
-            .map(|w| w.read(cx).focus_handle(cx))
-            .unwrap_or_else(|| cx.focus_handle());
-
-        let window_project_groups: Vec<_> = self
-            .multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .map(|mw| mw.read(cx).project_group_keys())
-            .unwrap_or_default();
-
-        PopoverMenu::new("sidebar-title-recent-projects-menu")
-            .menu(move |window, cx| {
-                Some(recent_projects::RecentProjects::popover(
-                    workspace.clone(),
-                    window_project_groups.clone(),
-                    None,
-                    focus_handle.clone(),
-                    window,
-                    cx,
-                ))
-            })
-            .trigger_with_tooltip(
-                Button::new("project_name_trigger", display_name)
-                    .label_size(LabelSize::Small)
-                    .tab_index(0isize)
-                    .when(self.worktree_count(cx) > 1, |this| {
-                        this.end_icon(
-                            Icon::new(IconName::ChevronDown)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                    })
-                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                    .when(!is_project_selected, |s| s.color(Color::Muted)),
-                move |_window, cx| {
-                    Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent::default(), cx)
-                },
-            )
-            .anchor(gpui::Anchor::TopLeft)
     }
 
     fn render_worktree_and_branch(
