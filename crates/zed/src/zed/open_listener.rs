@@ -155,6 +155,11 @@ impl OpenRequest {
         }
 
         for url in request.urls {
+            // Vilo registers vilo:// with the OS; handlers below still match the upstream zed:// form.
+            let url = match url.strip_prefix("vilo://") {
+                Some(rest) => format!("zed://{rest}"),
+                None => url,
+            };
             if let Some(server_name) = url.strip_prefix("zed-cli://") {
                 this.kind = Some(OpenRequestKind::CliConnection(connect_to_cli(server_name)?));
             } else if let Some(action_index) = url.strip_prefix("zed-dock-action://") {

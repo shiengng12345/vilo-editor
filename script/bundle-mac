@@ -54,6 +54,7 @@ shift $((OPTIND-1))
 # Get release channel
 pushd crates/zed
 channel=$(<RELEASE_CHANNEL)
+target_root="${CARGO_TARGET_DIR:-target}"
 export ZED_RELEASE_CHANNEL="${channel}"
 popd
 
@@ -252,7 +253,7 @@ function sign_app_binaries() {
             echo "$app_path"
         fi
     else
-        dmg_target_directory="target/${target_triple}/${target_dir}"
+        dmg_target_directory="${target_root}/${target_triple}/${target_dir}"
         dmg_source_directory="${dmg_target_directory}/dmg"
         dmg_file_path="${dmg_target_directory}/Zed-${arch_suffix}.dmg"
         xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
@@ -307,12 +308,12 @@ function extract_debug_symbols() {
         return
     fi
     debug_symbols_extracted=true
-    if ! dsymutil --flat "target/${target_triple}/${target_dir}/vilo" 2> target/dsymutil.log; then
+    if ! dsymutil --flat "${target_root}/${target_triple}/${target_dir}/vilo" 2> target/dsymutil.log; then
         echo "dsymutil failed"
         cat target/dsymutil.log
         exit 1
     fi
-    if ! dsymutil --flat "target/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
+    if ! dsymutil --flat "${target_root}/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
         echo "dsymutil failed"
         cat target/dsymutil.log
         exit 1
@@ -329,8 +330,8 @@ function upload_debug_symbols() {
         for attempt in 1 2 3; do
             echo "Sentry upload attempt $attempt..."
             if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-                "target/${target_triple}/${target_dir}/vilo.dwarf" \
-                "target/${target_triple}/${target_dir}/remote_server.dwarf"; then
+                "${target_root}/${target_triple}/${target_dir}/vilo.dwarf" \
+                "${target_root}/${target_triple}/${target_dir}/remote_server.dwarf"; then
                 break
             else
                 echo "Sentry upload failed on attempt $attempt"
@@ -352,14 +353,14 @@ upload_debug_symbols
 # also keep symbols recoverable when the sentry upload is skipped.
 if [[ "$target_dir" == "release" && "$local_install" != true ]]; then
     extract_debug_symbols
-    strip -x "target/${target_triple}/${target_dir}/vilo"
-    strip -x "target/${target_triple}/${target_dir}/cli"
-    strip -x "target/${target_triple}/${target_dir}/remote_server"
+    strip -x "${target_root}/${target_triple}/${target_dir}/vilo"
+    strip -x "${target_root}/${target_triple}/${target_dir}/cli"
+    strip -x "${target_root}/${target_triple}/${target_dir}/remote_server"
 fi
 
-cp target/${target_triple}/${target_dir}/vilo "${app_path}/Contents/MacOS/vilo"
-cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+cp ${target_root}/${target_triple}/${target_dir}/vilo "${app_path}/Contents/MacOS/vilo"
+cp ${target_root}/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+sign_binary "${target_root}/$target_triple/release/remote_server"
+gzip -f --stdout --best ${target_root}/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz

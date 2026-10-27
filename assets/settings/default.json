@@ -2346,11 +2346,9 @@
   //
   // If you don't want any of these extensions, add this field to your settings
   // and change the value to `false`.
-  "auto_install_extensions": {
-    "html": true,
-  },
+  "auto_install_extensions": {},
   // Whether to suggest installing extensions based on the files you open.
-  "suggest_extensions": true,
+  "suggest_extensions": false,
   // The capabilities granted to extensions.
   //
   // This list can be customized to restrict what extensions are able to do.

@@ -68,13 +68,23 @@ fn new(cx: &App) -> Arc<dyn CredentialsProvider> {
 /// A credentials provider that stores credentials in the system keychain.
 struct KeychainCredentialsProvider;
 
+/// Keychain items are keyed only by server URL, so without a prefix Vilo and
+/// Zed would read and overwrite each other's credentials.
+fn keychain_key(url: &str) -> String {
+    format!("{}+{url}", paths::APP_NAME_LOWERCASE)
+}
+
 impl CredentialsProvider for KeychainCredentialsProvider {
     fn read_credentials<'a>(
         &'a self,
         url: &'a str,
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
-        async move { cx.update(|cx| cx.read_credentials(url)).await }.boxed_local()
+        async move {
+            let key = keychain_key(url);
+            cx.update(|cx| cx.read_credentials(&key)).await
+        }
+        .boxed_local()
     }
 
     fn write_credentials<'a>(
@@ -85,7 +95,8 @@ impl CredentialsProvider for KeychainCredentialsProvider {
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         async move {
-            cx.update(move |cx| cx.write_credentials(url, username, password))
+            let key = keychain_key(url);
+            cx.update(move |cx| cx.write_credentials(&key, username, password))
                 .await
         }
         .boxed_local()
@@ -96,7 +107,11 @@ impl CredentialsProvider for KeychainCredentialsProvider {
         url: &'a str,
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-        async move { cx.update(move |cx| cx.delete_credentials(url)).await }.boxed_local()
+        async move {
+            let key = keychain_key(url);
+            cx.update(move |cx| cx.delete_credentials(&key)).await
+        }
+        .boxed_local()
     }
 }
 

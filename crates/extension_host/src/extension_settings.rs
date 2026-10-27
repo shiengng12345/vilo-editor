@@ -29,10 +29,11 @@ impl ExtensionSettings {
     }
 
     pub fn should_auto_update(&self, extension_id: &str) -> bool {
+        // Vilo: updates come from Zed's registry, so only extensions the user opts in auto-update.
         self.auto_update_extensions
             .get(extension_id)
             .copied()
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 }
 
