@@ -23,6 +23,8 @@ const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 pub(crate) struct DiskRoot {
     pub worktree_id: WorktreeId,
     pub abs_path: Arc<Path>,
+    /// This worktree's `file_scan_exclusions`, so search skips what the project never scans.
+    pub scan_exclusions: PathMatcher,
 }
 
 pub(crate) struct DiskCandidate {
@@ -44,17 +46,22 @@ pub(crate) fn walk(
     roots: Vec<DiskRoot>,
     query: SearchQuery,
     path_style: PathStyle,
-    // The worktree's `file_scan_exclusions`, so search skips what the project never scans.
-    scan_exclusions: PathMatcher,
     skip_abs_paths: HashSet<PathBuf>,
     progress: Arc<WalkProgress>,
 ) -> smol::channel::Receiver<DiskCandidate> {
-    let (tx, rx) = smol::channel::bounded(256);
-    let Some(first) = roots.first() else {
+    // Each queued candidate holds a whole file, so keep the queue short.
+    let (tx, rx) = smol::channel::bounded(16);
+    // Walk only outermost roots; files under nested worktrees still map to the deepest root.
+    let mut walk_roots = roots.iter().filter(|root| {
+        !roots.iter().any(|other| {
+            other.abs_path != root.abs_path && root.abs_path.starts_with(&other.abs_path)
+        })
+    });
+    let Some(first) = walk_roots.next() else {
         return rx;
     };
     let mut builder = WalkBuilder::new(&first.abs_path);
-    for root in &roots[1..] {
+    for root in walk_roots {
         builder.add(&root.abs_path);
     }
     builder
@@ -74,7 +81,6 @@ pub(crate) fn walk(
     let roots = Arc::new(roots);
     let query = Arc::new(query);
     let skip_abs_paths = Arc::new(skip_abs_paths);
-    let scan_exclusions = Arc::new(scan_exclusions);
 
     std::thread::Builder::new()
         .name("vilo-disk-search".into())
@@ -84,10 +90,10 @@ pub(crate) fn walk(
                 let roots = roots.clone();
                 let query = query.clone();
                 let skip_abs_paths = skip_abs_paths.clone();
-                let scan_exclusions = scan_exclusions.clone();
                 let progress = progress.clone();
                 Box::new(move |entry| {
-                    if progress.cancelled.load(Ordering::Relaxed) {
+                    // A closed channel means the panel or its search is gone.
+                    if progress.cancelled.load(Ordering::Relaxed) || tx.is_closed() {
                         return WalkState::Quit;
                     }
                     let Ok(entry) = entry else {
@@ -100,9 +106,9 @@ pub(crate) fn walk(
                     if kind.is_dir() {
                         // Prune excluded directories instead of visiting every file inside them.
                         let excluded = relative_to_root(&roots, abs_path, path_style).is_some_and(
-                            |(_, rel_path)| {
+                            |(root, rel_path)| {
                                 !rel_path.is_empty()
-                                    && (scan_exclusions.is_match(rel_path.as_ref())
+                                    && (root.scan_exclusions.is_match(rel_path.as_ref())
                                         || query.files_to_exclude().is_match(rel_path.as_ref()))
                             },
                         );
@@ -112,14 +118,20 @@ pub(crate) fn walk(
                             WalkState::Continue
                         };
                     }
-                    if !kind.is_file() || skip_abs_paths.contains(abs_path) {
+                    // Search symlinked files, but never follow symlinked directories (loops).
+                    let is_file = kind.is_file()
+                        || (kind.is_symlink()
+                            && fs::metadata(abs_path).is_ok_and(|metadata| metadata.is_file()));
+                    if !is_file || skip_abs_paths.contains(abs_path) {
                         return WalkState::Continue;
                     }
                     let Some((root, rel_path)) = relative_to_root(&roots, abs_path, path_style)
                     else {
                         return WalkState::Continue;
                     };
-                    if scan_exclusions.is_match(rel_path.as_ref()) || !query.match_path(&rel_path) {
+                    if root.scan_exclusions.is_match(rel_path.as_ref())
+                        || !query.match_path(&rel_path)
+                    {
                         return WalkState::Continue;
                     }
                     progress.files_searched.fetch_add(1, Ordering::Relaxed);
@@ -198,7 +210,9 @@ fn decode(bytes: &[u8]) -> String {
     let mut text = match bytes {
         [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
         [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, u16::from_be_bytes),
-        _ => String::from_utf8_lossy(bytes).into_owned(),
+        // A UTF-8 BOM is not part of the text; keeping it would shift first-line columns.
+        _ => String::from_utf8_lossy(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes))
+            .into_owned(),
     };
     text::LineEnding::normalize(&mut text);
     text
@@ -253,10 +267,10 @@ mod tests {
             vec![DiskRoot {
                 worktree_id: WorktreeId::from_usize(1),
                 abs_path: root.into(),
+                scan_exclusions: PathMatcher::default(),
             }],
             query("SendSmsCode"),
             PathStyle::local(),
-            PathMatcher::default(),
             HashSet::default(),
             progress.clone(),
         );
@@ -272,6 +286,60 @@ mod tests {
         found.sort();
         assert_eq!(found, vec![".github/ci.yml", "src/a.ts"]);
         assert!(progress.files_searched.load(Ordering::Relaxed) >= 4);
+    }
+
+    #[test]
+    fn test_walk_nested_roots_bom_symlinks_and_exclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("nested/src")).unwrap();
+        fs::create_dir_all(root.join("copies")).unwrap();
+        fs::write(root.join("outer.ts"), b"\xEF\xBB\xBFSendSmsCode").unwrap();
+        fs::write(root.join("nested/src/inner.ts"), "SendSmsCode").unwrap();
+        fs::write(root.join("copies/old.ts"), "SendSmsCode").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("nested/src/inner.ts"), root.join("link.ts")).unwrap();
+
+        let outer = WorktreeId::from_usize(1);
+        let nested = WorktreeId::from_usize(2);
+        let rx = walk(
+            vec![
+                DiskRoot {
+                    worktree_id: outer,
+                    abs_path: root.into(),
+                    scan_exclusions: PathMatcher::new(["copies"], PathStyle::local()).unwrap(),
+                },
+                DiskRoot {
+                    worktree_id: nested,
+                    abs_path: root.join("nested").into(),
+                    scan_exclusions: PathMatcher::default(),
+                },
+            ],
+            query("SendSmsCode"),
+            PathStyle::local(),
+            HashSet::default(),
+            Arc::new(WalkProgress::default()),
+        );
+        let mut found = Vec::new();
+        while let Ok(candidate) = smol::block_on(rx.recv()) {
+            if candidate.rel_path.as_unix_str() == "outer.ts" {
+                assert_eq!(candidate.text, "SendSmsCode", "UTF-8 BOM is stripped");
+            }
+            found.push((
+                candidate.worktree_id,
+                candidate.rel_path.as_unix_str().to_string(),
+            ));
+        }
+        found.sort();
+        let mut expected = vec![
+            (outer, "outer.ts".to_string()),
+            (nested, "src/inner.ts".to_string()),
+        ];
+        #[cfg(unix)]
+        expected.push((outer, "link.ts".to_string()));
+        expected.sort();
+        // The nested file appears once, under its own worktree; "copies" is excluded for the outer root.
+        assert_eq!(found, expected);
     }
 
     /// Manual benchmark: `VILO_BENCH_DIR=~/Desktop/Projects cargo test -p search --lib bench_walk -- --ignored --nocapture`
@@ -305,10 +373,10 @@ mod tests {
             vec![DiskRoot {
                 worktree_id: WorktreeId::from_usize(1),
                 abs_path: Path::new(&dir).into(),
+                scan_exclusions: PathMatcher::default(),
             }],
             query,
             PathStyle::local(),
-            PathMatcher::default(),
             HashSet::default(),
             progress.clone(),
         );

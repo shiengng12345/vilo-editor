@@ -25,7 +25,7 @@ use util::paths::PathStyle;
 use util::rel_path::RelPath;
 
 use crate::disk_search::{self, WalkProgress};
-use settings::Settings as _;
+use settings::{Settings as _, SettingsLocation};
 use text::Anchor;
 use ui::{
     IconButton, IconButtonShape, IndentGuideColors, ListItem, ListItemSpacing, Tooltip, prelude::*,
@@ -49,6 +49,8 @@ const SEARCH_PANEL_KEY: &str = "SearchPanel";
 const SEARCH_ON_TYPE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_LINE_PREVIEW_CHARS: usize = 200;
 const MAX_MATCHES: usize = 20_000;
+const MAX_BATCH_FILES: usize = 256;
+const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(100);
 /// Characters kept before a match; longer leading context is replaced by "…" so the match stays visible.
 const MAX_CONTEXT_BEFORE_MATCH: usize = 24;
@@ -352,9 +354,16 @@ impl SearchPanel {
             .visible_worktrees(cx)
             .map(|worktree| {
                 let worktree = worktree.read(cx);
+                let location = SettingsLocation {
+                    worktree_id: worktree.id(),
+                    path: RelPath::empty(),
+                };
                 disk_search::DiskRoot {
                     worktree_id: worktree.id(),
                     abs_path: worktree.abs_path(),
+                    scan_exclusions: WorktreeSettings::get(Some(location), cx)
+                        .file_scan_exclusions
+                        .clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -362,7 +371,21 @@ impl SearchPanel {
         let dirty_buffers = project
             .opened_buffers(cx)
             .into_iter()
-            .filter(|buffer| buffer.read(cx).is_dirty())
+            .filter(|buffer| {
+                let buffer = buffer.read(cx);
+                // Same path filters as the disk walk; untitled buffers have no path to filter.
+                buffer.is_dirty()
+                    && buffer.file().is_none_or(|file| {
+                        let location = SettingsLocation {
+                            worktree_id: file.worktree_id(cx),
+                            path: RelPath::empty(),
+                        };
+                        query.match_path(file.path())
+                            && !WorktreeSettings::get(Some(location), cx)
+                                .file_scan_exclusions
+                                .is_match(file.path().as_ref())
+                    })
+            })
             .collect::<Vec<_>>();
         let skip_abs_paths = dirty_buffers
             .iter()
@@ -374,14 +397,10 @@ impl SearchPanel {
 
         let progress = Arc::new(WalkProgress::default());
         self.walk_progress = Some(progress.clone());
-        let scan_exclusions = WorktreeSettings::get_global(cx)
-            .file_scan_exclusions
-            .clone();
         let candidates = disk_search::walk(
             roots,
             query.clone(),
             path_style,
-            scan_exclusions,
             skip_abs_paths,
             progress.clone(),
         );
@@ -404,8 +423,17 @@ impl SearchPanel {
                 }
             }
 
-            let mut chunks = pin!(candidates.ready_chunks(256));
-            while let Some(chunk) = chunks.next().await {
+            while let Ok(first) = candidates.recv().await {
+                // Batch by count and by bytes: each candidate holds a whole file.
+                let mut batch_bytes = first.text.len();
+                let mut chunk = vec![first];
+                while chunk.len() < MAX_BATCH_FILES && batch_bytes < MAX_BATCH_BYTES {
+                    let Ok(candidate) = candidates.try_recv() else {
+                        break;
+                    };
+                    batch_bytes += candidate.text.len();
+                    chunk.push(candidate);
+                }
                 // One foreground hop to reserve snapshots and one background task per batch:
                 // handling candidates one at a time dominated search time on large folders.
                 let Ok(snapshots) = this.update(cx, |_, cx| {
@@ -454,6 +482,9 @@ impl SearchPanel {
                 let reached_limit = this
                     .update(cx, |this, cx| {
                         for (target, lines) in files {
+                            if this.match_count() >= MAX_MATCHES {
+                                break;
+                            }
                             this.push_path_result(target, lines, cx);
                         }
                         this.rebuild_rows();
@@ -859,6 +890,14 @@ impl SearchPanel {
             .icon_color(Color::Muted)
             .tooltip(Tooltip::text(tooltip))
             .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+    }
+}
+
+impl Drop for SearchPanel {
+    fn drop(&mut self) {
+        if let Some(progress) = &self.walk_progress {
+            progress.cancelled.store(true, Ordering::Relaxed);
+        }
     }
 }
 
