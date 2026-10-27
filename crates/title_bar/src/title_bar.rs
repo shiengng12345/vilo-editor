@@ -14,7 +14,7 @@ pub use platform_title_bar::{
     self, DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, PlatformTitleBar,
     ShowNextWindowTab, ShowPreviousWindowTab,
 };
-use project::{linked_worktree_short_name, repo_identity_path, repo_identity_path_if_local};
+use project::{linked_worktree_short_name, repo_identity_path_if_local};
 
 #[cfg(not(target_os = "macos"))]
 use crate::application_menu::{
@@ -61,7 +61,6 @@ use zed_actions::OpenRemote;
 
 pub use onboarding_banner::restore_banner;
 
-const MAX_PROJECT_NAME_LENGTH: usize = 40;
 const MAX_BRANCH_NAME_LENGTH: usize = 40;
 const MAX_SHORT_SHA_LENGTH: usize = 8;
 
@@ -245,12 +244,11 @@ impl Render for TitleBar {
 
         let mut children = <ArrayVec<_, 5>>::new();
 
-        let mut project_name = None;
+        let project_name;
         let mut repository = None;
         let mut linked_worktree_name = None;
         if let Some(worktree) = self.effective_active_worktree(cx) {
             repository = self.get_repository_for_worktree(&worktree, cx);
-            let worktree_abs_path = worktree.read(cx).abs_path();
             project_name = worktree
                 .read(cx)
                 .root_name()
@@ -258,7 +256,6 @@ impl Render for TitleBar {
                 .map(|name| SharedString::from(name.to_string()));
             if let Some(repo) = &repository {
                 let repo = repo.read(cx);
-                let identity = repo_identity_path(&repo.common_dir_abs_path, repo.path_style);
                 let identity_fallback =
                     repo_identity_path_if_local(&repo.common_dir_abs_path, repo.path_style);
                 linked_worktree_name = linked_worktree_name_anchor(
@@ -278,32 +275,6 @@ impl Render for TitleBar {
                         .then_some(project_name.clone())
                         .flatten()
                 });
-
-                let display_name = if identity.extension() == Some(std::ffi::OsStr::new("git")) {
-                    identity.file_stem()
-                } else {
-                    repo.path_style.file_name(identity)
-                };
-
-                if let Some(repo_name) = display_name.and_then(|n| n.to_str()) {
-                    let visible_worktrees_in_repo = self.visible_worktrees_in_repository(repo, cx);
-                    let name = if visible_worktrees_in_repo == 1 {
-                        if let Ok(relative) =
-                            worktree_abs_path.strip_prefix(&*repo.work_directory_abs_path)
-                        {
-                            if relative.as_os_str().is_empty() {
-                                repo_name.to_string()
-                            } else {
-                                format!("{}/{}", repo_name, relative.display())
-                            }
-                        } else {
-                            repo_name.to_string()
-                        }
-                    } else {
-                        repo_name.to_string()
-                    };
-                    project_name = Some(SharedString::from(name));
-                }
             }
         }
 
@@ -352,15 +323,6 @@ impl Render for TitleBar {
                 .child(self.render_collaborator_list(window, cx))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .into_any_element(),
-        );
-
-        // Vilo: VS Code's command center sits between two equal columns so it stays centered.
-        children.push(
-            self.render_command_center(
-                project_name.filter(|_| title_bar_settings.show_project_items),
-                cx,
-            )
-            .into_any_element(),
         );
 
         if title_bar_settings.show_onboarding_banner {
@@ -602,22 +564,6 @@ impl TitleBar {
             .cloned()
     }
 
-    fn visible_worktrees_in_repository(
-        &self,
-        repository: &project::git_store::Repository,
-        cx: &App,
-    ) -> usize {
-        let repo_path = &repository.work_directory_abs_path;
-        self.project
-            .read(cx)
-            .visible_worktrees(cx)
-            .filter(|worktree| {
-                let worktree_path = worktree.read(cx).abs_path();
-                worktree_path == *repo_path || worktree_path.starts_with(repo_path.as_ref())
-            })
-            .count()
-    }
-
     fn render_remote_project_connection(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let workspace = self.workspace.clone();
 
@@ -802,69 +748,6 @@ impl TitleBar {
                 })
                 .into_any_element(),
         )
-    }
-
-    /// VS Code's command center: the project name in a centered box that opens the file finder.
-    fn render_command_center(
-        &self,
-        name: Option<SharedString>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
-        let display_name = match &name {
-            Some(name) => util::truncate_and_trailoff(name, MAX_PROJECT_NAME_LENGTH),
-            None => "Search".to_string(),
-        };
-        h_flex()
-            .id("command-center")
-            .h(px(22.))
-            .w(relative(0.38))
-            .min_w(px(120.))
-            .max_w(px(600.))
-            .flex_shrink(1.)
-            .rounded_md()
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.element_background)
-            .hover(|this| this.bg(colors.element_hover))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                // A plain row rather than a Button: buttons do not shrink, so a long name
-                // would push the chevron outside the box.
-                h_flex()
-                    .id("command-center-search")
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .justify_center()
-                    .gap_1()
-                    .px_2()
-                    .cursor_pointer()
-                    .tab_index(0isize)
-                    .role(gpui::Role::Button)
-                    .aria_label("Search Files")
-                    .tooltip(|_window, cx| {
-                        Tooltip::for_action(
-                            "Search Files",
-                            &workspace::ToggleFileFinder::default(),
-                            cx,
-                        )
-                    })
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(workspace::ToggleFileFinder::default()), cx)
-                    })
-                    .child(
-                        Icon::new(IconName::MagnifyingGlass)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new(display_name)
-                            .size(LabelSize::Small)
-                            .truncate()
-                            .when(name.is_none(), |this| this.color(Color::Muted)),
-                    ),
-            )
     }
 
     fn render_worktree_and_branch(
