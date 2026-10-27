@@ -310,6 +310,8 @@ impl Render for TitleBar {
         children.push(
             h_flex()
                 .h_full()
+                .flex_1()
+                .min_w_0()
                 .gap_0p5()
                 .map(|title_bar| {
                     let mut render_project_items = title_bar_settings.show_branch_name
@@ -332,9 +334,7 @@ impl Render for TitleBar {
                         .when(render_project_items, |title_bar| {
                             title_bar
                                 .when(title_bar_settings.show_project_items, |title_bar| {
-                                    title_bar
-                                        .children(self.render_project_host(cx))
-                                        .child(self.render_project_name(project_name, window, cx))
+                                    title_bar.children(self.render_project_host(cx))
                                 })
                                 .when_some(
                                     repository.filter(|_| is_git_enabled),
@@ -348,11 +348,16 @@ impl Render for TitleBar {
                                 )
                         })
                 })
+                .child(self.render_collaborator_list(window, cx))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .into_any_element(),
         );
 
-        children.push(self.render_collaborator_list(window, cx).into_any_element());
+        // Vilo: VS Code's command center sits between two equal columns so it stays centered.
+        children.push(
+            self.render_command_center(project_name, cx)
+                .into_any_element(),
+        );
 
         if title_bar_settings.show_onboarding_banner {
             if let Some(banner) = &self.banner {
@@ -378,6 +383,9 @@ impl Render for TitleBar {
 
         children.push(
             h_flex()
+                .flex_1()
+                .min_w_0()
+                .justify_end()
                 .pr_1()
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -795,6 +803,99 @@ impl TitleBar {
         )
     }
 
+    /// VS Code's command center: the project name in a centered box that opens the file
+    /// finder, with a chevron for recent projects.
+    fn render_command_center(
+        &self,
+        name: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let display_name = match &name {
+            Some(name) => util::truncate_and_trailoff(name, MAX_PROJECT_NAME_LENGTH),
+            None => "Open Recent Project".to_string(),
+        };
+        let recent_projects = self.recent_projects_menu(cx);
+        h_flex()
+            .id("command-center")
+            .h(px(22.))
+            .w(relative(0.38))
+            .max_w(px(600.))
+            .flex_shrink(1.)
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.element_background)
+            .hover(|this| this.bg(colors.element_hover))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new("command-center-search", display_name)
+                    .full_width()
+                    .label_size(LabelSize::Small)
+                    .start_icon(
+                        Icon::new(IconName::MagnifyingGlass)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .when(name.is_none(), |this| this.color(Color::Muted))
+                    .tab_index(0isize)
+                    .tooltip(Tooltip::text("Search files by name (⌘P)"))
+                    .on_click(|_, window, cx| {
+                        if let Some(action) = cx.build_action("file_finder::Toggle", None).log_err()
+                        {
+                            window.dispatch_action(action, cx);
+                        }
+                    }),
+            )
+            .child(
+                PopoverMenu::new("command-center-recent-projects")
+                    .menu(recent_projects)
+                    .trigger_with_tooltip(
+                        IconButton::new("command-center-recent", IconName::ChevronDown)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tab_index(0isize),
+                        move |_window, cx| {
+                            Tooltip::for_action(
+                                "Recent Projects",
+                                &zed_actions::OpenRecent::default(),
+                                cx,
+                            )
+                        },
+                    )
+                    .anchor(gpui::Anchor::TopRight),
+            )
+    }
+
+    fn recent_projects_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&mut Window, &mut App) -> Option<Entity<recent_projects::RecentProjects>> + 'static
+    {
+        let workspace = self.workspace.clone();
+        let focus_handle = workspace
+            .upgrade()
+            .map(|w| w.read(cx).focus_handle(cx))
+            .unwrap_or_else(|| cx.focus_handle());
+        let window_project_groups: Vec<_> = self
+            .multi_workspace
+            .as_ref()
+            .and_then(|mw| mw.upgrade())
+            .map(|mw| mw.read(cx).project_group_keys())
+            .unwrap_or_default();
+        move |window, cx| {
+            Some(recent_projects::RecentProjects::popover(
+                workspace.clone(),
+                window_project_groups.clone(),
+                None,
+                focus_handle.clone(),
+                window,
+                cx,
+            ))
+        }
+    }
+
+    #[allow(dead_code)]
     fn render_project_name(
         &self,
         name: Option<SharedString>,
