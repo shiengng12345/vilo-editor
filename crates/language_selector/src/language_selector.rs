@@ -1,5 +1,7 @@
+mod active_buffer_indentation;
 mod active_buffer_language;
 
+pub use active_buffer_indentation::ActiveBufferIndentation;
 pub use active_buffer_language::ActiveBufferLanguage;
 use anyhow::Context as _;
 use editor::Editor;

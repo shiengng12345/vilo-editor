@@ -7,7 +7,6 @@ use ui::{
     Button, ButtonCommon, Clickable, Context, FluentBuilder, IntoElement, LabelSize, ParentElement,
     Render, Tooltip, Window, div,
 };
-use util::paths::FILE_ROW_COLUMN_DELIMITER;
 use workspace::{HideStatusItem, StatusBarSettings, StatusItemView, Workspace, item::ItemHandle};
 
 #[derive(Copy, Clone, Debug, Default, PartialOrd, PartialEq)]
@@ -214,10 +213,7 @@ impl Render for CursorPosition {
         }
 
         div().when_some(self.position, |el, position| {
-            let mut text = format!(
-                "{}{FILE_ROW_COLUMN_DELIMITER}{}",
-                position.line, position.character,
-            );
+            let mut text = format!("Ln {}, Col {}", position.line, position.character);
             self.write_position(&mut text, cx);
 
             let context = self.context.clone();

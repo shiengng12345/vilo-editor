@@ -599,7 +599,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             }
         });
 
-        let search_button = cx.new(|_| search::search_status_button::SearchButton::new());
         let diagnostic_summary =
             cx.new(|cx| diagnostics::items::DiagnosticIndicator::new(workspace, cx));
         let active_file_name = cx.new(|_| workspace::active_file_name::ActiveFileName::new());
@@ -608,6 +607,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             cx.new(|_| encoding_selector::ActiveBufferEncoding::new(workspace));
         let active_buffer_language =
             cx.new(|_| language_selector::ActiveBufferLanguage::new(workspace));
+        let active_buffer_indentation =
+            cx.new(|_| language_selector::ActiveBufferIndentation::new());
         let active_toolchain_language =
             cx.new(|cx| toolchain_selector::ActiveToolchain::new(workspace, window, cx));
         let vim_mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
@@ -633,20 +634,22 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
         workspace.status_bar().update(cx, |status_bar, cx| {
-            // Vilo: branch first, then problems, as in VS Code's status bar.
+            // Vilo: VS Code's order. Left: branch, problems, background tasks.
             status_bar.add_left_item(branch_status, window, cx);
             status_bar.add_left_item(diagnostic_summary, window, cx);
-            status_bar.add_left_item(search_button, window, cx);
-            status_bar.add_left_item(lsp_button, window, cx);
             status_bar.add_left_item(active_file_name, window, cx);
             status_bar.add_left_item(git_blame_status, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
+            // Right items render in reverse registration order, so this reads right to left:
+            // edit prediction, language servers, toolchain, language, LF, UTF-8, Spaces, Ln/Col.
             status_bar.add_right_item(edit_prediction_ui, window, cx);
-            status_bar.add_right_item(active_buffer_encoding, window, cx);
-            status_bar.add_right_item(active_buffer_language, window, cx);
+            status_bar.add_right_item(lsp_button, window, cx);
             status_bar.add_right_item(active_toolchain_language, window, cx);
+            status_bar.add_right_item(active_buffer_language, window, cx);
             status_bar.add_right_item(line_ending_indicator, window, cx);
+            status_bar.add_right_item(active_buffer_encoding, window, cx);
+            status_bar.add_right_item(active_buffer_indentation, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
             status_bar.add_right_item(image_info, window, cx);
             // Keep these last so they stay leftmost and can change without moving the other items.
