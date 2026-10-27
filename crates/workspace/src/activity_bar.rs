@@ -9,6 +9,18 @@ const ACTIVE_INDICATOR_WIDTH: Pixels = px(2.);
 /// VS Code's activity bar order; other panels follow in dock order.
 const VS_CODE_ORDER: &[&str] = &["Project Panel", "Search Panel", "GitPanel", "DebugPanel"];
 
+/// VS Code's Codicon and view name for a panel, keyed by its persistent name.
+fn vs_code_view(persistent_name: &str) -> Option<(&'static str, &'static str)> {
+    Some(match persistent_name {
+        "Project Panel" => ("icons/vilo/codicons/files.svg", "Explorer"),
+        "Search Panel" => ("icons/vilo/codicons/search.svg", "Search"),
+        "GitPanel" => ("icons/vilo/codicons/source-control.svg", "Source Control"),
+        "DebugPanel" => ("icons/vilo/codicons/debug-alt.svg", "Run and Debug"),
+        "Outline Panel" => ("icons/vilo/codicons/list-tree.svg", "Outline"),
+        _ => return None,
+    })
+}
+
 /// Vilo: VS Code style activity bar along the left edge of the window.
 ///
 /// It shows the left dock's panels plus views that Zed implements as center
@@ -39,8 +51,11 @@ impl ActivityBar {
         cx: &App,
     ) -> Option<AnyElement> {
         let dock = self.left_dock.read(cx);
-        let icon = panel.icon(window, cx)?;
-        let tooltip = panel.icon_tooltip(window, cx)?;
+        let zed_icon = panel.icon(window, cx)?;
+        let (icon, tooltip) = match vs_code_view(panel.persistent_name()) {
+            Some((path, name)) => (Icon::from_path(path), SharedString::from(name)),
+            None => (Icon::new(zed_icon), panel.icon_tooltip(window, cx)?.into()),
+        };
         let is_active = dock.is_open() && dock.active_panel_index() == Some(index);
         // Clicking the active view collapses the side bar, as in VS Code.
         let action = if is_active {
@@ -54,7 +69,7 @@ impl ActivityBar {
         Some(render_item(
             format!("activity-bar-{}", panel.persistent_name()).into(),
             icon,
-            tooltip.into(),
+            tooltip,
             action,
             is_active,
             badge,
@@ -67,7 +82,7 @@ impl ActivityBar {
 #[allow(clippy::too_many_arguments)]
 fn render_item(
     id: SharedString,
-    icon: IconName,
+    icon: Icon,
     tooltip: SharedString,
     action: Box<dyn Action>,
     is_active: bool,
@@ -99,8 +114,7 @@ fn render_item(
                 .when(is_active, |this| this.bg(colors.text_accent)),
         )
         .child(
-            Icon::new(icon)
-                .size(IconSize::Custom(rems_from_px(24_f32)))
+            icon.size(IconSize::Custom(rems_from_px(24_f32)))
                 .color(if is_active {
                     Color::Default
                 } else {
@@ -149,7 +163,7 @@ impl Render for ActivityBar {
             .collect::<Vec<_>>();
         items.push(render_item(
             "activity-bar-extensions".into(),
-            IconName::Blocks,
+            Icon::from_path("icons/vilo/codicons/extensions.svg"),
             "Extensions".into(),
             zed_actions::Extensions::default().boxed_clone(),
             false,
