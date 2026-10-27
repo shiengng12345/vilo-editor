@@ -66,3 +66,17 @@ impl Settings for ExtensionSettings {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extensions_do_not_auto_update_unless_opted_in() {
+        let mut settings = ExtensionSettings::default();
+        assert!(!settings.should_auto_update("html"));
+
+        settings.auto_update_extensions.insert("html".into(), true);
+        assert!(settings.should_auto_update("html"));
+    }
+}

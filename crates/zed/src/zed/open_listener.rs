@@ -1475,6 +1475,33 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_parse_vilo_scheme_urls(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+
+        let parse = |url: &str, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                OpenRequest::parse(
+                    RawOpenRequest {
+                        urls: vec![url.into()],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+                .unwrap()
+            })
+        };
+
+        let request = parse("vilo://channel/some-channel-123", cx);
+        assert_eq!(request.join_channel, Some(123));
+
+        let request = parse("vilo://settings", cx);
+        assert!(matches!(
+            request.kind,
+            Some(OpenRequestKind::Setting { setting_path: None })
+        ));
+    }
+
+    #[gpui::test]
     fn test_parse_agent_url(cx: &mut TestAppContext) {
         let _app_state = init_test(cx);
 

@@ -19,7 +19,8 @@ required-features = ["cli"]
 
 [features]
 no-bundled-uninstall = ["cli"]
-default = ["cli"]
+# Vilo: the bundled uninstall script removes official Zed, so it is compiled out.
+default = ["cli", "no-bundled-uninstall"]
 cli = [
     "dep:askpass",
     "dep:clap",

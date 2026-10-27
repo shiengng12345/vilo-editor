@@ -1,4 +1,4 @@
-use client::ZED_URL_SCHEME;
+use client::VILO_URL_SCHEME;
 use gpui::{AsyncApp, actions};
 
 actions!(
@@ -10,5 +10,5 @@ actions!(
 );
 
 pub async fn register_zed_scheme(cx: &AsyncApp) -> anyhow::Result<()> {
-    cx.update(|cx| cx.register_url_scheme(ZED_URL_SCHEME)).await
+    cx.update(|cx| cx.register_url_scheme(VILO_URL_SCHEME)).await
 }

@@ -194,3 +194,16 @@ impl CredentialsProvider for DevelopmentCredentialsProvider {
         .boxed_local()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_keychain_key_is_namespaced_by_app() {
+        assert_eq!(
+            keychain_key("https://api.anthropic.com"),
+            format!("{}+https://api.anthropic.com", paths::APP_NAME_LOWERCASE)
+        );
+    }
+}

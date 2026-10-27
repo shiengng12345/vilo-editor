@@ -1927,7 +1927,10 @@ impl ProtoClient for Client {
 }
 
 /// prefix for the zed:// url scheme
-pub const ZED_URL_SCHEME: &str = "vilo";
+pub const ZED_URL_SCHEME: &str = "zed";
+
+/// The scheme Vilo registers with the OS; incoming links are mapped to [`ZED_URL_SCHEME`].
+pub const VILO_URL_SCHEME: &str = "vilo";
 
 /// A parsed Zed link that can be handled internally by the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
