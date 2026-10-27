@@ -197,6 +197,31 @@ impl ProjectEnvironment {
         self.local_directory_environment(&Shell::System, abs_path, cx)
     }
 
+    /// The environment of the visible worktree containing `abs_path`, or of `abs_path` itself
+    /// when no worktree does. A folder of many repositories then loads one shell instead of
+    /// one per repository, which kept terminals waiting behind the queue on startup.
+    // shortcut: a nested repository's own .envrc is not seen by git; upgrade if per-repo direnv matters.
+    pub fn worktree_directory_environment(
+        &mut self,
+        shell: &Shell,
+        abs_path: Arc<Path>,
+        cx: &mut App,
+    ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        let root = self
+            .worktree_store
+            .read_with(cx, |worktree_store, cx| {
+                worktree_store
+                    .visible_worktrees(cx)
+                    .map(|worktree| worktree.read(cx).abs_path())
+                    .filter(|root| abs_path.starts_with(root))
+                    .max_by_key(|root| root.as_os_str().len())
+            })
+            .ok()
+            .flatten()
+            .unwrap_or(abs_path);
+        self.local_directory_environment(shell, root, cx)
+    }
+
     /// Returns the project environment, if possible.
     /// If the project was opened from the CLI, then the inherited CLI environment is returned.
     /// If it wasn't opened from the CLI, and an absolute path is given, then a shell is spawned in
