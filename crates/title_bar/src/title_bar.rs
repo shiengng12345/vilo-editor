@@ -27,7 +27,7 @@ use client::{Client, UserStore, zed_urls};
 use command_palette_hooks::CommandPaletteFilter;
 
 use gpui::{
-    Action, Anchor, Animation, AnimationExt, AnyElement, App, Context, Element, Entity, Focusable,
+    Action, Anchor, Animation, AnimationExt, AnyElement, App, Context, Element, Entity,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, TaskExt, WeakEntity, Window, actions, div,
     pulsating_between,
@@ -804,8 +804,7 @@ impl TitleBar {
         )
     }
 
-    /// VS Code's command center: the project name in a centered box that opens the file
-    /// finder, with a chevron for recent projects.
+    /// VS Code's command center: the project name in a centered box that opens the file finder.
     fn render_command_center(
         &self,
         name: Option<SharedString>,
@@ -816,7 +815,6 @@ impl TitleBar {
             Some(name) => util::truncate_and_trailoff(name, MAX_PROJECT_NAME_LENGTH),
             None => "Search".to_string(),
         };
-        let recent_projects = self.recent_projects_menu(cx);
         h_flex()
             .id("command-center")
             .h(px(22.))
@@ -867,52 +865,6 @@ impl TitleBar {
                             .when(name.is_none(), |this| this.color(Color::Muted)),
                     ),
             )
-            .child(
-                PopoverMenu::new("command-center-recent-projects")
-                    .menu(recent_projects)
-                    .trigger_with_tooltip(
-                        IconButton::new("command-center-recent", IconName::ChevronDown)
-                            .icon_size(IconSize::XSmall)
-                            .icon_color(Color::Muted)
-                            .tab_index(0isize),
-                        move |_window, cx| {
-                            Tooltip::for_action(
-                                "Recent Projects",
-                                &zed_actions::OpenRecent::default(),
-                                cx,
-                            )
-                        },
-                    )
-                    .anchor(gpui::Anchor::TopRight),
-            )
-    }
-
-    fn recent_projects_menu(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl Fn(&mut Window, &mut App) -> Option<Entity<recent_projects::RecentProjects>> + 'static
-    {
-        let workspace = self.workspace.clone();
-        let focus_handle = workspace
-            .upgrade()
-            .map(|w| w.read(cx).focus_handle(cx))
-            .unwrap_or_else(|| cx.focus_handle());
-        let window_project_groups: Vec<_> = self
-            .multi_workspace
-            .as_ref()
-            .and_then(|mw| mw.upgrade())
-            .map(|mw| mw.read(cx).project_group_keys())
-            .unwrap_or_default();
-        move |window, cx| {
-            Some(recent_projects::RecentProjects::popover(
-                workspace.clone(),
-                window_project_groups.clone(),
-                None,
-                focus_handle.clone(),
-                window,
-                cx,
-            ))
-        }
     }
 
     fn render_worktree_and_branch(
