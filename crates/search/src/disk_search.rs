@@ -89,11 +89,25 @@ pub(crate) fn walk(
                     let Ok(entry) = entry else {
                         return WalkState::Continue;
                     };
-                    if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    let Some(kind) = entry.file_type() else {
                         return WalkState::Continue;
-                    }
+                    };
                     let abs_path = entry.path();
-                    if skip_abs_paths.contains(abs_path) {
+                    if kind.is_dir() {
+                        // Prune excluded directories instead of visiting every file inside them.
+                        let excluded = relative_to_root(&roots, abs_path, path_style).is_some_and(
+                            |(_, rel_path)| {
+                                !rel_path.is_empty()
+                                    && query.files_to_exclude().is_match(rel_path.as_ref())
+                            },
+                        );
+                        return if excluded {
+                            WalkState::Skip
+                        } else {
+                            WalkState::Continue
+                        };
+                    }
+                    if !kind.is_file() || skip_abs_paths.contains(abs_path) {
                         return WalkState::Continue;
                     }
                     let Some((root, rel_path)) = relative_to_root(&roots, abs_path, path_style)
@@ -104,11 +118,17 @@ pub(crate) fn walk(
                         return WalkState::Continue;
                     }
                     progress.files_searched.fetch_add(1, Ordering::Relaxed);
-                    let Some(text) = read_text(abs_path) else {
+                    let Some(bytes) = read_bytes(abs_path) else {
                         return WalkState::Continue;
                     };
-                    let detected = futures::executor::block_on(query.detect(&mut text.as_bytes()));
-                    if !matches!(detected, Ok(Some(_))) {
+                    // Match on the raw bytes first so only matching files pay for decoding. UTF-16
+                    // text and multi-line queries (normalized to \n) must be matched after decoding.
+                    let decode_first = is_utf16(&bytes) || query.as_str().contains('\n');
+                    if !decode_first && !detects(&query, &bytes) {
+                        return WalkState::Continue;
+                    }
+                    let text = decode(&bytes);
+                    if decode_first && !detects(&query, text.as_bytes()) {
                         return WalkState::Continue;
                     }
                     let candidate = DiskCandidate {
@@ -142,23 +162,41 @@ fn relative_to_root<'a>(
     Some((root, rel_path))
 }
 
-/// Reads a text file, skipping oversized and binary files. UTF-16 files are
-/// decoded rather than mistaken for binary because of their zero bytes.
-fn read_text(abs_path: &Path) -> Option<String> {
+fn is_utf16(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF])
+}
+
+fn detects(query: &SearchQuery, mut bytes: &[u8]) -> bool {
+    matches!(
+        futures::executor::block_on(query.detect(&mut bytes)),
+        Ok(Some(_))
+    )
+}
+
+/// Reads a file, skipping oversized and binary ones. UTF-16 files are kept
+/// rather than mistaken for binary because of their zero bytes.
+fn read_bytes(abs_path: &Path) -> Option<Vec<u8>> {
     let mut file = fs::File::open(abs_path).ok()?;
     if file.metadata().ok()?.len() > MAX_FILE_BYTES {
         return None;
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
-    let mut text = match bytes.as_slice() {
+    if !is_utf16(&bytes) && bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Decodes file bytes and normalizes line endings, as a buffer would hold them.
+fn decode(bytes: &[u8]) -> String {
+    let mut text = match bytes {
         [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
         [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, u16::from_be_bytes),
-        _ if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) => return None,
-        _ => String::from_utf8_lossy(&bytes).into_owned(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
     };
     text::LineEnding::normalize(&mut text);
-    Some(text)
+    text
 }
 
 fn decode_utf16(bytes: &[u8], to_unit: fn([u8; 2]) -> u16) -> String {
@@ -229,5 +267,57 @@ mod tests {
         found.sort();
         assert_eq!(found, vec![".github/ci.yml", "src/a.ts"]);
         assert!(progress.files_searched.load(Ordering::Relaxed) >= 4);
+    }
+
+    /// Manual benchmark: `VILO_BENCH_DIR=~/Desktop/Projects cargo test -p search --lib bench_walk -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_walk() {
+        let Ok(dir) = std::env::var("VILO_BENCH_DIR") else {
+            return;
+        };
+        let query = SearchQuery::text(
+            "SendSmsCode",
+            true,
+            true,
+            false,
+            PathMatcher::default(),
+            PathMatcher::new(
+                std::env::var("VILO_BENCH_EXCLUDE")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|glob| !glob.is_empty()),
+                PathStyle::local(),
+            )
+            .unwrap(),
+            false,
+            None,
+        )
+        .unwrap();
+        let progress = Arc::new(WalkProgress::default());
+        let started = std::time::Instant::now();
+        let rx = walk(
+            vec![DiskRoot {
+                worktree_id: WorktreeId::from_usize(1),
+                abs_path: Path::new(&dir).into(),
+            }],
+            query,
+            PathStyle::local(),
+            HashSet::default(),
+            progress.clone(),
+        );
+        let mut matched = 0;
+        let mut first = None;
+        while smol::block_on(rx.recv()).is_ok() {
+            first.get_or_insert_with(|| started.elapsed());
+            matched += 1;
+        }
+        eprintln!(
+            "walk: {:?} total, first match {:?}, {} files searched, {} matched",
+            started.elapsed(),
+            first,
+            progress.files_searched.load(Ordering::Relaxed),
+            matched
+        );
     }
 }

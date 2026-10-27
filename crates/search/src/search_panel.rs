@@ -399,26 +399,39 @@ impl SearchPanel {
                 }
             }
 
-            let mut chunks = pin!(candidates.ready_chunks(64));
+            let mut chunks = pin!(candidates.ready_chunks(256));
             while let Some(chunk) = chunks.next().await {
-                for candidate in chunk {
-                    let Ok(snapshot) = this.update(cx, |_, cx| {
-                        Buffer::build_snapshot(
-                            text::Rope::from(candidate.text.as_str()),
-                            None,
-                            None,
-                            None,
-                            cx,
-                        )
-                    }) else {
-                        return;
-                    };
-                    let query = query.clone();
-                    let lines = cx
-                        .background_spawn(async move {
+                // One foreground hop to reserve snapshots and one background task per batch:
+                // handling candidates one at a time dominated search time on large folders.
+                let Ok(snapshots) = this.update(cx, |_, cx| {
+                    chunk
+                        .into_iter()
+                        .map(|candidate| {
+                            let snapshot = Buffer::build_snapshot(
+                                text::Rope::from(candidate.text.as_str()),
+                                None,
+                                None,
+                                None,
+                                cx,
+                            );
+                            let target = ProjectPath {
+                                worktree_id: candidate.worktree_id,
+                                path: candidate.rel_path,
+                            };
+                            (target, snapshot)
+                        })
+                        .collect::<Vec<_>>()
+                }) else {
+                    return;
+                };
+                let query = query.clone();
+                let files = cx
+                    .background_spawn(async move {
+                        let mut files = Vec::with_capacity(snapshots.len());
+                        for (target, snapshot) in snapshots {
                             let snapshot = snapshot.await;
                             let ranges = query.search(&snapshot, None).await;
-                            build_match_lines(
+                            let lines = build_match_lines(
                                 &snapshot,
                                 ranges.into_iter().map(|range| {
                                     (
@@ -427,33 +440,26 @@ impl SearchPanel {
                                         None,
                                     )
                                 }),
-                            )
-                        })
-                        .await;
-                    let target = ProjectPath {
-                        worktree_id: candidate.worktree_id,
-                        path: candidate.rel_path,
-                    };
-                    let reached_limit = this
-                        .update(cx, |this, cx| {
-                            this.push_path_result(target, lines, cx);
-                            this.match_count() >= MAX_MATCHES
-                        })
-                        .unwrap_or(true);
-                    if reached_limit {
-                        progress.cancelled.store(true, Ordering::Relaxed);
-                        this.update(cx, |this, _| this.limit_reached = true).ok();
-                        break;
-                    }
-                }
-                if this
+                            );
+                            files.push((target, lines));
+                        }
+                        files
+                    })
+                    .await;
+                let reached_limit = this
                     .update(cx, |this, cx| {
+                        for (target, lines) in files {
+                            this.push_path_result(target, lines, cx);
+                        }
                         this.rebuild_rows();
                         cx.notify();
+                        this.match_count() >= MAX_MATCHES
                     })
-                    .is_err()
-                {
-                    return;
+                    .unwrap_or(true);
+                if reached_limit {
+                    progress.cancelled.store(true, Ordering::Relaxed);
+                    this.update(cx, |this, _| this.limit_reached = true).ok();
+                    break;
                 }
                 if progress.cancelled.load(Ordering::Relaxed) {
                     break;
