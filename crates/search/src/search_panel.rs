@@ -95,6 +95,9 @@ struct FileResult {
     file_name: SharedString,
     directory: SharedString,
     matches: Vec<MatchLine>,
+    /// Hash of the searched disk text. Lines alone cannot tell identical lines apart once
+    /// the file is edited, so a single replace on a disk result requires the file unchanged.
+    disk_text_hash: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -481,7 +484,7 @@ impl SearchPanel {
                                 worktree_id: candidate.worktree_id,
                                 path: candidate.rel_path,
                             };
-                            (target, snapshot)
+                            (target, candidate.text_hash, snapshot)
                         })
                         .collect::<Vec<_>>()
                 }) else {
@@ -496,7 +499,7 @@ impl SearchPanel {
                 let files = cx
                     .background_spawn(async move {
                         let mut files = Vec::with_capacity(snapshots.len());
-                        for (target, snapshot) in snapshots {
+                        for (target, text_hash, snapshot) in snapshots {
                             // Truncate per file so one file with huge match counts cannot blow past the limit.
                             if remaining == 0 {
                                 break;
@@ -515,18 +518,18 @@ impl SearchPanel {
                                     )
                                 }),
                             );
-                            files.push((target, lines));
+                            files.push((target, text_hash, lines));
                         }
                         files
                     })
                     .await;
                 let reached_limit = this
                     .update(cx, |this, cx| {
-                        for (target, lines) in files {
+                        for (target, text_hash, lines) in files {
                             if this.match_count() >= MAX_MATCHES {
                                 break;
                             }
-                            this.push_path_result(target, lines, cx);
+                            this.push_path_result(target, Some(text_hash), lines, cx);
                         }
                         this.rebuild_rows();
                         cx.notify();
@@ -579,10 +582,17 @@ impl SearchPanel {
             file_name,
             directory,
             matches,
+            disk_text_hash: None,
         });
     }
 
-    fn push_path_result(&mut self, target: ProjectPath, matches: Vec<MatchLine>, cx: &App) {
+    fn push_path_result(
+        &mut self,
+        target: ProjectPath,
+        disk_text_hash: Option<u64>,
+        matches: Vec<MatchLine>,
+        cx: &App,
+    ) {
         if matches.is_empty() {
             return;
         }
@@ -595,6 +605,7 @@ impl SearchPanel {
             file_name,
             directory,
             matches,
+            disk_text_hash,
         });
     }
 
@@ -976,7 +987,7 @@ impl SearchPanel {
                     ResultTarget::Path(path) => ResultTarget::Path(path.clone()),
                 };
                 Some((
-                    search_match.map(|m| (m.anchor, m.point, m.line_hash)),
+                    search_match.map(|m| (m.anchor, m.point, m.line_hash, file.disk_text_hash)),
                     target,
                 ))
             })
@@ -1011,7 +1022,12 @@ impl SearchPanel {
                     continue;
                 }
                 // Anchors track edits made since the search, so a single replace hits the clicked match.
-                let single = search_match.and_then(|(anchor, point, expected_hash)| {
+                let single = search_match.and_then(|(anchor, point, expected_hash, disk_hash)| {
+                    if disk_hash
+                        .is_some_and(|hash| disk_search::text_hash(&snapshot.text()) != hash)
+                    {
+                        return None;
+                    }
                     let point = anchor.map_or(point, |anchor| anchor.to_point(&snapshot));
                     let line = snapshot
                         .text_for_range(
@@ -1019,7 +1035,7 @@ impl SearchPanel {
                                 ..Point::new(point.row, snapshot.line_len(point.row)),
                         )
                         .collect::<String>();
-                    (line_hash(&line) == expected_hash).then_some(point)
+                    (disk_search::text_hash(&line) == expected_hash).then_some(point)
                 });
                 if search_match.is_some() && single.is_none() {
                     skipped += 1;
@@ -1596,13 +1612,6 @@ fn file_labels(path: &RelPath, path_style: PathStyle) -> (SharedString, SharedSt
     )
 }
 
-fn line_hash(line: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    line.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// One preview line per match, from match start/end points and an optional anchor.
 fn build_match_lines(
     snapshot: &language::BufferSnapshot,
@@ -1621,7 +1630,7 @@ fn build_match_lines(
             MatchLine {
                 anchor,
                 point: start,
-                line_hash: line_hash(&line),
+                line_hash: disk_search::text_hash(&line),
                 line_number: start.row + 1,
                 preview: preview.into(),
                 highlight,
@@ -1873,25 +1882,39 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_single_replace_skips_moved_match_without_anchor(cx: &mut TestAppContext) {
-        let (panel, project, mut cx) = init_panel_test(cx, json!({ "one.rs": "a a" })).await;
+    async fn test_single_replace_on_disk_result_requires_unchanged_file(cx: &mut TestAppContext) {
+        let (panel, project, mut cx) = init_panel_test(cx, json!({ "one.rs": "a\na\nc" })).await;
+        // Turn the results into disk results: no anchors, identity from the searched file text.
+        let as_disk_result = |cx: &mut VisualTestContext| {
+            panel.update(cx, |panel, _| {
+                let file = &mut panel.results[0];
+                file.disk_text_hash = Some(disk_search::text_hash("a\na\nc"));
+                for search_match in &mut file.matches {
+                    search_match.anchor = None;
+                }
+            })
+        };
         search(&panel, "a", false, &mut cx);
-        // Simulate a disk result: no anchor, and the file was edited so the old column holds other text.
-        panel.update(&mut cx, |panel, _| {
-            for search_match in &mut panel.results[0].matches {
-                search_match.anchor = None;
-            }
-        });
+        as_disk_result(&mut cx);
         let buffer = project
             .update(&mut cx, |project, cx| {
                 project.open_local_buffer("/dir/one.rs", cx)
             })
             .await
             .unwrap();
-        buffer.update(&mut cx, |buffer, cx| buffer.edit([(0..0, "a ")], None, cx));
-        // The stale second-match column (0, 2) now holds a different "a"; it must not be replaced.
+        buffer.update(&mut cx, |buffer, cx| buffer.edit([(0..0, "a\n")], None, cx));
+        // Row 1 still reads "a", but it is now the original first match; it must not be replaced.
         replace(&panel, "b", ReplaceScope::Match(0, 1), &mut cx);
-        assert_eq!(buffer.read_with(&cx, |buffer, _| buffer.text()), "a a a");
+        assert_eq!(
+            buffer.read_with(&cx, |buffer, _| buffer.text()),
+            "a\na\na\nc"
+        );
+
+        buffer.update(&mut cx, |buffer, cx| buffer.edit([(0..2, "")], None, cx));
+        search(&panel, "a", false, &mut cx);
+        as_disk_result(&mut cx);
+        replace(&panel, "b", ReplaceScope::Match(0, 1), &mut cx);
+        assert_eq!(buffer.read_with(&cx, |buffer, _| buffer.text()), "a\nb\nc");
     }
 
     #[test]

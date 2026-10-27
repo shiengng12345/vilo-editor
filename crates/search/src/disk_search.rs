@@ -32,6 +32,8 @@ pub(crate) struct DiskCandidate {
     pub rel_path: Arc<RelPath>,
     /// File contents with line endings normalized, as a buffer would hold them.
     pub text: String,
+    /// Lets a later single replace confirm the file still holds the searched text.
+    pub text_hash: u64,
 }
 
 #[derive(Default)]
@@ -153,6 +155,7 @@ pub(crate) fn walk(
                     let candidate = DiskCandidate {
                         worktree_id: root.worktree_id,
                         rel_path,
+                        text_hash: text_hash(&text),
                         text,
                     };
                     if tx.send_blocking(candidate).is_err() {
@@ -208,6 +211,13 @@ fn read_bytes(abs_path: &Path) -> Option<Vec<u8>> {
 }
 
 /// Decodes file bytes and normalizes line endings, as a buffer would hold them.
+pub(crate) fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn decode(bytes: &[u8]) -> String {
     let mut text = match bytes {
         [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
