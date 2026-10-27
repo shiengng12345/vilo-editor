@@ -76,6 +76,8 @@ struct MatchLine {
     /// Present for open buffers, so the position follows later edits.
     anchor: Option<Anchor>,
     point: Point,
+    /// Lets a single replace confirm its line is unchanged; disk results have no anchor.
+    line_hash: u64,
     line_number: u32,
     preview: SharedString,
     highlight: Range<usize>,
@@ -973,7 +975,10 @@ impl SearchPanel {
                     ResultTarget::Buffer(buffer) => ResultTarget::Buffer(buffer.clone()),
                     ResultTarget::Path(path) => ResultTarget::Path(path.clone()),
                 };
-                Some((search_match.map(|m| (m.anchor, m.point)), target))
+                Some((
+                    search_match.map(|m| (m.anchor, m.point, m.line_hash)),
+                    target,
+                ))
             })
             .collect::<Vec<_>>();
         let project = self.project.clone();
@@ -1006,16 +1011,27 @@ impl SearchPanel {
                     continue;
                 }
                 // Anchors track edits made since the search, so a single replace hits the clicked match.
-                let point = search_match.map(|(anchor, point)| {
-                    anchor.map_or(point, |anchor| anchor.to_point(&snapshot))
+                let single = search_match.and_then(|(anchor, point, expected_hash)| {
+                    let point = anchor.map_or(point, |anchor| anchor.to_point(&snapshot));
+                    let line = snapshot
+                        .text_for_range(
+                            Point::new(point.row, 0)
+                                ..Point::new(point.row, snapshot.line_len(point.row)),
+                        )
+                        .collect::<String>();
+                    (line_hash(&line) == expected_hash).then_some(point)
                 });
+                if search_match.is_some() && single.is_none() {
+                    skipped += 1;
+                    continue;
+                }
                 let ranges = query.search(&snapshot, None).await;
                 let edits = ranges
                     .into_iter()
                     .filter(|range| {
-                        point.is_none_or(|point| snapshot.offset_to_point(range.start) == point)
+                        single.is_none_or(|point| snapshot.offset_to_point(range.start) == point)
                     })
-                    .take(if point.is_some() { 1 } else { usize::MAX })
+                    .take(if single.is_some() { 1 } else { usize::MAX })
                     .filter_map(|range| {
                         let start = snapshot.offset_to_point(range.start);
                         let end = snapshot.offset_to_point(range.end);
@@ -1040,13 +1056,22 @@ impl SearchPanel {
                 if edits.is_empty() {
                     continue;
                 }
-                replaced += edits.len();
-                // Dirty state is read at edit time: the user may have typed while the search awaited.
+                let edit_count = edits.len();
+                // The search awaited, so the user may have typed since the snapshot, making its
+                // ranges and dirty state stale.
                 let was_dirty = buffer.update(cx, |buffer, cx| {
+                    if buffer.version().changed_since(snapshot.version()) {
+                        return None;
+                    }
                     let was_dirty = buffer.is_dirty();
                     buffer.edit(edits, None, cx);
-                    was_dirty
+                    Some(was_dirty)
                 });
+                let Some(was_dirty) = was_dirty else {
+                    skipped += 1;
+                    continue;
+                };
+                replaced += edit_count;
                 // Like VS Code, save files that were clean: a buffer only held by the result list
                 // would be dropped with its edits once the results refresh.
                 if was_dirty {
@@ -1084,7 +1109,7 @@ impl SearchPanel {
                 );
                 if skipped > 0 {
                     status.push_str(&format!(
-                        ", skipped {skipped} read-only or unreadable file(s)"
+                        ", skipped {skipped} read-only, unreadable or concurrently edited file(s)"
                     ));
                 }
                 if !failed_saves.is_empty() {
@@ -1119,6 +1144,7 @@ impl SearchPanel {
             regex: Some(self.regex),
             case_sensitive: Some(self.case_sensitive),
             whole_word: Some(self.whole_word),
+            include_ignored: Some(false),
             ..Default::default()
         };
         window.dispatch_action(Box::new(action), cx);
@@ -1570,6 +1596,13 @@ fn file_labels(path: &RelPath, path_style: PathStyle) -> (SharedString, SharedSt
     )
 }
 
+fn line_hash(line: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    line.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// One preview line per match, from match start/end points and an optional anchor.
 fn build_match_lines(
     snapshot: &language::BufferSnapshot,
@@ -1588,6 +1621,7 @@ fn build_match_lines(
             MatchLine {
                 anchor,
                 point: start,
+                line_hash: line_hash(&line),
                 line_number: start.row + 1,
                 preview: preview.into(),
                 highlight,
@@ -1836,6 +1870,28 @@ mod tests {
             buffer_text(&project, "/dir/one.rs", &mut cx).await,
             ("a b a".into(), false)
         );
+    }
+
+    #[gpui::test]
+    async fn test_single_replace_skips_moved_match_without_anchor(cx: &mut TestAppContext) {
+        let (panel, project, mut cx) = init_panel_test(cx, json!({ "one.rs": "a a" })).await;
+        search(&panel, "a", false, &mut cx);
+        // Simulate a disk result: no anchor, and the file was edited so the old column holds other text.
+        panel.update(&mut cx, |panel, _| {
+            for search_match in &mut panel.results[0].matches {
+                search_match.anchor = None;
+            }
+        });
+        let buffer = project
+            .update(&mut cx, |project, cx| {
+                project.open_local_buffer("/dir/one.rs", cx)
+            })
+            .await
+            .unwrap();
+        buffer.update(&mut cx, |buffer, cx| buffer.edit([(0..0, "a ")], None, cx));
+        // The stale second-match column (0, 2) now holds a different "a"; it must not be replaced.
+        replace(&panel, "b", ReplaceScope::Match(0, 1), &mut cx);
+        assert_eq!(buffer.read_with(&cx, |buffer, _| buffer.text()), "a a a");
     }
 
     #[test]
