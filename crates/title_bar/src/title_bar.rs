@@ -843,6 +843,8 @@ impl TitleBar {
                     .px_2()
                     .cursor_pointer()
                     .tab_index(0isize)
+                    .role(gpui::Role::Button)
+                    .aria_label("Search Files")
                     .tooltip(|_window, cx| {
                         Tooltip::for_action(
                             "Search Files",
