@@ -380,10 +380,10 @@ impl SearchPanel {
                             worktree_id: file.worktree_id(cx),
                             path: RelPath::empty(),
                         };
+                        // is_path_excluded also checks ancestors, e.g. a file under an excluded folder.
                         query.match_path(file.path())
                             && !WorktreeSettings::get(Some(location), cx)
-                                .file_scan_exclusions
-                                .is_match(file.path().as_ref())
+                                .is_path_excluded(file.path())
                     })
             })
             .collect::<Vec<_>>();
@@ -458,12 +458,23 @@ impl SearchPanel {
                     return;
                 };
                 let query = query.clone();
+                let Ok(mut remaining) =
+                    this.read_with(cx, |this, _| MAX_MATCHES.saturating_sub(this.match_count()))
+                else {
+                    return;
+                };
                 let files = cx
                     .background_spawn(async move {
                         let mut files = Vec::with_capacity(snapshots.len());
                         for (target, snapshot) in snapshots {
+                            // Truncate per file so one file with huge match counts cannot blow past the limit.
+                            if remaining == 0 {
+                                break;
+                            }
                             let snapshot = snapshot.await;
-                            let ranges = query.search(&snapshot, None).await;
+                            let mut ranges = query.search(&snapshot, None).await;
+                            ranges.truncate(remaining);
+                            remaining -= ranges.len();
                             let lines = build_match_lines(
                                 &snapshot,
                                 ranges.into_iter().map(|range| {

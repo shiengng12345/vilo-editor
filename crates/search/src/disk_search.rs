@@ -141,7 +141,9 @@ pub(crate) fn walk(
                     // Match on the raw bytes first so only matching files pay for decoding. UTF-16
                     // text and multi-line queries (normalized to \n) must be matched after decoding.
                     let decode_first = is_utf16(&bytes) || query.as_str().contains('\n');
-                    if !decode_first && !detects(&query, &bytes) {
+                    // Skip a UTF-8 BOM so anchored patterns like `^foo` still match the first line.
+                    let without_bom = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+                    if !decode_first && !detects(&query, without_bom) {
                         return WalkState::Continue;
                     }
                     let text = decode(&bytes);
@@ -340,6 +342,37 @@ mod tests {
         expected.sort();
         // The nested file appears once, under its own worktree; "copies" is excluded for the outer root.
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn test_walk_anchored_regex_matches_after_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("bom.ts"), b"\xEF\xBB\xBFSendSmsCode()").unwrap();
+        let query = SearchQuery::regex(
+            "^SendSmsCode",
+            false,
+            true,
+            false,
+            false,
+            PathMatcher::default(),
+            PathMatcher::default(),
+            false,
+            None,
+        )
+        .unwrap();
+        let rx = walk(
+            vec![DiskRoot {
+                worktree_id: WorktreeId::from_usize(1),
+                abs_path: dir.path().into(),
+                scan_exclusions: PathMatcher::default(),
+            }],
+            query,
+            PathStyle::local(),
+            HashSet::default(),
+            Arc::new(WalkProgress::default()),
+        );
+        let candidate = smol::block_on(rx.recv()).expect("BOM file matches ^SendSmsCode");
+        assert_eq!(candidate.text, "SendSmsCode()");
     }
 
     /// Manual benchmark: `VILO_BENCH_DIR=~/Desktop/Projects cargo test -p search --lib bench_walk -- --ignored --nocapture`
