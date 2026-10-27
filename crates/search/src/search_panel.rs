@@ -57,6 +57,7 @@ struct MatchLine {
 
 struct FileResult {
     buffer: Entity<Buffer>,
+    icon: Option<SharedString>,
     file_name: SharedString,
     directory: SharedString,
     matches: Vec<MatchLine>,
@@ -134,7 +135,7 @@ impl SearchPanel {
             case_sensitive: false,
             whole_word: false,
             regex: false,
-            show_filters: true,
+            show_filters: false,
             results: Vec::new(),
             collapsed: HashSet::default(),
             rows: Vec::new(),
@@ -276,6 +277,9 @@ impl SearchPanel {
         }
         let buffer_ref = buffer.read(cx);
         let snapshot = buffer_ref.snapshot();
+        let icon = buffer_ref
+            .file()
+            .and_then(|file| file_icons::FileIcons::get_icon(file.path().as_std_path(), cx));
         let (file_name, directory) = match buffer_ref.file() {
             Some(file) => {
                 let path = file.path();
@@ -312,6 +316,7 @@ impl SearchPanel {
             .collect();
         self.results.push(FileResult {
             buffer,
+            icon,
             file_name,
             directory,
             matches,
@@ -429,7 +434,7 @@ impl SearchPanel {
     ) -> impl IntoElement {
         IconButton::new(id, icon)
             .shape(IconButtonShape::Square)
-            .icon_size(IconSize::Small)
+            .icon_size(IconSize::XSmall)
             .toggle_state(active)
             .tooltip(Tooltip::text(tooltip))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -438,17 +443,26 @@ impl SearchPanel {
             }))
     }
 
-    fn render_input(&self, editor: &Entity<Editor>, cx: &App) -> Div {
+    /// A compact single-line input box; `trailing` sits inside it on the right, as in VS Code.
+    fn render_input(
+        &self,
+        editor: &Entity<Editor>,
+        trailing: Vec<AnyElement>,
+        cx: &App,
+    ) -> impl IntoElement {
         h_flex()
-            .flex_1()
-            .min_w_0()
-            .px_1p5()
-            .py_1()
+            .w_full()
+            .flex_none()
+            .h(px(26.))
+            .pl_1p5()
+            .pr_0p5()
+            .gap_0p5()
             .rounded_sm()
             .border_1()
             .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().editor_background)
             .child(div().flex_1().min_w_0().child(editor.clone()))
+            .children(trailing)
     }
 
     fn render_row(&self, row: Row, cx: &mut Context<Self>) -> AnyElement {
@@ -473,19 +487,36 @@ impl SearchPanel {
                         .size(IconSize::Small)
                         .color(Color::Muted),
                     )
-                    .child(Label::new(file.file_name.clone()).single_line())
+                    .when_some(file.icon.clone(), |this, icon| {
+                        this.child(
+                            Icon::from_path(icon)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
                     .child(
-                        Label::new(file.directory.clone())
-                            .color(Color::Muted)
+                        Label::new(file.file_name.clone())
                             .size(LabelSize::Small)
-                            .single_line()
-                            .truncate(),
+                            .single_line(),
                     )
-                    .child(div().flex_1())
                     .child(
-                        Label::new(file.matches.len().to_string())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        div().flex_1().min_w_0().child(
+                            Label::new(file.directory.clone())
+                                .color(Color::Muted)
+                                .size(LabelSize::XSmall)
+                                .single_line()
+                                .truncate(),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .px_1p5()
+                            .rounded_full()
+                            .bg(colors.element_background)
+                            .child(
+                                Label::new(file.matches.len().to_string()).size(LabelSize::XSmall),
+                            ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_file(file_ix, cx)))
                     .into_any_element()
@@ -507,6 +538,7 @@ impl SearchPanel {
                     .tooltip(Tooltip::text(format!("Line {}", search_match.line_number)))
                     .child(
                         HighlightedLabel::from_ranges(preview, vec![highlight])
+                            .size(LabelSize::Small)
                             .single_line()
                             .truncate(),
                     )
@@ -534,94 +566,97 @@ impl EventEmitter<PanelEvent> for SearchPanel {}
 impl Render for SearchPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let row_count = self.rows.len();
+        let toggles = vec![
+            self.render_option(
+                "search-panel-case",
+                IconName::CaseSensitive,
+                "Match Case",
+                self.case_sensitive,
+                |this| this.case_sensitive = !this.case_sensitive,
+                cx,
+            )
+            .into_any_element(),
+            self.render_option(
+                "search-panel-word",
+                IconName::WholeWord,
+                "Match Whole Word",
+                self.whole_word,
+                |this| this.whole_word = !this.whole_word,
+                cx,
+            )
+            .into_any_element(),
+            self.render_option(
+                "search-panel-regex",
+                IconName::Regex,
+                "Use Regular Expression",
+                self.regex,
+                |this| this.regex = !this.regex,
+                cx,
+            )
+            .into_any_element(),
+        ];
+        let filter_label =
+            |text: &'static str| Label::new(text).size(LabelSize::XSmall).color(Color::Muted);
+
         v_flex()
             .id("search-panel")
             .key_context("SearchPanel")
             .track_focus(&self.focus_handle)
             .size_full()
-            .p_2()
-            .gap_1()
             .child(
-                Label::new("SEARCH")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(self.render_input(&self.query_editor, cx))
-                    .child(self.render_option(
-                        "search-panel-case",
-                        IconName::CaseSensitive,
-                        "Match Case",
-                        self.case_sensitive,
-                        |this| this.case_sensitive = !this.case_sensitive,
-                        cx,
-                    ))
-                    .child(self.render_option(
-                        "search-panel-word",
-                        IconName::WholeWord,
-                        "Match Whole Word",
-                        self.whole_word,
-                        |this| this.whole_word = !this.whole_word,
-                        cx,
-                    ))
-                    .child(self.render_option(
-                        "search-panel-regex",
-                        IconName::Regex,
-                        "Use Regular Expression",
-                        self.regex,
-                        |this| this.regex = !this.regex,
-                        cx,
-                    )),
-            )
-            .child(
-                h_flex().justify_end().child(
-                    IconButton::new("search-panel-filters", IconName::Ellipsis)
-                        .icon_size(IconSize::Small)
-                        .toggle_state(self.show_filters)
-                        .tooltip(Tooltip::text("Toggle Search Details"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_filters = !this.show_filters;
-                            cx.notify();
-                        })),
+                h_flex().flex_none().h(px(32.)).px_3().child(
+                    Label::new("SEARCH")
+                        .size(LabelSize::XSmall)
+                        .weight(gpui::FontWeight::SEMIBOLD),
                 ),
             )
-            .when(self.show_filters, |this| {
-                this.child(
-                    Label::new("files to include")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(self.render_input(&self.include_editor, cx))
-                .child(
-                    Label::new("files to exclude")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(self.render_input(&self.exclude_editor, cx))
-            })
-            .when_some(self.summary(), |this, summary| {
-                this.child(
-                    Label::new(summary)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-            })
             .child(
-                uniform_list(
-                    "search-panel-results",
-                    row_count,
-                    cx.processor(|this, range: Range<usize>, _window, cx| {
-                        this.rows[range]
-                            .to_vec()
-                            .into_iter()
-                            .map(|row| this.render_row(row, cx))
-                            .collect()
+                v_flex()
+                    .flex_none()
+                    .px_3()
+                    .gap_1()
+                    .child(self.render_input(&self.query_editor, toggles, cx))
+                    .child(
+                        h_flex().justify_end().child(
+                            IconButton::new("search-panel-filters", IconName::Ellipsis)
+                                .icon_size(IconSize::XSmall)
+                                .toggle_state(self.show_filters)
+                                .tooltip(Tooltip::text("Toggle Search Details"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_filters = !this.show_filters;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .when(self.show_filters, |this| {
+                        this.child(filter_label("files to include"))
+                            .child(self.render_input(&self.include_editor, Vec::new(), cx))
+                            .child(filter_label("files to exclude"))
+                            .child(self.render_input(&self.exclude_editor, Vec::new(), cx))
+                    })
+                    .when_some(self.summary(), |this, summary| {
+                        this.child(
+                            Label::new(summary)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
                     }),
-                )
-                .flex_1()
-                .size_full(),
+            )
+            .child(
+                div().flex_1().min_h_0().pt_1().child(
+                    uniform_list(
+                        "search-panel-results",
+                        row_count,
+                        cx.processor(|this, range: Range<usize>, _window, cx| {
+                            this.rows[range]
+                                .to_vec()
+                                .into_iter()
+                                .map(|row| this.render_row(row, cx))
+                                .collect()
+                        }),
+                    )
+                    .size_full(),
+                ),
             )
     }
 }
