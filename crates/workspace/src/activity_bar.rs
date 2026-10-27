@@ -2,7 +2,7 @@ use crate::dock::{Dock, PanelHandle};
 use gpui::{Action, Anchor, Entity, Focusable, Subscription};
 use settings::SettingsStore;
 use std::sync::Arc;
-use ui::{ContextMenu, CountBadge, IconButton, PopoverMenu, Tooltip, prelude::*};
+use ui::{ContextMenu, CountBadge, IconButton, PopoverMenu, Tooltip, prelude::*, rems_from_px};
 
 pub const ACTIVITY_BAR_WIDTH: Pixels = px(48.);
 const ACTIVE_INDICATOR_WIDTH: Pixels = px(2.);
@@ -75,42 +75,57 @@ fn render_item(
     focus_handle: gpui::FocusHandle,
     cx: &App,
 ) -> AnyElement {
-    let indicator_color = cx.theme().colors().text_accent;
-    h_flex()
+    let colors = cx.theme().colors();
+    // VS Code metrics: 48px square items, 24px icons, inactive icons at 65% until hovered.
+    div()
+        .id(id)
         .relative()
-        .w_full()
+        .flex()
+        .items_center()
         .justify_center()
+        .size(ACTIVITY_BAR_WIDTH)
+        .flex_none()
+        .cursor_pointer()
+        .tab_index(0isize)
+        .aria_label(tooltip.clone())
+        .opacity(if is_active { 1. } else { 0.65 })
         .child(
             div()
                 .absolute()
                 .left_0()
-                .top_0()
-                .bottom_0()
+                .top(px(12.))
+                .h(px(24.))
                 .w(ACTIVE_INDICATOR_WIDTH)
-                .when(is_active, |this| this.bg(indicator_color)),
+                .when(is_active, |this| this.bg(colors.text_accent)),
         )
         .child(
-            div()
-                .relative()
-                .child(
-                    IconButton::new(id, icon)
-                        .icon_size(IconSize::Medium)
-                        .size(ButtonSize::Large)
-                        .toggle_state(is_active)
-                        .tab_index(0isize)
-                        .aria_label(tooltip.clone())
-                        .tooltip({
-                            let action = action.boxed_clone();
-                            move |_window, cx| Tooltip::for_action(tooltip.clone(), &*action, cx)
-                        })
-                        .on_click(move |_, window, cx| {
-                            // Actions route through the focused element, so focus the dock first.
-                            window.focus(&focus_handle, cx);
-                            window.dispatch_action(action.boxed_clone(), cx);
-                        }),
-                )
-                .when_some(badge, |this, count| this.child(CountBadge::new(count))),
+            Icon::new(icon)
+                .size(IconSize::Custom(rems_from_px(24_f32)))
+                .color(if is_active {
+                    Color::Default
+                } else {
+                    Color::Muted
+                }),
         )
+        .when_some(badge, |this, count| {
+            this.child(
+                div()
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(6.))
+                    .child(CountBadge::new(count)),
+            )
+        })
+        .tooltip({
+            let action = action.boxed_clone();
+            move |_window, cx| Tooltip::for_action(tooltip.clone(), &*action, cx)
+        })
+        .on_click(move |_, window, cx| {
+            // Actions route through the focused element, so focus the dock first.
+            window.focus(&focus_handle, cx);
+            window.dispatch_action(action.boxed_clone(), cx);
+        })
+        .hover(move |style| style.bg(colors.ghost_element_hover).opacity(1.))
         .into_any_element()
 }
 
@@ -154,13 +169,14 @@ impl Render for ActivityBar {
             .bg(colors.title_bar_background)
             .border_r_1()
             .border_color(colors.border)
-            .child(v_flex().w_full().gap_1().children(items))
+            .child(v_flex().w_full().children(items))
             .child(
                 h_flex().w_full().justify_center().child(
                     PopoverMenu::new("activity-bar-manage")
                         .trigger_with_tooltip(
                             IconButton::new("activity-bar-manage-button", IconName::Settings)
-                                .icon_size(IconSize::Medium)
+                                .icon_size(IconSize::Custom(rems_from_px(24_f32)))
+                                .icon_color(Color::Muted)
                                 .size(ButtonSize::Large)
                                 .tab_index(0isize),
                             Tooltip::text("Manage"),

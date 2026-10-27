@@ -19,7 +19,10 @@ use project::{
     search::{SearchQuery, SearchResult},
 };
 use text::Anchor;
-use ui::{HighlightedLabel, IconButton, IconButtonShape, Tooltip, prelude::*};
+use ui::{
+    IconButton, IconButtonShape, IndentGuideColors, ListItem, ListItemSpacing, Tooltip, prelude::*,
+    rems_from_px,
+};
 use util::{ResultExt as _, paths::PathMatcher};
 use workspace::{
     Workspace,
@@ -37,6 +40,13 @@ actions!(
 const SEARCH_PANEL_KEY: &str = "SearchPanel";
 const SEARCH_ON_TYPE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_LINE_PREVIEW_CHARS: usize = 200;
+/// Characters kept before a match; longer leading context is replaced by "…" so the match stays visible.
+const MAX_CONTEXT_BEFORE_MATCH: usize = 24;
+// VS Code workbench metrics (logical px), scoped to the side bar so the global UI size stays as is.
+const ROW_HEIGHT: Pixels = px(22.);
+const HEADER_HEIGHT: Pixels = px(35.);
+const INPUT_HEIGHT: Pixels = px(28.);
+const INDENT_SIZE: f32 = 16.;
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -92,6 +102,7 @@ pub struct SearchPanel {
     results: Vec<FileResult>,
     collapsed: HashSet<usize>,
     rows: Vec<Row>,
+    selected_row: Option<usize>,
     status: Status,
     position: DockPosition,
     pending_debounce: Option<Task<()>>,
@@ -139,6 +150,7 @@ impl SearchPanel {
             results: Vec::new(),
             collapsed: HashSet::default(),
             rows: Vec::new(),
+            selected_row: None,
             status: Status::Idle,
             position: DockPosition::Left,
             pending_debounce: None,
@@ -219,6 +231,7 @@ impl SearchPanel {
     fn run_search(&mut self, cx: &mut Context<Self>) {
         self.results.clear();
         self.collapsed.clear();
+        self.selected_row = None;
         self.limit_reached = false;
         self.rebuild_rows();
         let query = match self.build_query(cx) {
@@ -448,110 +461,164 @@ impl SearchPanel {
         &self,
         editor: &Entity<Editor>,
         trailing: Vec<AnyElement>,
+        window: &Window,
         cx: &App,
     ) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let focused = editor.focus_handle(cx).is_focused(window);
         h_flex()
             .w_full()
             .flex_none()
-            .h(px(26.))
+            .h(INPUT_HEIGHT)
             .pl_1p5()
             .pr_0p5()
             .gap_0p5()
             .rounded_sm()
             .border_1()
-            .border_color(cx.theme().colors().border)
-            .bg(cx.theme().colors().editor_background)
+            .border_color(if focused {
+                colors.border_focused
+            } else {
+                colors.border
+            })
+            .bg(colors.editor_background)
+            .text_size(rems_from_px(13_f32))
             .child(div().flex_1().min_w_0().child(editor.clone()))
             .children(trailing)
     }
 
-    fn render_row(&self, row: Row, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
+    fn render_row(
+        &self,
+        row_ix: usize,
+        row: Row,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.selected_row == Some(row_ix);
+        let focused = selected && self.focus_handle.contains_focused(window, cx);
+        let text_size = LabelSize::Custom(rems_from_px(13_f32));
         match row {
             Row::File(file_ix) => {
                 let file = &self.results[file_ix];
-                let collapsed = self.collapsed.contains(&file_ix);
-                h_flex()
-                    .id(("search-file", file_ix))
-                    .w_full()
-                    .px_1()
-                    .gap_1()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(colors.ghost_element_hover))
+                let expanded = !self.collapsed.contains(&file_ix);
+                ListItem::new(("search-file", file_ix))
+                    .height(ROW_HEIGHT)
+                    .spacing(ListItemSpacing::Dense)
+                    .indent_level(0)
+                    .indent_step_size(px(INDENT_SIZE))
+                    .toggle(expanded)
+                    .on_toggle(cx.listener(move |this, _, _, cx| this.toggle_file(file_ix, cx)))
+                    .toggle_state(selected)
+                    .focused(focused)
+                    .start_slot::<Icon>(file.icon.clone().map(|icon| {
+                        Icon::from_path(icon)
+                            .size(IconSize::Small)
+                            .color(Color::Muted)
+                    }))
                     .child(
-                        Icon::new(if collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
+                        h_flex()
+                            .min_w_0()
+                            .gap_1p5()
+                            .child(
+                                Label::new(file.file_name.clone())
+                                    .size(text_size)
+                                    .single_line(),
+                            )
+                            .child(
+                                Label::new(file.directory.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .single_line()
+                                    .truncate(),
+                            ),
                     )
-                    .when_some(file.icon.clone(), |this, icon| {
-                        this.child(
-                            Icon::from_path(icon)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
-                    })
-                    .child(
-                        Label::new(file.file_name.clone())
-                            .size(LabelSize::Small)
-                            .single_line(),
-                    )
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Label::new(file.directory.clone())
-                                .color(Color::Muted)
-                                .size(LabelSize::XSmall)
-                                .single_line()
-                                .truncate(),
-                        ),
-                    )
-                    .child(
+                    .end_slot(
                         div()
-                            .flex_none()
                             .px_1p5()
+                            .h(px(16.))
+                            .flex()
+                            .items_center()
                             .rounded_full()
-                            .bg(colors.element_background)
+                            .bg(cx.theme().colors().element_background)
                             .child(
                                 Label::new(file.matches.len().to_string()).size(LabelSize::XSmall),
                             ),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_file(file_ix, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected_row = Some(row_ix);
+                        this.toggle_file(file_ix, cx);
+                    }))
                     .into_any_element()
             }
             Row::Match(file_ix, match_ix) => {
                 let search_match = &self.results[file_ix].matches[match_ix];
-                let preview = search_match.preview.clone();
-                let highlight = search_match.highlight.clone();
-                h_flex()
-                    .id(ElementId::NamedInteger(
-                        "search-match".into(),
-                        ((file_ix as u64) << 32) | match_ix as u64,
-                    ))
-                    .w_full()
-                    .pl_6()
-                    .pr_1()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(colors.ghost_element_hover))
-                    .tooltip(Tooltip::text(format!("Line {}", search_match.line_number)))
-                    .child(
-                        HighlightedLabel::from_ranges(preview, vec![highlight])
-                            .size(LabelSize::Small)
-                            .single_line()
-                            .truncate(),
-                    )
-                    .on_click(
-                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                            // Single click previews, double click pins the tab, as in VS Code.
-                            let allow_preview = event.click_count() < 2;
-                            this.open_match(file_ix, match_ix, allow_preview, window, cx);
-                        }),
-                    )
-                    .into_any_element()
+                let highlight_style = gpui::HighlightStyle {
+                    background_color: Some(cx.theme().colors().search_match_background),
+                    ..Default::default()
+                };
+                ListItem::new(ElementId::NamedInteger(
+                    "search-match".into(),
+                    ((file_ix as u64) << 32) | match_ix as u64,
+                ))
+                .height(ROW_HEIGHT)
+                .spacing(ListItemSpacing::Dense)
+                .indent_level(1)
+                .indent_step_size(px(INDENT_SIZE))
+                .toggle_state(selected)
+                .focused(focused)
+                .tooltip(Tooltip::text(format!("Line {}", search_match.line_number)))
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(rems_from_px(13_f32))
+                        .text_ellipsis()
+                        .child(
+                            gpui::StyledText::new(search_match.preview.clone()).with_highlights([
+                                (search_match.highlight.clone(), highlight_style),
+                            ]),
+                        ),
+                )
+                .on_click(
+                    cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                        this.selected_row = Some(row_ix);
+                        // Single click previews, double click pins the tab, as in VS Code.
+                        let allow_preview = event.click_count() < 2;
+                        this.open_match(file_ix, match_ix, allow_preview, window, cx);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()
             }
         }
+    }
+
+    fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        self.collapsed = (0..self.results.len()).collect();
+        self.rebuild_rows();
+        cx.notify();
+    }
+
+    fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.query_editor
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
+        self.pending_debounce = None;
+        self.run_search(cx);
+    }
+
+    fn header_button(
+        &self,
+        id: &'static str,
+        icon: IconName,
+        tooltip: &'static str,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        IconButton::new(id, icon)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
     }
 }
 
@@ -564,7 +631,7 @@ impl Focusable for SearchPanel {
 impl EventEmitter<PanelEvent> for SearchPanel {}
 
 impl Render for SearchPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let row_count = self.rows.len();
         let toggles = vec![
             self.render_option(
@@ -596,7 +663,8 @@ impl Render for SearchPanel {
             .into_any_element(),
         ];
         let filter_label =
-            |text: &'static str| Label::new(text).size(LabelSize::XSmall).color(Color::Muted);
+            |text: &'static str| Label::new(text).size(LabelSize::Small).color(Color::Muted);
+        let has_results = !self.results.is_empty();
 
         v_flex()
             .id("search-panel")
@@ -604,56 +672,105 @@ impl Render for SearchPanel {
             .track_focus(&self.focus_handle)
             .size_full()
             .child(
-                h_flex().flex_none().h(px(32.)).px_3().child(
-                    Label::new("SEARCH")
-                        .size(LabelSize::XSmall)
-                        .weight(gpui::FontWeight::SEMIBOLD),
-                ),
+                h_flex()
+                    .flex_none()
+                    .h(HEADER_HEIGHT)
+                    .pl_3()
+                    .pr_1p5()
+                    .justify_between()
+                    .child(
+                        Label::new("SEARCH")
+                            .size(LabelSize::Custom(rems_from_px(11_f32)))
+                            .weight(gpui::FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .child(self.header_button(
+                                "search-panel-refresh",
+                                IconName::RotateCw,
+                                "Refresh",
+                                |this, _, cx| this.run_search(cx),
+                                cx,
+                            ))
+                            .child(self.header_button(
+                                "search-panel-clear",
+                                IconName::Close,
+                                "Clear Search Results",
+                                |this, window, cx| this.clear(window, cx),
+                                cx,
+                            ))
+                            .when(has_results, |this| {
+                                this.child(self.header_button(
+                                    "search-panel-collapse",
+                                    IconName::ListCollapse,
+                                    "Collapse All",
+                                    |this, _, cx| this.collapse_all(cx),
+                                    cx,
+                                ))
+                            }),
+                    ),
             )
             .child(
                 v_flex()
                     .flex_none()
                     .px_3()
                     .gap_1()
-                    .child(self.render_input(&self.query_editor, toggles, cx))
-                    .child(
-                        h_flex().justify_end().child(
-                            IconButton::new("search-panel-filters", IconName::Ellipsis)
-                                .icon_size(IconSize::XSmall)
-                                .toggle_state(self.show_filters)
-                                .tooltip(Tooltip::text("Toggle Search Details"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_filters = !this.show_filters;
-                                    cx.notify();
-                                })),
-                        ),
-                    )
+                    .child(self.render_input(&self.query_editor, toggles, window, cx))
                     .when(self.show_filters, |this| {
                         this.child(filter_label("files to include"))
-                            .child(self.render_input(&self.include_editor, Vec::new(), cx))
+                            .child(self.render_input(&self.include_editor, Vec::new(), window, cx))
                             .child(filter_label("files to exclude"))
-                            .child(self.render_input(&self.exclude_editor, Vec::new(), cx))
+                            .child(self.render_input(&self.exclude_editor, Vec::new(), window, cx))
                     })
-                    .when_some(self.summary(), |this, summary| {
-                        this.child(
-                            Label::new(summary)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                    }),
+                    .child(
+                        h_flex()
+                            .h(ROW_HEIGHT)
+                            .justify_between()
+                            .child(
+                                Label::new(self.summary().unwrap_or_default())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .single_line()
+                                    .truncate(),
+                            )
+                            .child(
+                                IconButton::new("search-panel-filters", IconName::Ellipsis)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .toggle_state(self.show_filters)
+                                    .tooltip(Tooltip::text("Toggle Search Details"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_filters = !this.show_filters;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
             )
             .child(
-                div().flex_1().min_h_0().pt_1().child(
+                div().flex_1().min_h_0().child(
                     uniform_list(
                         "search-panel-results",
                         row_count,
-                        cx.processor(|this, range: Range<usize>, _window, cx| {
-                            this.rows[range]
-                                .to_vec()
-                                .into_iter()
-                                .map(|row| this.render_row(row, cx))
+                        cx.processor(|this, range: Range<usize>, window, cx| {
+                            range
+                                .map(|row_ix| {
+                                    this.render_row(row_ix, this.rows[row_ix], window, cx)
+                                })
                                 .collect()
                         }),
+                    )
+                    .with_decoration(
+                        ui::indent_guides(px(INDENT_SIZE), IndentGuideColors::panel(cx))
+                            .with_compute_indents_fn(cx.entity(), |this, range, _, _| {
+                                this.rows[range]
+                                    .iter()
+                                    .map(|row| match row {
+                                        Row::File(_) => 0,
+                                        Row::Match(..) => 1,
+                                    })
+                                    .collect()
+                            }),
                     )
                     .size_full(),
                 ),
@@ -711,26 +828,42 @@ impl Panel for SearchPanel {
 }
 
 /// Builds the one-line preview shown under a file: leading indentation is
-/// dropped, long lines are cut at a char boundary, and the highlight is
-/// clamped to what remains. Columns are byte offsets into `line`; a match that
-/// continues past this line has no end column.
+/// dropped, context before the match is cut to [`MAX_CONTEXT_BEFORE_MATCH`]
+/// characters with a "…" prefix so the match is always visible, long lines are
+/// cut at a char boundary, and the highlight is remapped onto the result.
+/// Columns are byte offsets into `line`; a match continuing past this line has no end column.
 fn match_preview(
     line: &str,
     start_column: usize,
     end_column: Option<usize>,
 ) -> (String, Range<usize>) {
     let indent = line.len() - line.trim_start().len();
-    let mut preview = line[indent..].to_string();
+    let start = start_column.clamp(indent, line.len());
+    let end = end_column
+        .map_or(line.len(), |end| end.min(line.len()))
+        .max(start);
+    let start = line.floor_char_boundary(start);
+    let end = line.ceil_char_boundary(end);
+
+    let context_start = line[indent..start]
+        .char_indices()
+        .rev()
+        .nth(MAX_CONTEXT_BEFORE_MATCH - 1)
+        .map_or(indent, |(offset, _)| indent + offset);
+    let prefix = if context_start > indent { "…" } else { "" };
+    let mut preview = format!("{prefix}{}", &line[context_start..]);
+    let shift = prefix.len() as isize - context_start as isize;
+    let remap = |offset: usize| (offset as isize + shift) as usize;
+    let mut highlight = remap(start)..remap(end);
+
     if preview.len() > MAX_LINE_PREVIEW_CHARS {
-        let cut = preview.floor_char_boundary(MAX_LINE_PREVIEW_CHARS);
+        let cut = preview
+            .floor_char_boundary(MAX_LINE_PREVIEW_CHARS.max(highlight.end.min(preview.len())));
         preview.truncate(cut);
     }
-    let start = start_column.saturating_sub(indent).min(preview.len());
-    let end = end_column
-        .map_or(preview.len(), |end| end.saturating_sub(indent))
-        .min(preview.len())
-        .max(start);
-    (preview, start..end)
+    highlight.end = highlight.end.min(preview.len());
+    highlight.start = highlight.start.min(highlight.end);
+    (preview, highlight)
 }
 
 #[cfg(test)]
@@ -824,11 +957,15 @@ mod tests {
         let (preview, highlight) = match_preview("let x = `multi", 8, None);
         assert_eq!(&preview[highlight], "`multi");
 
-        // Long lines are truncated and the highlight is clamped.
-        let long = format!("{}needle", "中".repeat(100));
-        let (preview, highlight) = match_preview(&long, 300, Some(306));
-        assert!(preview.len() <= MAX_LINE_PREVIEW_CHARS);
-        assert!(preview.is_char_boundary(preview.len()));
-        assert!(highlight.is_empty());
+        // Long leading context is cut with "…" so the match stays visible.
+        let long = format!("{}needle tail", "中".repeat(100));
+        let start = long.find("needle").unwrap();
+        let (preview, highlight) = match_preview(&long, start, Some(start + 6));
+        assert!(preview.starts_with('…'));
+        assert_eq!(&preview[highlight], "needle");
+        assert_eq!(
+            preview.chars().count(),
+            1 + MAX_CONTEXT_BEFORE_MATCH + "needle tail".len()
+        );
     }
 }
