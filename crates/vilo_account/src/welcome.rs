@@ -3,7 +3,8 @@ use gpui::{
     Window, prelude::*,
 };
 use ui::{
-    Avatar, Button, ButtonLike, ButtonStyle, ContextMenu, Divider, PopoverMenu, Tooltip, prelude::*,
+    Avatar, Button, ButtonLike, ButtonSize, ButtonStyle, ContextMenu, Divider, PopoverMenu,
+    TintColor, Tooltip, prelude::*,
 };
 use workspace::{ModalView, Workspace};
 
@@ -13,9 +14,17 @@ use crate::{AccountEvent, AccountStore, MEEGLE_HOSTS, SignInStatus};
 /// is always allowed: Vilo works the same without an account.
 pub struct WelcomeModal {
     store: Entity<AccountStore>,
-    host: usize,
+    /// Shown when a provider that is not available yet is chosen.
+    notice: Option<SharedString>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Copy)]
+enum Provider {
+    GitHub,
+    Google,
+    Meegle,
 }
 
 impl WelcomeModal {
@@ -30,7 +39,7 @@ impl WelcomeModal {
         ];
         Self {
             store,
-            host: 0,
+            notice: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -42,6 +51,53 @@ impl WelcomeModal {
             store.mark_welcome_seen(cx);
         });
         cx.emit(DismissEvent);
+    }
+
+    fn choose(&mut self, provider: Provider, cx: &mut Context<Self>) {
+        self.notice = match provider {
+            // shortcut: only the default Meegle site; other sites need a picker or setting.
+            Provider::Meegle => {
+                self.store.update(cx, |store, cx| {
+                    store.sign_in_with_meegle(MEEGLE_HOSTS[0], cx)
+                });
+                None
+            }
+            Provider::GitHub => Some("Signing in with GitHub is coming soon.".into()),
+            Provider::Google => Some("Signing in with Google is coming soon.".into()),
+        };
+        cx.notify();
+    }
+
+    fn provider_button(
+        &self,
+        provider: Provider,
+        in_progress: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (id, icon, label) = match provider {
+            Provider::GitHub => ("sign-in-github", IconName::Github, "Continue with GitHub"),
+            Provider::Google => ("sign-in-google", IconName::AiGoogle, "Continue with Google"),
+            Provider::Meegle => ("sign-in-meegle", IconName::Blocks, "Continue with Meegle"),
+        };
+        let style = match provider {
+            Provider::GitHub => ButtonStyle::Tinted(TintColor::Accent),
+            Provider::Google | Provider::Meegle => ButtonStyle::Outlined,
+        };
+        ButtonLike::new(id)
+            .full_width()
+            .size(ButtonSize::Large)
+            .style(style)
+            .disabled(in_progress)
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(40.))
+                    .justify_center()
+                    .gap_2()
+                    .child(Icon::new(icon).size(IconSize::Medium))
+                    .child(Label::new(label).size(LabelSize::Large)),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.choose(provider, cx)))
     }
 }
 
@@ -59,7 +115,7 @@ impl ModalView for WelcomeModal {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> workspace::DismissDecision {
-        // Escape or a click outside counts as "skip for now".
+        // Escape or a click outside counts as "continue without signing in".
         self.store.update(cx, |store, cx| {
             store.cancel_sign_in(cx);
             store.mark_welcome_seen(cx);
@@ -74,47 +130,26 @@ impl ModalView for WelcomeModal {
 
 impl Render for WelcomeModal {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
         let status = self.store.read(cx).status().clone();
         let in_progress = matches!(status, SignInStatus::InProgress { .. });
-        let host = MEEGLE_HOSTS[self.host.min(MEEGLE_HOSTS.len() - 1)];
 
-        let host_picker = h_flex()
-            .gap_1()
-            .children(MEEGLE_HOSTS.iter().enumerate().map(|(index, candidate)| {
-                Button::new(("meegle-host", index), *candidate)
-                    .label_size(LabelSize::Small)
-                    .toggle_state(index == self.host)
-                    .style(ButtonStyle::Subtle)
-                    .disabled(in_progress)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.host = index;
-                        cx.notify();
-                    }))
-            }));
+        let logo = div()
+            .size(px(48.))
+            .flex_none()
+            .rounded_lg()
+            .bg(colors.text_accent.opacity(0.35))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(Headline::new("V").size(HeadlineSize::Large));
 
-        let primary = if in_progress {
-            Button::new("cancel-sign-in", "Waiting for the browser… Cancel")
-                .full_width()
-                .style(ButtonStyle::Outlined)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.store.update(cx, |store, cx| store.cancel_sign_in(cx));
-                }))
-        } else {
-            Button::new("sign-in-meegle", "Continue with Meegle")
-                .full_width()
-                .style(ButtonStyle::Filled)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.store
-                        .update(cx, |store, cx| store.sign_in_with_meegle(host, cx));
-                }))
-        };
-
-        let coming_soon = |id: &'static str, label: &'static str| {
-            Button::new(id, label)
-                .full_width()
-                .style(ButtonStyle::Outlined)
-                .disabled(true)
-                .tooltip(Tooltip::text("Coming soon"))
+        let note: Option<(SharedString, Color)> = match &status {
+            SignInStatus::InProgress { .. } => {
+                Some(("Finish signing in in your browser…".into(), Color::Muted))
+            }
+            SignInStatus::Failed(message) => Some((message.clone(), Color::Error)),
+            SignInStatus::Idle => self.notice.clone().map(|notice| (notice, Color::Muted)),
         };
 
         v_flex()
@@ -122,41 +157,74 @@ impl Render for WelcomeModal {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.skip(cx)))
             .elevation_3(cx)
-            .w(px(420.))
+            .w(px(480.))
             .p_6()
-            .gap_4()
+            .gap_5()
             .child(
-                v_flex()
-                    .gap_1()
-                    .child(Headline::new("Welcome to Vilo").size(HeadlineSize::Large))
-                    .child(
-                        Label::new("Sign in to link Vilo to your account. You can also skip this and sign in later from the title bar.")
-                            .color(Color::Muted),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(Label::new("Meegle site").size(LabelSize::Small).color(Color::Muted))
-                    .child(host_picker)
-                    .child(primary)
-                    .child(coming_soon("sign-in-github", "Continue with GitHub"))
-                    .child(coming_soon("sign-in-google", "Continue with Google")),
-            )
-            .when_some(
-                match &status {
-                    SignInStatus::Failed(message) => Some(message.clone()),
-                    _ => None,
-                },
-                |this, message| this.child(Label::new(message).size(LabelSize::Small).color(Color::Error)),
+                h_flex().gap_4().child(logo).child(
+                    v_flex()
+                        .gap_0p5()
+                        .child(Headline::new("Welcome to Vilo").size(HeadlineSize::Large))
+                        .child(
+                            Label::new("Your workspace. Your tools. Your flow.")
+                                .color(Color::Muted),
+                        ),
+                ),
             )
             .child(Divider::horizontal())
             .child(
-                h_flex().justify_end().child(
-                    Button::new("skip-sign-in", "Skip for now")
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(|this, _, _, cx| this.skip(cx))),
-                ),
+                v_flex()
+                    .gap_3()
+                    .child(self.provider_button(Provider::GitHub, in_progress, cx))
+                    .child(self.provider_button(Provider::Google, in_progress, cx))
+                    .child(self.provider_button(Provider::Meegle, in_progress, cx)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Lock)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Sign in to connect your work tools, like Meegle.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .when_some(note, |this, (message, color)| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .child(Label::new(message).size(LabelSize::Small).color(color))
+                        .when(in_progress, |this| {
+                            this.child(
+                                Button::new("cancel-sign-in", "Cancel")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.store.update(cx, |store, cx| store.cancel_sign_in(cx));
+                                    })),
+                            )
+                        }),
+                )
+            })
+            .child(Divider::horizontal())
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(
+                        Label::new("Sign in anytime from the title bar.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Button::new("skip-sign-in", "Continue without signing in")
+                            .style(ButtonStyle::Subtle)
+                            .end_icon(Icon::new(IconName::ArrowRight).size(IconSize::Small))
+                            .on_click(cx.listener(|this, _, _, cx| this.skip(cx))),
+                    ),
             )
     }
 }
