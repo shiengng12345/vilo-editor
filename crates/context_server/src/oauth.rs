@@ -1925,8 +1925,12 @@ mod tests {
     fn test_dcr_registration_body_mirrors_server_grant_types() {
         // When the server only supports authorization_code, omit refresh_token.
         let server_types = vec!["authorization_code".to_string()];
-        let body =
-            dcr_registration_body("Vilo", "http://127.0.0.1:12345/callback", Some(&server_types), &[]);
+        let body = dcr_registration_body(
+            "Vilo",
+            "http://127.0.0.1:12345/callback",
+            Some(&server_types),
+            &[],
+        );
         assert_eq!(body["grant_types"][0], "authorization_code");
         assert!(body["grant_types"].as_array().unwrap().len() == 1);
 
@@ -1935,8 +1939,12 @@ mod tests {
             "authorization_code".to_string(),
             "refresh_token".to_string(),
         ];
-        let body =
-            dcr_registration_body("Vilo", "http://127.0.0.1:12345/callback", Some(&server_types), &[]);
+        let body = dcr_registration_body(
+            "Vilo",
+            "http://127.0.0.1:12345/callback",
+            Some(&server_types),
+            &[],
+        );
         assert_eq!(body["grant_types"][0], "authorization_code");
         assert_eq!(body["grant_types"][1], "refresh_token");
     }

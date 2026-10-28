@@ -18356,6 +18356,7 @@ dependencies = [
  "theme_settings",
  "ui",
  "util",
+ "vilo_account",
  "workspace",
  "zed_actions",
 ]
@@ -19557,6 +19558,31 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vilo_account"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "collections",
+ "context_server",
+ "futures 0.3.34",
+ "gpui",
+ "http_client",
+ "log",
+ "menu",
+ "paths",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "ui",
+ "url",
+ "util",
+ "uuid",
+ "workspace",
+ "zed_actions",
+]
 
 [[package]]
 name = "vim"
@@ -22531,6 +22557,7 @@ dependencies = [
  "urlencoding",
  "util",
  "uuid",
+ "vilo_account",
  "vim",
  "vim_mode_setting",
  "watch",

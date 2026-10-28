@@ -47,7 +47,7 @@ pub enum RequestId {
     Str(String),
 }
 
-pub(crate) struct Client {
+pub struct Client {
     server_id: ContextServerId,
     next_id: AtomicI32,
     outbound_tx: async_channel::Sender<String>,
@@ -75,7 +75,7 @@ pub(crate) struct Client {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub(crate) struct ContextServerId(pub Arc<str>);
+pub struct ContextServerId(pub Arc<str>);
 
 fn is_null_value<T: Serialize>(value: &T) -> bool {
     matches!(serde_json::to_value(value), Ok(Value::Null))

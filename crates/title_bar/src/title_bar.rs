@@ -382,6 +382,7 @@ impl Render for TitleBar {
                 .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
                     this.child(self.render_user_menu_button(cx))
                 })
+                .child(vilo_account::AccountButton::new(self.workspace.clone()))
                 .into_any_element(),
         );
 
