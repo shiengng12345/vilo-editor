@@ -1,4 +1,5 @@
-mod import_compare;
+mod compare;
+mod import;
 
 use std::{
     path::PathBuf,
@@ -112,7 +113,8 @@ async fn client_for(connection: &Connection, cx: &AsyncApp) -> Result<VaultClien
         _ => return Err("No token saved for this address.".to_string()),
     };
     let origin = normalize_origin(&connection.address).map_err(|error| error.to_string())?;
-    Ok(VaultClient::new(cx.update(|cx| cx.http_client()), origin, token))
+    Ok(VaultClient::new(cx.update(|cx| cx.http_client()), origin, token)
+        .with_backoff(cx.background_executor().clone()))
 }
 
 enum Fetch<T> {
@@ -169,8 +171,8 @@ pub struct VaultView {
     confirm_reveal_all: bool,
     form: Option<ConnectionForm>,
     collapsed_sites: HashSet<String>,
-    import: Option<import_compare::ImportState>,
-    compare: Option<import_compare::CompareState>,
+    import: Option<import::ImportState>,
+    compare: Option<compare::CompareState>,
     go_to: Entity<Editor>,
     /// Sequence of the newest connections snapshot written to disk.
     persisted: Arc<Mutex<u64>>,

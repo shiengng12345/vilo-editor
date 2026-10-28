@@ -10,6 +10,10 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::Deserialize;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// A KV secret is small; anything larger is not a secret worth rendering.
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+/// Retries after `429 Too Many Requests`, waiting longer each time.
+const RATE_LIMIT_RETRIES: u32 = 3;
 /// Path segments are user data; keep `/` as the separator and escape the rest.
 const SEGMENT: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -32,6 +36,9 @@ pub enum VaultError {
     /// The server answered with a redirect; the token is never sent on to it.
     Redirected,
     Status(u16),
+    /// Still `429` after backing off.
+    RateLimited,
+    TooLarge,
     Network(String),
     Unexpected,
 }
@@ -45,7 +52,10 @@ impl std::fmt::Display for VaultError {
                 "Vault redirected the request to another address. Vilo did not follow it; \
                  check the connection address.",
             ),
+            VaultError::Status(503) => f.write_str("Vault is sealed or unavailable (503)."),
             VaultError::Status(status) => write!(f, "Vault answered with status {status}."),
+            VaultError::RateLimited => f.write_str("Vault kept rejecting requests as too many (429)."),
+            VaultError::TooLarge => f.write_str("The response is too large to show."),
             VaultError::Network(message) => write!(f, "Could not reach Vault: {message}"),
             VaultError::Unexpected => f.write_str("Vault returned an unexpected response."),
         }
@@ -69,6 +79,7 @@ pub fn normalize_origin(address: &str) -> Result<Url> {
 #[derive(Clone)]
 pub struct VaultClient {
     http: Arc<dyn HttpClient>,
+    executor: Option<gpui::BackgroundExecutor>,
     origin: Url,
     token: String,
 }
@@ -133,9 +144,16 @@ impl VaultClient {
     pub fn new(http: Arc<dyn HttpClient>, origin: Url, token: String) -> Self {
         Self {
             http,
+            executor: None,
             origin,
             token,
         }
+    }
+
+    /// Lets the client wait and retry when Vault answers `429`.
+    pub fn with_backoff(mut self, executor: gpui::BackgroundExecutor) -> Self {
+        self.executor = Some(executor);
+        self
     }
 
     pub async fn lookup_self(&self) -> Result<TokenInfo, VaultError> {
@@ -216,6 +234,28 @@ impl VaultClient {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<(serde_json::Value, bool), VaultError> {
+        let mut attempt = 0;
+        loop {
+            match self.get_once(path, query).await {
+                Err(VaultError::RateLimited) if attempt < RATE_LIMIT_RETRIES => {
+                    let Some(executor) = &self.executor else {
+                        return Err(VaultError::RateLimited);
+                    };
+                    executor
+                        .timer(Duration::from_millis(500 * 2u64.pow(attempt)))
+                        .await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn get_once(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<(serde_json::Value, bool), VaultError> {
         let mut url = self.origin.join(path).map_err(|_| VaultError::Unexpected)?;
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
@@ -246,12 +286,19 @@ impl VaultClient {
         if status.as_u16() == 403 {
             return Err(VaultError::Forbidden);
         }
+        if status.as_u16() == 429 {
+            return Err(VaultError::RateLimited);
+        }
         let mut body = String::new();
         response
             .body_mut()
+            .take(MAX_RESPONSE_BYTES + 1)
             .read_to_string(&mut body)
             .await
             .map_err(|_| VaultError::Unexpected)?;
+        if body.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(VaultError::TooLarge);
+        }
         if status.as_u16() == 404 {
             let body = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
             return Ok((body, false));
