@@ -16,7 +16,8 @@ use gpui::{
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 use ui::{
-    Button, ButtonStyle, Checkbox, ContextMenu, Divider, IconButton, PopoverMenu, ToggleState,
+    Button, ButtonStyle, Checkbox, ContextMenu, Divider, IconButton, Indicator, PopoverMenu,
+    ToggleState,
     Tooltip, prelude::*,
 };
 use util::ResultExt as _;
@@ -167,6 +168,7 @@ pub struct VaultView {
     revealed: HashSet<String>,
     confirm_reveal_all: bool,
     form: Option<ConnectionForm>,
+    collapsed_sites: HashSet<String>,
     import: Option<import_compare::ImportState>,
     compare: Option<import_compare::CompareState>,
     go_to: Entity<Editor>,
@@ -222,6 +224,7 @@ impl VaultView {
             revealed: HashSet::default(),
             confirm_reveal_all: false,
             form: None,
+            collapsed_sites: HashSet::default(),
             import: None,
             compare: None,
             go_to,
@@ -732,7 +735,6 @@ impl VaultView {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let active_id = self.session.as_ref().map(|session| session.connection_id.clone());
-        let mut list = v_flex().gap_0p5();
         let mut ordered = self.connections.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|c| {
             (
@@ -741,46 +743,141 @@ impl VaultView {
                 c.name.to_lowercase(),
             )
         });
-        let mut current_site = None;
+        let mut sites: Vec<(String, Vec<&Connection>)> = Vec::new();
         for connection in ordered {
-            if current_site != Some(connection.site.as_str()) {
-                current_site = Some(connection.site.as_str());
-                list = list.child(
-                    div().px_2().pt_1().child(
-                        Label::new(if connection.site.is_empty() {
-                            "No site".to_string()
-                        } else {
-                            connection.site.clone()
-                        })
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                    ),
-                );
+            match sites.last_mut() {
+                Some((site, members)) if *site == connection.site => members.push(connection),
+                _ => sites.push((connection.site.clone(), vec![connection])),
             }
-            let id = connection.id.clone();
-            let is_active = active_id.as_ref() == Some(&connection.id);
+        }
+        let mut list = v_flex().gap_1();
+        for (site, members) in sites {
+            let collapsed = self.collapsed_sites.contains(&site);
+            let has_active = members
+                .iter()
+                .any(|c| active_id.as_ref() == Some(&c.id));
+            let site_name = if site.is_empty() {
+                "No site".to_string()
+            } else {
+                site.clone()
+            };
+            let toggle_site = site.clone();
+            let menu_site = site.clone();
+            let view = cx.entity().downgrade();
             list = list.child(
                 h_flex()
-                    .id(SharedString::from(format!("vault-connection-{}", connection.id)))
+                    .id(SharedString::from(format!("vault-site-{site}")))
+                    .group("vault-site")
                     .px_2()
                     .py_1()
                     .gap_2()
                     .rounded_sm()
                     .cursor_pointer()
-                    .when(is_active, |this| this.bg(colors.element_selected))
                     .hover(|style| style.bg(colors.element_hover))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.connect(id.clone(), window, cx)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.collapsed_sites.remove(&toggle_site) {
+                            this.collapsed_sites.insert(toggle_site.clone());
+                        }
+                        cx.notify();
                     }))
-                    .child(Label::new(connection.name.clone()).truncate())
-                    .when(!connection.environment.is_empty(), |this| {
-                        this.child(
-                            Label::new(connection.environment.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                    }),
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::Folder
+                        } else {
+                            IconName::FolderOpen
+                        })
+                        .size(IconSize::Small)
+                        .color(if has_active { Color::Accent } else { Color::Muted }),
+                    )
+                    .child(
+                        Label::new(site_name)
+                            .weight(if has_active {
+                                gpui::FontWeight::BOLD
+                            } else {
+                                gpui::FontWeight::NORMAL
+                            })
+                            .truncate(),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        PopoverMenu::new(SharedString::from(format!("vault-site-menu-{site}")))
+                            .trigger(
+                                IconButton::new(
+                                    SharedString::from(format!("vault-site-menu-button-{site}")),
+                                    IconName::Ellipsis,
+                                )
+                                .icon_size(IconSize::Small),
+                            )
+                            .menu(move |window, cx| {
+                                let view = view.clone();
+                                let site = menu_site.clone();
+                                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                    let view = view.clone();
+                                    menu.entry("Add environment", None, move |window, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.open_form(None, window, cx);
+                                            if let Some(form) = &this.form {
+                                                form.site.update(cx, |editor, cx| {
+                                                    editor.set_text(site.clone(), window, cx)
+                                                });
+                                            }
+                                        })
+                                        .ok();
+                                    })
+                                }))
+                            }),
+                    ),
             );
+            if collapsed {
+                continue;
+            }
+            let mut environments = v_flex()
+                .ml(px(15.))
+                .pl_2()
+                .gap_0p5()
+                .border_l_1()
+                .border_color(colors.border_variant);
+            for connection in &members {
+                let id = connection.id.clone();
+                let is_active = active_id.as_ref() == Some(&connection.id);
+                let shares_environment = members
+                    .iter()
+                    .filter(|other| other.environment == connection.environment)
+                    .count()
+                    > 1;
+                let label = match (connection.environment.is_empty(), shares_environment) {
+                    (true, _) => connection.name.clone(),
+                    (false, true) => format!("{} - {}", connection.environment, connection.name),
+                    (false, false) => connection.environment.clone(),
+                };
+                let tooltip = format!("{}\n{}", connection.name, connection.address);
+                environments = environments.child(
+                    h_flex()
+                        .id(SharedString::from(format!("vault-connection-{}", connection.id)))
+                        .px_2()
+                        .py_1()
+                        .gap_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(is_active, |this| this.bg(colors.element_selected))
+                        .hover(|style| style.bg(colors.element_hover))
+                        .tooltip(Tooltip::text(tooltip))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.connect(id.clone(), window, cx)
+                        }))
+                        .child(Indicator::dot().color(environment_color(&connection.environment)))
+                        .child(
+                            Label::new(label)
+                                .weight(if is_active {
+                                    gpui::FontWeight::BOLD
+                                } else {
+                                    gpui::FontWeight::NORMAL
+                                })
+                                .truncate(),
+                        ),
+                );
+            }
+            list = list.child(environments);
         }
 
         let mut tree = v_flex().gap_0p5();
@@ -814,7 +911,7 @@ impl VaultView {
             .child(
                 h_flex()
                     .justify_between()
-                    .child(Label::new("Connections").size(LabelSize::Small).color(Color::Muted))
+                    .child(Label::new("SITES").size(LabelSize::Small).color(Color::Muted))
                     .child(
                         h_flex()
                             .child(
@@ -1408,6 +1505,20 @@ impl Render for VaultView {
                     })
                     .child(main),
             )
+    }
+}
+
+/// QA-like environments orange, UAT blue, production red, as in the site list sample.
+fn environment_color(environment: &str) -> Color {
+    let environment = environment.to_lowercase();
+    if environment.contains("prod") || environment == "live" {
+        Color::Error
+    } else if environment.contains("uat") {
+        Color::Accent
+    } else if environment.is_empty() {
+        Color::Muted
+    } else {
+        Color::Warning
     }
 }
 
