@@ -9654,19 +9654,30 @@ impl Workspace {
         self.active_module
     }
 
+    /// Builds a module's view without showing it, so it can load in the background.
+    pub fn prepare_module(
+        &mut self,
+        id: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let index = self.modules.iter().position(|module| module.id == id)?;
+        if self.modules[index].view.is_none() {
+            let view = (self.modules[index].build)(window, cx);
+            self.modules[index].view = Some(view);
+        }
+        Some(index)
+    }
+
     pub fn activate_module(
         &mut self,
         id: &'static str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.modules.iter().position(|module| module.id == id) else {
+        let Some(index) = self.prepare_module(id, window, cx) else {
             return;
         };
-        if self.modules[index].view.is_none() {
-            let view = (self.modules[index].build)(window, cx);
-            self.modules[index].view = Some(view);
-        }
         if self.active_module.is_none() {
             self.focus_before_module = window.focused(cx);
         }

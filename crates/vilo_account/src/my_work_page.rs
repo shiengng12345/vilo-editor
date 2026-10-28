@@ -36,7 +36,15 @@ const DRAWER_OVERLAY_BELOW: Pixels = px(1100.);
 const TABLE_MIN_WIDTH: Pixels = px(1040.);
 
 pub fn init(store: Entity<AccountStore>, cx: &mut App) {
-    cx.observe_new(move |workspace: &mut Workspace, _, cx| {
+    cx.observe_new(move |workspace: &mut Workspace, window, cx| {
+        // Signed in: start loading now so the page is ready when it is opened.
+        if let Some(window) = window
+            && store.read(cx).account().is_some()
+        {
+            cx.defer_in(window, |workspace, window, cx| {
+                workspace.prepare_module(MODULE_ID, window, cx);
+            });
+        }
         let store = store.clone();
         workspace.register_module(
             MODULE_ID,
