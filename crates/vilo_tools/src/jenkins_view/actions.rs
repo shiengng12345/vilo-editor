@@ -930,7 +930,24 @@ impl JenkinsView {
             .flex_1()
             .overflow_y_scroll()
             .gap_3()
-            .child(Headline::new(title).size(HeadlineSize::Small))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Headline::new(title).size(HeadlineSize::Small))
+                    .child(div().flex_1())
+                    .when(!busy, |this| {
+                        this.child(
+                            Button::new("jenkins-history", "History")
+                                .label_size(LabelSize::Small)
+                                .start_icon(Icon::new(IconName::HistoryRerun).size(IconSize::Small))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    // Leaving the form never cancels anything already sent.
+                                    this.action = None;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
             .when(action.form.is_some(), |this| {
                 this.child(
                     Label::new(

@@ -783,7 +783,11 @@ impl JenkinsView {
                                 .cursor_pointer()
                                 .when(selected, |this| this.bg(colors.element_selected))
                                 .hover(|style| style.bg(colors.element_hover))
-                                .on_click(cx.listener(move |this, _, _, cx| this.open_job(open.clone(), cx)))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    // The build form comes first; history loads behind it for the History button.
+                                    this.open_job(open.clone(), cx);
+                                    this.start_build_form(open.clone(), None, window, cx);
+                                }))
                                 .child(Indicator::dot().color(ball_color(job.color.as_deref())))
                                 .child(Label::new(job.name.clone()).size(LabelSize::Small).truncate())
                                 .into_any_element(),
