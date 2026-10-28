@@ -17,7 +17,7 @@ use gpui::{
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 use ui::{
-    Button, ButtonStyle, Checkbox, ContextMenu, Divider, IconButton, Indicator, PopoverMenu,
+    Button, ButtonStyle, Checkbox, ContextMenu, IconButton, Indicator, PopoverMenu,
     ToggleState,
     Tooltip, prelude::*,
 };
@@ -726,12 +726,6 @@ impl Focusable for VaultView {
     }
 }
 
-fn banner(icon: IconName, color: Color, message: impl Into<SharedString>) -> impl IntoElement {
-    h_flex()
-        .gap_2()
-        .child(Icon::new(icon).size(IconSize::Small).color(color))
-        .child(Label::new(message).size(LabelSize::Small).color(color))
-}
 
 impl VaultView {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -758,8 +752,9 @@ impl VaultView {
             let has_active = members
                 .iter()
                 .any(|c| active_id.as_ref() == Some(&c.id));
+            // Connections saved without a site.
             let site_name = if site.is_empty() {
-                "No site".to_string()
+                "Ungrouped".to_string()
             } else {
                 site.clone()
             };
@@ -901,65 +896,77 @@ impl VaultView {
             }
         }
 
+        let explorer_title = self
+            .active_connection()
+            .map_or("EXPLORER".to_string(), |connection| {
+                format!("EXPLORER · {}", connection.label().to_uppercase())
+            });
         v_flex()
-            .w(px(300.))
+            .w(px(280.))
             .flex_none()
             .h_full()
             .border_r_1()
             .border_color(colors.border)
             .bg(colors.panel_background)
-            .p_2()
-            .gap_2()
-            .child(
+            .child(section_header(
+                "CONNECTIONS",
                 h_flex()
-                    .justify_between()
-                    .child(Label::new("SITES").size(LabelSize::Small).color(Color::Muted))
                     .child(
-                        h_flex()
-                            .child(
-                                IconButton::new("vault-compare", IconName::Diff)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Compare secrets"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_compare(None, window, cx)
-                                    })),
-                            )
-                            .child(
-                                IconButton::new("vault-import", IconName::Download)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Import connections"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_import(window, cx)
-                                    })),
-                            )
-                            .child(
-                                IconButton::new("vault-export", IconName::ArrowUpRight)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Export connections (without tokens)"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.export_connections(cx)
-                                    })),
-                            )
-                            .child(
-                                IconButton::new("vault-add-connection", IconName::Plus)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Add a Vault connection"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_form(None, window, cx)
-                                    })),
-                            ),
+                        IconButton::new("vault-import", IconName::Download)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Import connections"))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_import(window, cx))),
+                    )
+                    .child(
+                        IconButton::new("vault-export", IconName::ArrowUpRight)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Export connections (without tokens)"))
+                            .on_click(cx.listener(|this, _, _, cx| this.export_connections(cx))),
+                    )
+                    .child(
+                        IconButton::new("vault-add-connection", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Add a Vault connection"))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_form(None, window, cx))),
                     ),
+            ))
+            .child(
+                v_flex()
+                    .id("vault-connections")
+                    .max_h(relative(0.45))
+                    .overflow_y_scroll()
+                    .px_1()
+                    .pb_2()
+                    .child(list),
             )
-            .child(list)
-            .when(self.session.is_some(), |this| {
-                this.child(Divider::horizontal()).child(
-                    v_flex()
-                        .id("vault-tree")
-                        .flex_1()
-                        .overflow_y_scroll()
-                        .child(tree),
-                )
-            })
+            .child(
+                div()
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .child(section_header(explorer_title, h_flex())),
+            )
+            .child(
+                v_flex()
+                    .id("vault-tree")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_1()
+                    .pb_2()
+                    .child(if self.session.is_some() {
+                        tree.into_any_element()
+                    } else {
+                        div()
+                            .px_3()
+                            .py_2()
+                            .child(
+                                Label::new("Select a connection to browse its secrets.")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element()
+                    }),
+            )
     }
 
     fn render_folder(
@@ -1007,9 +1014,27 @@ impl VaultView {
                     .size(IconSize::XSmall)
                     .color(Color::Muted),
                 )
-                .child(Label::new(label).size(LabelSize::Small))
-                .when(depth == 0 && mount.version == KvVersion::V1, |this| {
-                    this.child(Label::new("v1").size(LabelSize::XSmall).color(Color::Muted))
+                .child(
+                    Icon::new(if depth == 0 {
+                        IconName::Server
+                    } else if expanded {
+                        IconName::FolderOpen
+                    } else {
+                        IconName::Folder
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .child(Label::new(label).size(LabelSize::Small).truncate())
+                .when(depth == 0, |this| {
+                    this.child(
+                        Label::new(match mount.version {
+                            KvVersion::V1 => "kv v1",
+                            KvVersion::V2 => "kv v2",
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    )
                 })
         });
         if !expanded {
@@ -1194,9 +1219,7 @@ impl VaultView {
     fn render_secret(&self, secret: &OpenSecret, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
         let title = format!("{}/{}", secret.mount.path, secret.path);
-        let mut header = h_flex()
-            .gap_3()
-            .child(Headline::new(title.clone()).size(HeadlineSize::Small));
+        let mut header = h_flex().gap_2();
         if let Some(connection_id) = self.session.as_ref().map(|session| session.connection_id.clone()) {
             header = header.child(
                 Button::new("vault-compare-secret", "Compare…")
@@ -1398,57 +1421,177 @@ impl Render for VaultView {
         let connection = self.active_connection().cloned();
         let info = self.session.as_ref().and_then(|session| session.info.clone());
 
-        let mut status = h_flex().gap_4().flex_wrap();
-        if let Some(connection) = &connection {
-            let id = connection.id.clone();
-            status = status
-                .child(Label::new(connection.name.clone()))
-                .child(Label::new(connection.address.clone()).size(LabelSize::Small).color(Color::Muted))
+        let editing_elsewhere = self.form.is_some() || self.import.is_some() || self.compare.is_some();
+
+        let header = h_flex()
+            .px_4()
+            .py_2p5()
+            .gap_4()
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .child(match &connection {
+                Some(connection) => v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(Indicator::dot().color(environment_color(&connection.environment)))
+                            .child(
+                                Label::new(connection.name.clone())
+                                    .size(LabelSize::Large)
+                                    .weight(gpui::FontWeight::SEMIBOLD)
+                                    .truncate(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("vault-endpoint")
+                            .tooltip(Tooltip::text(connection.address.clone()))
+                            .child(
+                                Label::new(connection.address.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .buffer_font(cx)
+                                    .truncate(),
+                            ),
+                    )
+                    .child(
+                        Label::new(match &info {
+                            Some(info) => format!(
+                                "Token {} · {}",
+                                info.display_name,
+                                if info.ttl == 0 {
+                                    "never expires".to_string()
+                                } else {
+                                    format!("expires in {}", format_ttl(info.ttl))
+                                }
+                            ),
+                            None if self.session.is_some() => {
+                                "Token details are not visible to this token".to_string()
+                            }
+                            None => String::new(),
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .into_any_element(),
+                None => v_flex()
+                    .flex_1()
+                    .child(Label::new("Vault").size(LabelSize::Large).weight(gpui::FontWeight::SEMIBOLD))
+                    .child(
+                        Label::new("No connection selected")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            })
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .child(
+                        Button::new("vault-compare", "Compare")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::Diff).size(IconSize::Small))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_compare(None, window, cx))),
+                    )
+                    .when_some(connection.as_ref().map(|c| c.id.clone()), |this, id| {
+                        this.child(
+                            Button::new("vault-edit-connection", "Edit connection")
+                                .label_size(LabelSize::Small)
+                                .start_icon(Icon::new(IconName::Pencil).size(IconSize::Small))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_form(Some(id.clone()), window, cx)
+                                })),
+                        )
+                    }),
+            );
+
+        let mut notices = Vec::new();
+        if connection.as_ref().is_some_and(Connection::is_plaintext) {
+            notices.push(security_notice(
+                "notice-plaintext",
+                Severity::Warning,
+                "Unencrypted connection",
+                "The token and every secret value cross the network in plain text over http.",
+                cx,
+            ));
+        }
+        if info.as_ref().is_some_and(TokenInfo::is_root) {
+            notices.push(security_notice(
+                "notice-root",
+                Severity::Error,
+                "Root token",
+                "This session has full control of this Vault. Prefer a token scoped to the paths you read.",
+                cx,
+            ));
+        }
+
+        let path_bar = (self.session.is_some() && !editing_elsewhere).then(|| {
+            let mut crumbs = h_flex().flex_1().min_w_0().gap_1();
+            match &self.secret {
+                Some(secret) => {
+                    let segments = std::iter::once(secret.mount.path.clone())
+                        .chain(secret.path.split('/').map(str::to_string))
+                        .collect::<Vec<_>>();
+                    let last = segments.len().saturating_sub(1);
+                    for (index, segment) in segments.into_iter().enumerate() {
+                        if index > 0 {
+                            crumbs = crumbs.child(
+                                Icon::new(IconName::ChevronRight)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            );
+                        }
+                        crumbs = crumbs.child(
+                            Label::new(segment)
+                                .size(LabelSize::Small)
+                                .buffer_font(cx)
+                                .color(if index == last { Color::Default } else { Color::Muted }),
+                        );
+                    }
+                }
+                None => {
+                    crumbs = crumbs.child(
+                        Label::new("No secret open")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                }
+            }
+            h_flex()
+                .px_4()
+                .py_1()
+                .gap_3()
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .bg(colors.toolbar_background)
+                .child(crumbs)
                 .child(
-                    Button::new("vault-edit-connection", "Edit")
-                        .label_size(LabelSize::Small)
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_form(Some(id.clone()), window, cx)
-                        })),
-                );
-            if connection.is_plaintext() {
-                status = status.child(banner(
-                    IconName::Warning,
-                    Color::Warning,
-                    "Unencrypted connection: the token and values travel in plain text.",
-                ));
-            }
-        }
-        match &info {
-            Some(info) if info.is_root() => {
-                status = status.child(banner(
-                    IconName::Warning,
-                    Color::Error,
-                    "Root token: full control of this Vault.",
-                ))
-            }
-            Some(info) => {
-                let expiry = if info.ttl == 0 {
-                    "never expires".to_string()
-                } else {
-                    format!("expires in {}", format_ttl(info.ttl))
-                };
-                status = status.child(
-                    Label::new(format!("{} · {expiry}", info.display_name))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    h_flex()
+                        .w(px(320.))
+                        .flex_none()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(colors.editor_background)
+                                .child(self.go_to.clone()),
+                        )
+                        .child(
+                            Button::new("vault-go", "Open")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| this.go_to_path(cx))),
+                        ),
                 )
-            }
-            None if self.session.is_some() => {
-                status = status.child(
-                    Label::new("Token details are not visible to this token.")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-            }
-            None => {}
-        }
+        });
 
         let main = if let Some(form) = &self.form {
             self.render_form(form, cx).into_any_element()
@@ -1457,17 +1600,27 @@ impl Render for VaultView {
         } else if let Some(compare) = &self.compare {
             self.render_compare(compare, cx)
         } else if let Some(message) = &self.session_error {
-            Label::new(message.clone()).color(Color::Muted).into_any_element()
+            empty_state(IconName::Server, message.clone(), None)
         } else if let Some(secret) = &self.secret {
             self.render_secret(secret, cx)
         } else if self.session.is_some() {
-            Label::new("Pick a secret on the left, or type its path above.")
-                .color(Color::Muted)
-                .into_any_element()
+            empty_state(
+                IconName::Lock,
+                "No secret open".into(),
+                Some("Pick a secret in the explorer, or type its path in the bar above.".into()),
+            )
+        } else if self.connections.is_empty() {
+            empty_state(
+                IconName::Server,
+                "No connections yet".into(),
+                Some("Add a Vault connection, or import several from a JSON file.".into()),
+            )
         } else {
-            Label::new("Pick a connection on the left.")
-                .color(Color::Muted)
-                .into_any_element()
+            empty_state(
+                IconName::Server,
+                "No connection selected".into(),
+                Some("Choose a connection on the left to browse its secrets.".into()),
+            )
         };
 
         h_flex()
@@ -1481,33 +1634,108 @@ impl Render for VaultView {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .p_6()
-                    .gap_4()
                     .bg(colors.editor_background)
-                    .child(status)
-                    .when(self.session.is_some() && self.form.is_none() && self.import.is_none() && self.compare.is_none(), |this| {
+                    .child(header)
+                    .when(!notices.is_empty(), |this| {
                         this.child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(colors.border)
-                                        .child(self.go_to.clone()),
-                                )
-                                .child(
-                                    Button::new("vault-go", "Open")
-                                        .on_click(cx.listener(|this, _, _, cx| this.go_to_path(cx))),
-                                ),
+                            v_flex()
+                                .px_4()
+                                .py_2()
+                                .gap_1()
+                                .border_b_1()
+                                .border_color(colors.border_variant)
+                                .children(notices),
                         )
                     })
-                    .child(main),
+                    .children(path_bar)
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .p_4()
+                            .gap_3()
+                            .child(main),
+                    ),
             )
     }
+}
+
+#[derive(Clone, Copy)]
+enum Severity {
+    Warning,
+    Error,
+}
+
+/// A security notice: always visible while it applies, never dismissible.
+fn security_notice(
+    id: &'static str,
+    severity: Severity,
+    title: &'static str,
+    consequence: &'static str,
+    cx: &App,
+) -> AnyElement {
+    let status = cx.theme().status();
+    let (color, background, border) = match severity {
+        Severity::Warning => (Color::Warning, status.warning_background, status.warning),
+        Severity::Error => (Color::Error, status.error_background, status.error),
+    };
+    h_flex()
+        .id(id)
+        .items_start()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .border_l_2()
+        .border_color(border)
+        .bg(background)
+        .child(
+            div()
+                .pt(px(2.))
+                .child(Icon::new(IconName::Warning).size(IconSize::Small).color(color)),
+        )
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .flex_wrap()
+                .gap_x_1p5()
+                .child(Label::new(title).size(LabelSize::Small).weight(gpui::FontWeight::SEMIBOLD).color(color))
+                .child(Label::new(consequence).size(LabelSize::Small)),
+        )
+        .into_any_element()
+}
+
+fn empty_state(icon: IconName, title: SharedString, hint: Option<SharedString>) -> AnyElement {
+    v_flex()
+        .flex_1()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .child(Icon::new(icon).size(IconSize::XLarge).color(Color::Muted))
+        .child(Label::new(title).color(Color::Muted))
+        .when_some(hint, |this, hint| {
+            this.child(Label::new(hint).size(LabelSize::Small).color(Color::Muted))
+        })
+        .into_any_element()
+}
+
+/// A VS Code style section header for the explorer side bar.
+fn section_header(title: impl Into<SharedString>, actions: impl IntoElement) -> impl IntoElement {
+    h_flex()
+        .h(px(26.))
+        .pl_3()
+        .pr_1()
+        .justify_between()
+        .child(
+            Label::new(title)
+                .size(LabelSize::XSmall)
+                .weight(gpui::FontWeight::SEMIBOLD)
+                .color(Color::Muted)
+                .truncate(),
+        )
+        .child(actions)
 }
 
 /// QA-like environments orange, UAT blue, production red, as in the site list sample.
