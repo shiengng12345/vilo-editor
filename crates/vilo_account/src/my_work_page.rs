@@ -30,6 +30,8 @@ actions!(
 
 pub const MODULE_ID: &str = "my-work";
 const ENRICH_CONCURRENCY: usize = 4;
+/// HR records (leave, overtime) also land in the to-do list but are not development work.
+const HIDDEN_TYPE_NAMES: &[&str] = &["leave", "overtime"];
 const DRAWER_WIDTH: Pixels = px(420.);
 /// Below this page width the detail drawer covers the table instead of sitting beside it.
 const DRAWER_OVERLAY_BELOW: Pixels = px(1100.);
@@ -211,6 +213,7 @@ pub struct MyWorkPage {
     drawer: Option<Drawer>,
     /// Lists whose first page failed while others loaded.
     list_errors: HashMap<WorkList, SharedString>,
+    hidden_type_keys: HashSet<String>,
     /// Width of the page the last time it was laid out; decides drawer placement.
     page_width: Pixels,
     _subscriptions: Vec<Subscription>,
@@ -268,6 +271,7 @@ impl MyWorkPage {
             selected: None,
             drawer: None,
             list_errors: HashMap::default(),
+            hidden_type_keys: HashSet::default(),
             page_width: px(0.),
             _subscriptions: subscriptions,
         };
@@ -301,6 +305,7 @@ impl MyWorkPage {
         self.selected = None;
         self.error = None;
         self.list_errors.clear();
+        self.hidden_type_keys.clear();
         self.loading = false;
         self.page = 0;
         cx.notify();
@@ -455,6 +460,37 @@ impl MyWorkPage {
         cx.notify();
     }
 
+    /// Item types are keyed per space, so a hidden type is recognised by name once
+    /// one of its items' details arrive, and then hides every item of that key.
+    fn learn_hidden_type(&mut self, id: u64, brief: &Brief, cx: &mut Context<Self>) {
+        if !HIDDEN_TYPE_NAMES.contains(&brief.type_name.to_lowercase().as_str()) {
+            return;
+        }
+        let type_key = self
+            .lists
+            .values()
+            .flat_map(|state| state.items.iter())
+            .find(|item| item.id == id)
+            .map(|item| item.type_key.clone());
+        if let Some(type_key) = type_key
+            && self.hidden_type_keys.insert(type_key)
+        {
+            self.enrich_visible(cx);
+        }
+    }
+
+    // shortcut: rows of hidden types on pages not loaded yet still count, until a
+    // server-side type filter is available.
+    fn hidden_count(&self, list: WorkList) -> usize {
+        self.lists.get(&list).map_or(0, |state| {
+            state
+                .items
+                .iter()
+                .filter(|item| self.hidden_type_keys.contains(&item.type_key))
+                .count()
+        })
+    }
+
     fn filtered(&self, cx: &App) -> Vec<WorkItem> {
         let query = self.filter_editor.read(cx).text(cx).trim().to_lowercase();
         let Some(state) = self.lists.get(&self.list) else {
@@ -464,7 +500,9 @@ impl MyWorkPage {
             .items
             .iter()
             .filter(|item| {
-                self.type_filter
+                !self.hidden_type_keys.contains(&item.type_key)
+                    && self
+                        .type_filter
                     .as_ref()
                     .is_none_or(|type_key| *type_key == item.type_key)
                     && self
@@ -581,6 +619,7 @@ impl MyWorkPage {
                     this.briefs_pending.remove(&id);
                     match result {
                         Ok(brief) => {
+                            this.learn_hidden_type(id, &brief, cx);
                             this.briefs.insert(id, brief);
                         }
                         Err(error) => {
@@ -632,6 +671,7 @@ impl MyWorkPage {
                     this.briefs_pending.remove(&item.id);
                     match result {
                         Ok(brief) => {
+                            this.learn_hidden_type(item.id, &brief, cx);
                             this.briefs.insert(item.id, brief);
                         }
                         Err(_) => {
@@ -879,10 +919,15 @@ fn parse_work_items(response: &serde_json::Value) -> Result<(Vec<WorkItem>, usiz
         .get("list")
         .and_then(|list| list.as_array())
         .context("Meegle returned an unexpected work item list")?;
+    let mut seen = HashSet::default();
     let items = list
         .iter()
         .filter_map(|entry| {
             let id = entry.pointer("/work_item_info/work_item_id")?.as_u64()?;
+            // An item waiting on several of your nodes is listed once per node.
+            if !seen.insert(id) {
+                return None;
+            }
             let state = text(entry, "/node_info/node_name")
                 .or_else(|| text(entry, "/state_info/start_state_key_name"))
                 .unwrap_or_default();
@@ -1265,7 +1310,10 @@ impl MyWorkPage {
                 let count = self
                     .counts
                     .get(&list)
-                    .map_or_else(|| "–".to_string(), |count| count.to_string());
+                    .map_or_else(
+                        || "–".to_string(),
+                        |count| count.saturating_sub(self.hidden_count(list)).to_string(),
+                    );
                 let colors = cx.theme().colors();
                 v_flex()
                     .id(list.action())
@@ -1564,8 +1612,9 @@ impl MyWorkPage {
 
     fn render_pager(&self, filtered: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.lists.get(&self.list);
-        let loaded = state.map_or(0, |state| state.items.len());
-        let total = state.map_or(0, |state| state.total);
+        let hidden = self.hidden_count(self.list);
+        let loaded = state.map_or(0, |state| state.items.len()).saturating_sub(hidden);
+        let total = state.map_or(0, |state| state.total).saturating_sub(hidden);
         let pages = filtered.div_ceil(self.page_size).max(1);
         let first = (self.page * self.page_size + 1).min(filtered);
         let last = ((self.page + 1) * self.page_size).min(filtered);
