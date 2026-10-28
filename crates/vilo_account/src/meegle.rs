@@ -7,7 +7,7 @@ use context_server::{
     client::{Client, ContextServerId},
     oauth::{self, AuthServerMetadata, OAuthTokens, WwwAuthenticate},
     protocol::ModelContextProtocol,
-    transport::HttpTransport,
+    transport::{HttpTransport, Transport as _},
     types::{CallToolParams, Implementation, ToolResponseContent, requests::CallTool},
 };
 use gpui::AsyncApp;
@@ -174,6 +174,18 @@ async fn fetch_identity(resource: &Url, access_token: &str, cx: &mut AsyncApp) -
 /// itself can do more, so this list is the boundary (VILO_IDENTITY_LOGIN_PLAN §4.1).
 const ALLOWED_TOOLS: &[&str] = &[IDENTITY_TOOL, "list_todo", "search_project_info"];
 
+/// Meegle rejected the access token (HTTP 401).
+#[derive(Debug)]
+pub struct TokenRejected;
+
+impl std::fmt::Display for TokenRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Meegle rejected the session")
+    }
+}
+
+impl std::error::Error for TokenRejected {}
+
 /// Calls one Meegle MCP tool and returns the JSON document in its text output.
 pub(crate) async fn call_tool(
     resource: &Url,
@@ -199,25 +211,33 @@ pub(crate) async fn call_tool(
     let client = Client::new(
         ContextServerId("vilo-account".into()),
         "Vilo account".into(),
-        transport,
+        transport.clone(),
         Some(REQUEST_TIMEOUT),
         cx.clone(),
     )?;
-    let protocol = ModelContextProtocol::new(client)
-        .initialize(Implementation {
-            name: "Vilo".to_string(),
-            title: None,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            description: None,
-        })
-        .await?;
-    let response = protocol
-        .request::<CallTool>(CallToolParams {
-            name: name.to_string(),
-            arguments: Some(arguments),
-            meta: None,
-        })
-        .await?;
+    let result = async {
+        let protocol = ModelContextProtocol::new(client)
+            .initialize(Implementation {
+                name: "Vilo".to_string(),
+                title: None,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                description: None,
+            })
+            .await?;
+        protocol
+            .request::<CallTool>(CallToolParams {
+                name: name.to_string(),
+                arguments: Some(arguments),
+                meta: None,
+            })
+            .await
+    }
+    .await;
+    // The transport records a 401 separately; only that means the token is bad.
+    if transport.auth_challenge().is_some() {
+        return Err(TokenRejected.into());
+    }
+    let response = result?;
     if response.is_error == Some(true) {
         bail!("Meegle reported an error for {name}");
     }

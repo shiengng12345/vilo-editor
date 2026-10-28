@@ -71,6 +71,13 @@ struct WorkItem {
     due: Option<SharedString>,
 }
 
+#[derive(Clone, Copy)]
+enum MessageAction {
+    SignIn,
+    SignInAgain,
+    Retry,
+}
+
 enum LoadState {
     NotLoaded,
     Loading,
@@ -298,7 +305,7 @@ impl MyWorkPanel {
     fn render_message(
         &self,
         message: impl Into<SharedString>,
-        button: Option<(&'static str, &'static str)>,
+        action: Option<MessageAction>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         v_flex()
@@ -309,16 +316,20 @@ impl MyWorkPanel {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
-            .when_some(button, |this, (id, label)| {
+            .when_some(action, |this, action| {
+                let label = match action {
+                    MessageAction::SignIn => "Sign In with Meegle",
+                    MessageAction::SignInAgain => "Sign In Again",
+                    MessageAction::Retry => "Retry",
+                };
                 this.child(
-                    Button::new(id, label)
+                    Button::new("my-work-message-action", label)
                         .style(ButtonStyle::Filled)
                         .full_width()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if id == "my-work-retry" {
-                                this.reload_now(cx);
-                            } else {
-                                this.open_sign_in(window, cx);
+                        .on_click(cx.listener(move |this, _, window, cx| match action {
+                            MessageAction::Retry => this.reload_now(cx),
+                            MessageAction::SignIn | MessageAction::SignInAgain => {
+                                this.open_sign_in(window, cx)
                             }
                         })),
                 )
@@ -414,16 +425,22 @@ async fn call_meegle(
         .await
         .map_err(|error| anyhow!(error))?;
     match meegle::call_tool(&resource, &token, name, arguments.clone(), cx).await {
-        Ok(response) => Ok(response),
-        Err(error) => {
-            log::info!("Meegle call failed, retrying with a renewed token: {error:#}");
+        Err(error) if error.is::<meegle::TokenRejected>() => {
             store.update(cx, |store, _| store.invalidate_access_token(&token));
             let token = store
                 .update(cx, |store, cx| store.access_token(cx))
                 .await
                 .map_err(|error| anyhow!(error))?;
-            meegle::call_tool(&resource, &token, name, arguments, cx).await
+            let result = meegle::call_tool(&resource, &token, name, arguments, cx).await;
+            if result
+                .as_ref()
+                .is_err_and(|error| error.is::<meegle::TokenRejected>())
+            {
+                store.update(cx, |store, cx| store.reject_access_token(&token, cx));
+            }
+            result
         }
+        result => result,
     }
 }
 
@@ -509,20 +526,20 @@ impl Render for MyWorkPanel {
         let body = if store.account().is_none() {
             self.render_message(
                 "Sign in with Meegle to see your work items here.",
-                Some(("my-work-sign-in", "Sign In with Meegle")),
+                Some(MessageAction::SignIn),
                 cx,
             )
         } else if store.needs_sign_in() {
             self.render_message(
                 "Your Meegle session needs to be renewed.",
-                Some(("my-work-sign-in", "Sign In Again")),
+                Some(MessageAction::SignInAgain),
                 cx,
             )
         } else {
             match &self.load_state {
                 LoadState::Failed(error) if self.items.is_empty() => self.render_message(
                     format!("Could not load work items: {error}"),
-                    Some(("my-work-retry", "Retry")),
+                    Some(MessageAction::Retry),
                     cx,
                 ),
                 LoadState::NotLoaded | LoadState::Loading if self.items.is_empty() => {
@@ -531,6 +548,15 @@ impl Render for MyWorkPanel {
                 LoadState::Loaded if self.items.is_empty() => {
                     self.render_message("Nothing here.", None, cx)
                 }
+                LoadState::Failed(error) => v_flex()
+                    .flex_1()
+                    .child(self.render_message(
+                        format!("Could not refresh: {error}"),
+                        Some(MessageAction::Retry),
+                        cx,
+                    ))
+                    .child(self.render_items(cx))
+                    .into_any_element(),
                 _ => self.render_items(cx),
             }
         };

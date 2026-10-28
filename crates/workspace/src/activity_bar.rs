@@ -11,8 +11,8 @@ const VS_CODE_ORDER: &[&str] = &[
     "Project Panel",
     "Search Panel",
     "GitPanel",
-    "DebugPanel",
     "My Work Panel",
+    "DebugPanel",
 ];
 
 /// VS Code's Codicon and view name for a panel, keyed by its persistent name.

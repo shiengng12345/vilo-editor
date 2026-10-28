@@ -207,6 +207,13 @@ impl AccountStore {
         self.epoch
     }
 
+    /// A freshly refreshed token was rejected too: the session is gone.
+    pub fn reject_access_token(&mut self, token: &str, cx: &mut Context<Self>) {
+        self.invalidate_access_token(token);
+        self.needs_sign_in = true;
+        cx.notify();
+    }
+
     /// Drops a cached token that the server rejected, so the next request refreshes.
     pub fn invalidate_access_token(&mut self, token: &str) {
         if self
@@ -471,7 +478,12 @@ async fn commit(
             store.access = Some(CachedAccess {
                 epoch: store.epoch,
                 token: identity.tokens.access_token.clone(),
-                expires_at: identity.tokens.expires_at,
+                expires_at: Some(
+                    identity
+                        .tokens
+                        .expires_at
+                        .unwrap_or_else(|| SystemTime::now() + DEFAULT_ACCESS_TOKEN_LIFETIME),
+                ),
             });
             cx.emit(AccountEvent::SignedIn);
             cx.notify();
@@ -522,25 +534,49 @@ async fn refresh_access(
         return Ok((tokens.access_token, tokens.expires_at));
     };
     let credential_lock = this.read_with(cx, |store, _| store.credential_lock.clone())?;
-    let _guard = credential_lock.lock().await;
-    if this.read_with(cx, |store, _| store.epoch)? != epoch {
-        return Err(anyhow!("signed out while renewing the Meegle session"));
-    }
-    // Another window may have renewed it already; its newer token wins.
-    let stored = cx
-        .update(|cx| cx.read_credentials(&account.credential_url))
-        .await?
-        .and_then(|(_, bytes)| serde_json::from_slice::<StoredCredential>(&bytes).ok());
-    if stored.and_then(|stored| stored.refresh_token) != Some(refresh_token) {
-        return Ok((tokens.access_token, tokens.expires_at));
-    }
     credential.refresh_token = Some(rotated);
     let bytes = serde_json::to_vec(&credential)?;
-    cx.update(|cx| cx.write_credentials(&account.credential_url, &username, &bytes))
+    let credential_url = account.credential_url.clone();
+    let this = this.clone();
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    // Detached so that cancelling the refresh cannot release the lock while the
+    // keychain write is still running; sign-out's delete waits on the same lock.
+    cx.spawn(async move |cx| {
+        let _guard = credential_lock.lock().await;
+        let result = async {
+            if this.read_with(cx, |store, _| store.epoch)? != epoch {
+                return Err(anyhow!("signed out while renewing the Meegle session"));
+            }
+            let stored = cx
+                .update(|cx| cx.read_credentials(&credential_url))
+                .await?
+                .ok_or(SignInRequired(
+                    "You signed out of Meegle in another window.",
+                ))?;
+            // Another window in this process renewed first; keep its token. Separate
+            // Vilo processes are not coordinated: if two rotate at once, the loser's
+            // next refresh gets invalid_grant and asks the user to sign in again.
+            let stored_token = serde_json::from_slice::<StoredCredential>(&stored.1)
+                .ok()
+                .and_then(|stored| stored.refresh_token);
+            if stored_token.is_some_and(|stored_token| stored_token != refresh_token) {
+                return Ok(());
+            }
+            cx.update(|cx| cx.write_credentials(&credential_url, &username, &bytes))
+                .await
+                .map_err(|_| {
+                    // The old refresh token is spent after rotation, so this cannot be retried.
+                    SignInRequired("Vilo could not save the renewed Meegle session. Sign in again.")
+                        .into()
+                })
+        }
+        .await;
+        sender.send(result).ok();
+    })
+    .detach();
+    receiver
         .await
-        .map_err(|_| {
-            SignInRequired("Vilo could not save the renewed Meegle session. Sign in again.")
-        })?;
+        .map_err(|_| anyhow!("renewing the Meegle session was interrupted"))??;
     Ok((tokens.access_token, tokens.expires_at))
 }
 
