@@ -163,6 +163,33 @@ pub enum WriteAction<'a> {
     Stop { job: &'a [String], number: u64 },
 }
 
+/// An Active Choices cascade parameter as Jenkins' build page wires it up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CascadeSpec {
+    pub name: String,
+    pub referenced: Vec<String>,
+    /// Several values (checkboxes, multi-select) joined with commas on submit.
+    pub multiple: bool,
+    proxy: String,
+}
+
+/// One rendering of the build page: its session and the cascades on it.
+/// Kept for a single form; the bound proxies only exist in this session.
+pub struct FormSession {
+    pub cascades: Vec<CascadeSpec>,
+    crumb: Option<(String, String)>,
+    cookies: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChoiceOption {
+    pub label: String,
+    /// The value Jenkins receives.
+    pub key: String,
+    pub selected: bool,
+    pub disabled: bool,
+}
+
 pub struct LogChunk {
     pub text: String,
     /// The byte offset to ask for next, as reported by Jenkins.
@@ -403,6 +430,124 @@ impl JenkinsClient {
         classify_write(&action, status, location.as_ref(), &self.base)
     }
 
+    /// Loads the job's build page to drive its Active Choices parameters the
+    /// way the page itself does.
+    pub async fn open_form(&self, job: &[String]) -> Result<FormSession, JenkinsError> {
+        let url = self
+            .base
+            .join(&format!("{}build?delay=0sec", job_path(job)))
+            .map_err(|_| JenkinsError::Unexpected)?;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(url.as_str())
+            .header("Authorization", &self.authorization)
+            .follow_redirects(RedirectPolicy::NoFollow)
+            .timeout(REQUEST_TIMEOUT)
+            .body(AsyncBody::empty())
+            .map_err(|_| JenkinsError::Unexpected)?;
+        let mut response = self
+            .http
+            .send(request)
+            .await
+            .map_err(|error| JenkinsError::Network(error.to_string().chars().take(200).collect()))?;
+        // Jenkins renders the form with 405 for a GET of a parameterized job.
+        match response.status().as_u16() {
+            200 | 405 => {}
+            401 => return Err(JenkinsError::Unauthorized),
+            403 => return Err(JenkinsError::Forbidden),
+            404 => return Err(JenkinsError::NotFound),
+            status if (300..400).contains(&status) => return Err(JenkinsError::Redirected),
+            status => return Err(JenkinsError::Status(status)),
+        }
+        let cookies = session_cookies(&response);
+        let mut bytes = Vec::new();
+        response
+            .body_mut()
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| JenkinsError::Unexpected)?;
+        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(JenkinsError::TooLarge);
+        }
+        let html = String::from_utf8_lossy(&bytes);
+        let crumb = attribute(&html, "data-crumb-header")
+            .zip(attribute(&html, "data-crumb-value"));
+        Ok(FormSession {
+            cascades: parse_cascades(&html),
+            crumb,
+            cookies,
+        })
+    }
+
+    /// Recomputes one cascade's choices from the values it references. The
+    /// plugin keeps this state per session, so calls for a form must not overlap.
+    pub async fn cascade_choices(
+        &self,
+        form: &FormSession,
+        cascade: &CascadeSpec,
+        referenced_values: &[(String, String)],
+    ) -> Result<Vec<ChoiceOption>, JenkinsError> {
+        let text = referenced_values
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("__LESEP__");
+        let update = serde_json::to_string(&[text]).map_err(|_| JenkinsError::Unexpected)?;
+        self.proxy_call(form, &cascade.proxy, "doUpdate", update).await?;
+        let body = self.proxy_call(form, &cascade.proxy, "getChoicesForUI", "[]".into()).await?;
+        parse_choices(&body)
+    }
+
+    async fn proxy_call(&self, form: &FormSession, proxy: &str, method: &str, body: String) -> Result<String, JenkinsError> {
+        // Only the proxies found on the page just loaded, and only these methods.
+        if !matches!(method, "doUpdate" | "getChoicesForUI") || !form.cascades.iter().any(|cascade| cascade.proxy == proxy) {
+            return Err(JenkinsError::Unexpected);
+        }
+        let url = self
+            .base
+            .join(&format!("$stapler/bound/{proxy}/{method}"))
+            .map_err(|_| JenkinsError::Unexpected)?;
+        if !is_within(&self.base, &url) {
+            return Err(JenkinsError::Unexpected);
+        }
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(url.as_str())
+            .header("Authorization", &self.authorization)
+            .header("Content-Type", "application/x-stapler-method-invocation;charset=UTF-8")
+            .follow_redirects(RedirectPolicy::NoFollow)
+            .timeout(REQUEST_TIMEOUT);
+        if let Some((field, value)) = &form.crumb {
+            request = request.header("Crumb", value.as_str()).header(field.as_str(), value.as_str());
+        }
+        if !form.cookies.is_empty() {
+            request = request.header("Cookie", form.cookies.join("; "));
+        }
+        let request = request
+            .body(AsyncBody::from(body.into_bytes()))
+            .map_err(|_| JenkinsError::Unexpected)?;
+        let mut response = self
+            .http
+            .send(request)
+            .await
+            .map_err(|error| JenkinsError::Network(error.to_string().chars().take(200).collect()))?;
+        match response.status().as_u16() {
+            200..=299 => {}
+            403 => return Err(JenkinsError::Forbidden),
+            404 => return Err(JenkinsError::NotFound),
+            status => return Err(JenkinsError::Status(status)),
+        }
+        let mut text = String::new();
+        response
+            .body_mut()
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_string(&mut text)
+            .await
+            .map_err(|_| JenkinsError::Unexpected)?;
+        Ok(text)
+    }
+
     async fn crumb(&self) -> Result<(Option<(String, String)>, Vec<String>), JenkinsError> {
         let url = self.base.join("crumbIssuer/api/json").map_err(|_| JenkinsError::Unexpected)?;
         let request = Request::builder()
@@ -425,14 +570,7 @@ impl JenkinsClient {
         if !response.status().is_success() {
             return Err(JenkinsError::Status(response.status().as_u16()));
         }
-        let cookies = response
-            .headers()
-            .get_all("set-cookie")
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .filter_map(|cookie| cookie.split(';').next())
-            .map(str::to_string)
-            .collect();
+        let cookies = session_cookies(&response);
         let mut body = String::new();
         response
             .body_mut()
@@ -523,6 +661,120 @@ impl JenkinsClient {
         }
         Ok((String::from_utf8_lossy(&bytes).into_owned(), headers))
     }
+}
+
+fn session_cookies(response: &http_client::Response<AsyncBody>) -> Vec<String> {
+    response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|cookie| cookie.split(';').next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The first value of an HTML attribute, entity-decoded for the few entities Jenkins emits.
+fn attribute(html: &str, name: &str) -> Option<String> {
+    let start = html.find(&format!("{name}=\""))? + name.len() + 2;
+    let end = html[start..].find('"')? + start;
+    Some(decode_entities(&html[start..end]))
+}
+
+fn decode_entities(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Finds each `cascade-choice-parameter-data-holder` and its bound proxy. A
+/// cascade whose markup is not fully recognized is left out, so the caller
+/// sees it missing and falls back to Jenkins' own page.
+fn parse_cascades(html: &str) -> Vec<CascadeSpec> {
+    let mut cascades = Vec::new();
+    let mut rest = html;
+    while let Some(index) = rest.find("class=\"cascade-choice-parameter-data-holder\"") {
+        let tag_start = rest[..index].rfind('<').unwrap_or(0);
+        let tag_end = rest[index..].find('>').map_or(rest.len(), |end| index + end);
+        let tag = &rest[tag_start..tag_end];
+        let after = &rest[tag_end..];
+        rest = after;
+        let (Some(name), Some(random), Some(proxy_name)) = (
+            attribute(tag, "data-name"),
+            attribute(tag, "data-random-name"),
+            attribute(tag, "data-proxy-name"),
+        ) else {
+            continue;
+        };
+        let referenced = attribute(tag, "data-referenced-parameters")
+            .unwrap_or_default()
+            .split(',')
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        let marker = "$stapler/bound/script/$stapler/bound/";
+        let proxy = after.find(marker).and_then(|start| {
+            let id_start = start + marker.len();
+            let script = &after[id_start..after[id_start..].find('"').map_or(after.len(), |end| id_start + end)];
+            let (id, query) = script.split_once('?')?;
+            let valid = id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+            (valid && decode_entities(query).contains(&format!("var={proxy_name}&"))).then(|| id.to_string())
+        });
+        // The control lives in the element with the random id, before the holder.
+        let control_start = html.find(&format!("id=\"{random}\""));
+        let control = control_start.map(|start| &html[start..html[start..].find("cascade-choice-parameter-data-holder").map_or(html.len(), |end| start + end)]);
+        let multiple = match control {
+            Some(control) if control.contains("class=\"dynamic_checkbox\"") => Some(true),
+            Some(control) if control.contains("<select") && control.contains("multiple") => Some(true),
+            Some(control) if control.contains("<select") || control.contains("type=\"radio\"") => Some(false),
+            _ => None,
+        };
+        if let (Some(proxy), Some(multiple)) = (proxy, multiple) {
+            cascades.push(CascadeSpec { name, referenced, multiple, proxy });
+        }
+    }
+    cascades
+}
+
+/// `getChoicesForUI` answers `[labels, keys]`; markers like `:selected` and
+/// `:disabled` ride on the labels and keys and are stripped here.
+fn parse_choices(body: &str) -> Result<Vec<ChoiceOption>, JenkinsError> {
+    let value: serde_json::Value = parse_lenient(body)?;
+    let arrays = value.as_array().filter(|arrays| arrays.len() == 2).ok_or(JenkinsError::Unexpected)?;
+    let labels = arrays[0].as_array().ok_or(JenkinsError::Unexpected)?;
+    let keys = arrays[1].as_array().ok_or(JenkinsError::Unexpected)?;
+    if labels.len() != keys.len() {
+        return Err(JenkinsError::Unexpected);
+    }
+    let text = |value: &serde_json::Value| match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    Ok(labels
+        .iter()
+        .zip(keys)
+        .map(|(label, key)| {
+            let (mut label, mut key) = (text(label), text(key));
+            let mut selected = false;
+            let mut disabled = false;
+            for marked in [&mut label, &mut key] {
+                loop {
+                    if let Some(stripped) = marked.strip_suffix(":selected") {
+                        *marked = stripped.to_string();
+                        selected = true;
+                    } else if let Some(stripped) = marked.strip_suffix(":disabled") {
+                        *marked = stripped.to_string();
+                        disabled = true;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            ChoiceOption { label, key, selected, disabled }
+        })
+        .collect())
 }
 
 /// Reads Jenkins' answer to a change. Redirects to the job or login page mean
@@ -729,6 +981,20 @@ pub fn strip_escapes(text: &str) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod tests_support {
+    use super::CascadeSpec;
+
+    pub fn spec(name: &str, referenced: &[&str], multiple: bool) -> CascadeSpec {
+        CascadeSpec {
+            name: name.into(),
+            referenced: referenced.iter().map(|name| name.to_string()).collect(),
+            multiple,
+            proxy: "00000000-0000-0000-0000-000000000000".into(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -812,8 +1078,37 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cascades_from_build_page() {
+        let html = r#"<div name="parameter" id="choice-parameter-1" class="active-choice"><input name="name" type="hidden" value="NAMESPACE"><select name="value"><option value="a">a</option></select></div>
+<span data-referenced-parameters="ENV_TYPE" data-random-name="choice-parameter-1" class="cascade-choice-parameter-data-holder" data-name="NAMESPACE" data-proxy-name="proxy_1"></span><script src="/$stapler/bound/script/$stapler/bound/ffde6e7d-4c57-4324-84a6-13662c630667?var=proxy_1&amp;methods=doUpdate,getChoicesForUI"></script>
+<div name="parameter" id="choice-parameter-2" class="active-choice"><input name="name" type="hidden" value="SERVICES"><div id="ecp_choice-parameter-2" class="dynamic_checkbox"></div></div>
+<span data-referenced-parameters="NAMESPACE,ENV_TYPE" data-random-name="choice-parameter-2" class="cascade-choice-parameter-data-holder" data-name="SERVICES" data-proxy-name="proxy_2"></span><script src="/$stapler/bound/script/$stapler/bound/e3bd75c4-4c2b-419f-b725-1bdee446abbf?var=proxy_2&amp;methods=doUpdate,getChoicesForUI"></script>
+<div name="parameter" id="choice-parameter-3" class="active-choice"><input name="name" type="hidden" value="ODD"><textarea></textarea></div>
+<span data-referenced-parameters="ENV_TYPE" data-random-name="choice-parameter-3" class="cascade-choice-parameter-data-holder" data-name="ODD" data-proxy-name="proxy_3"></span><script src="/$stapler/bound/script/$stapler/bound/43c63be4-ec21-4a16-a276-407e566d78f8?var=proxy_3&amp;methods=doUpdate"></script>"#;
+        let cascades = parse_cascades(html);
+        // The third control is not recognized, so it is left out for the caller to refuse.
+        assert_eq!(cascades.len(), 2);
+        assert_eq!((cascades[0].name.as_str(), cascades[0].multiple), ("NAMESPACE", false));
+        assert_eq!(cascades[0].referenced, vec!["ENV_TYPE".to_string()]);
+        assert_eq!((cascades[1].name.as_str(), cascades[1].multiple), ("SERVICES", true));
+        assert_eq!(cascades[1].proxy, "e3bd75c4-4c2b-419f-b725-1bdee446abbf");
+    }
+
+    #[test]
+    fn test_parse_choices_keeps_labels_and_keys_apart() {
+        let choices = parse_choices(r#"[["QA env:selected","UAT"],["qat:selected","uat:disabled"]]"#).unwrap();
+        assert_eq!(
+            choices[0],
+            ChoiceOption { label: "QA env".into(), key: "qat".into(), selected: true, disabled: false }
+        );
+        assert_eq!((choices[1].key.as_str(), choices[1].disabled), ("uat", true));
+        assert!(parse_choices(r#"[["a"],["a","b"]]"#).is_err());
+    }
+
+    #[test]
     fn test_strip_escapes_removes_colors_osc_and_controls() {
         let text = "\u{1b}[31mERROR\u{1b}[0m done\u{1b}]52;c;Zm9v\u{7}\tok\u{8}\n\u{1b}]0;title\u{1b}\\end";
         assert_eq!(strip_escapes(text), "ERROR done\tok\nend");
     }
 }
+
