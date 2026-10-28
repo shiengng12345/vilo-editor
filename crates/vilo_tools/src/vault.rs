@@ -276,26 +276,8 @@ impl VaultClient {
         data: &serde_json::Map<String, serde_json::Value>,
         cas: u64,
     ) -> Result<u64, WriteError> {
-        if mount.version != KvVersion::V2 {
-            return Err(WriteError::Failed("KV v1 secrets are read-only in Vilo.".into()));
-        }
-        let request_path = kv_path(mount, KvOperation::Read, path)
-            .map_err(|error| WriteError::Failed(error.to_string()))?;
         let body = serde_json::json!({ "options": { "cas": cas }, "data": data });
-        let body = serde_json::to_vec(&body).map_err(|_| WriteError::Failed("Could not encode the secret.".into()))?;
-        let (status, raw) = match self.fetch(Method::POST, &request_path, &[], Some(body)).await {
-            Ok(response) => response,
-            // Refused before anything was sent.
-            Err(error @ (VaultError::Unexpected | VaultError::InvalidPath)) => {
-                return Err(WriteError::Failed(error.to_string()));
-            }
-            Err(VaultError::Forbidden) => return Err(WriteError::Forbidden),
-            Err(VaultError::Redirected) => return Err(WriteError::Failed(VaultError::Redirected.to_string())),
-            Err(VaultError::RateLimited) => {
-                return Err(WriteError::Failed("Vault rejected the write as too many requests (429).".into()));
-            }
-            Err(error) => return Err(WriteError::OutcomeUnknown(error.to_string())),
-        };
+        let (status, raw) = self.post_write(mount, KvOperation::Read, path, &body).await?;
         match status {
             200..=299 => serde_json::from_str::<serde_json::Value>(&raw)
                 .ok()
@@ -303,6 +285,58 @@ impl VaultClient {
                 .ok_or_else(|| WriteError::OutcomeUnknown("Vault did not return the new version".into())),
             400 if is_cas_mismatch(&raw) => Err(WriteError::Conflict),
             status => Err(WriteError::Failed(format!("Vault refused the write (status {status})."))),
+        }
+    }
+
+    /// Soft-deletes exactly `version`, never "whatever is newest now". Reversible with undelete.
+    pub async fn delete_version(&self, mount: &Mount, path: &str, version: u64) -> Result<(), WriteError> {
+        self.version_operation(mount, KvOperation::Delete, path, version).await
+    }
+
+    /// Restores a soft-deleted version. It does not become the newest version again.
+    pub async fn undelete_version(&self, mount: &Mount, path: &str, version: u64) -> Result<(), WriteError> {
+        self.version_operation(mount, KvOperation::Undelete, path, version).await
+    }
+
+    async fn version_operation(
+        &self,
+        mount: &Mount,
+        operation: KvOperation,
+        path: &str,
+        version: u64,
+    ) -> Result<(), WriteError> {
+        let body = serde_json::json!({ "versions": [version] });
+        match self.post_write(mount, operation, path, &body).await? {
+            (200..=299, _) => Ok(()),
+            (status, _) => Err(WriteError::Failed(format!("Vault refused the change (status {status})."))),
+        }
+    }
+
+    /// Sends one KV v2 mutation. Never retried: a repeat could apply twice.
+    async fn post_write(
+        &self,
+        mount: &Mount,
+        operation: KvOperation,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<(u16, String), WriteError> {
+        if mount.version != KvVersion::V2 {
+            return Err(WriteError::Failed("KV v1 secrets are read-only in Vilo.".into()));
+        }
+        let request_path = kv_path(mount, operation, path)
+            .map_err(|error| WriteError::Failed(error.to_string()))?;
+        let body = serde_json::to_vec(body).map_err(|_| WriteError::Failed("Could not encode the request.".into()))?;
+        match self.fetch(Method::POST, &request_path, &[], Some(body)).await {
+            Ok(response) => Ok(response),
+            // Refused before anything was sent, or by Vault before it acted.
+            Err(error @ (VaultError::Unexpected | VaultError::InvalidPath | VaultError::Redirected)) => {
+                Err(WriteError::Failed(error.to_string()))
+            }
+            Err(VaultError::Forbidden) => Err(WriteError::Forbidden),
+            Err(VaultError::RateLimited) => {
+                Err(WriteError::Failed("Vault rejected the change as too many requests (429).".into()))
+            }
+            Err(error) => Err(WriteError::OutcomeUnknown(error.to_string())),
         }
     }
 
@@ -429,6 +463,8 @@ enum KvOperation {
     List,
     Read,
     Metadata,
+    Delete,
+    Undelete,
 }
 
 fn kv_path(mount: &Mount, operation: KvOperation, path: &str) -> Result<String, VaultError> {
@@ -444,6 +480,8 @@ fn kv_path(mount: &Mount, operation: KvOperation, path: &str) -> Result<String, 
         (KvVersion::V1, _) => None,
         (KvVersion::V2, KvOperation::Read) => Some("data"),
         (KvVersion::V2, KvOperation::List | KvOperation::Metadata) => Some("metadata"),
+        (KvVersion::V2, KvOperation::Delete) => Some("delete"),
+        (KvVersion::V2, KvOperation::Undelete) => Some("undelete"),
     };
     let encoded = path
         .trim_matches('/')
@@ -759,6 +797,14 @@ mod tests {
             "v1/FPMS-NT-V2/metadata/ccms/uat"
         );
         assert_eq!(kv_path(&v1, KvOperation::List, "a/").unwrap(), "v1/FPMS-NT-V2/a/");
+        assert_eq!(
+            kv_path(&v2, KvOperation::Delete, "ccms/uat").unwrap(),
+            "v1/FPMS-NT-V2/delete/ccms/uat"
+        );
+        assert_eq!(
+            kv_path(&v2, KvOperation::Undelete, "ccms/uat").unwrap(),
+            "v1/FPMS-NT-V2/undelete/ccms/uat"
+        );
         assert_eq!(kv_path(&v1, KvOperation::Read, "a/b").unwrap(), "v1/FPMS-NT-V2/a/b");
         // Segments cannot climb out of the mount or smuggle a query.
         assert_eq!(

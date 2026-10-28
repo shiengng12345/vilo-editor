@@ -187,6 +187,7 @@ pub struct VaultView {
     confirm_reveal_all: bool,
     form: Option<ConnectionForm>,
     edit: Option<edit::EditState>,
+    delete: Option<edit::DeleteState>,
     /// The last write's outcome, shown above the secret.
     notice: Option<SharedString>,
     /// Value rows showing their formatted JSON.
@@ -252,6 +253,7 @@ impl VaultView {
             confirm_reveal_all: false,
             form: None,
             edit: None,
+            delete: None,
             notice: None,
             expanded_values: HashSet::default(),
             json_view: false,
@@ -302,6 +304,7 @@ impl VaultView {
         self.expanded.clear();
         self.secret = None;
         self.edit = None;
+        self.delete = None;
         self.notice = None;
         self.expanded_values.clear();
         self.json_view = false;
@@ -443,6 +446,7 @@ impl VaultView {
             None
         };
         self.generation += 1;
+        self.delete = None;
         self.json_view = false;
         self.confirm_json_view = false;
         self.revealed.clear();
@@ -1341,12 +1345,32 @@ impl VaultView {
         let body = match &secret.read {
             Fetch::Loading => Label::new("Loading…").color(Color::Muted).into_any_element(),
             Fetch::Failed(message) => Label::new(message.clone()).color(Color::Warning).into_any_element(),
-            Fetch::Loaded(SecretRead::Unavailable { version, state }) => Label::new(match state {
-                VersionState::Destroyed => format!("Version {version} was destroyed; its values are gone."),
-                _ => format!("Version {version} was deleted. Its values can be restored in Vault."),
-            })
-            .color(Color::Warning)
-            .into_any_element(),
+            Fetch::Loaded(SecretRead::Unavailable { version, state }) => {
+                let version = *version;
+                let destroyed = *state == VersionState::Destroyed;
+                v_flex()
+                    .gap_2()
+                    .child(
+                        Label::new(if destroyed {
+                            format!("Version {version} was destroyed; its values are gone.")
+                        } else {
+                            format!("Version {version} was deleted.")
+                        })
+                        .color(Color::Warning),
+                    )
+                    .when(!destroyed && secret.mount.version == KvVersion::V2, |this| {
+                        this.child(
+                            h_flex().child(
+                                Button::new("vault-undelete", format!("Restore version {version}"))
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_delete(version, true, window, cx)
+                                    })),
+                            ),
+                        )
+                    })
+                    .into_any_element()
+            }
             Fetch::Loaded(SecretRead::Found(found)) => {
                 let all_revealed = !found.values.is_empty()
                     && found.values.keys().all(|key| self.revealed.contains(key));
@@ -1413,6 +1437,21 @@ impl VaultView {
                                 this.start_edit(window, cx)
                             }))
                     })
+                    .when_some(
+                        found
+                            .version
+                            .filter(|_| secret.mount.version == KvVersion::V2 && secret.version.is_none()),
+                        |this, version| {
+                            this.child(
+                                Button::new("vault-delete-secret", "Delete")
+                                    .label_size(LabelSize::Small)
+                                    .start_icon(Icon::new(IconName::Trash).size(IconSize::Small))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_delete(version, false, window, cx)
+                                    })),
+                            )
+                        },
+                    )
                     .child(
                         Button::new(
                             "vault-reveal-all",
@@ -1573,7 +1612,15 @@ impl VaultView {
                 v_flex().flex_1().min_h_0().gap_2().child(toolbar).child(content).into_any_element()
             }
         };
-        v_flex().flex_1().min_h_0().gap_3().child(header).child(body).into_any_element()
+        let delete = self.delete.as_ref().map(|state| self.render_delete(state, cx));
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .gap_3()
+            .child(header)
+            .children(delete)
+            .child(body)
+            .into_any_element()
     }
 }
 

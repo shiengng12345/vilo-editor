@@ -126,7 +126,181 @@ fn audit_line(
     .to_string()
 }
 
+/// Appends one value-free line to the local write log.
+fn append_audit(line: String, cx: &mut App) {
+    cx.background_spawn(async move {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(paths::config_dir().join("vault_audit.log"))?;
+        writeln!(file, "{line}")
+    })
+    .detach_and_log_err(cx);
+}
+
+pub(super) struct DeleteState {
+    version: u64,
+    /// Restores a deleted version instead of deleting the current one.
+    undelete: bool,
+    confirm: Entity<Editor>,
+    message: Option<SharedString>,
+    running: bool,
+    _task: Option<Task<()>>,
+}
+
 impl VaultView {
+    pub(super) fn start_delete(&mut self, version: u64, undelete: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.notice = None;
+        self.delete = Some(DeleteState {
+            version,
+            undelete,
+            confirm: editor("Type the connection name", "", false, window, cx),
+            message: None,
+            running: false,
+            _task: None,
+        });
+        cx.notify();
+    }
+
+    fn run_delete(&mut self, cx: &mut Context<Self>) {
+        let (Some(state), Some(secret), Some(session)) = (&mut self.delete, &self.secret, &self.session) else {
+            return;
+        };
+        let Some(connection) = self.connections.iter().find(|c| c.id == session.connection_id).cloned() else {
+            return;
+        };
+        if connection.is_protected() && state.confirm.read(cx).text(cx).trim() != connection.name {
+            state.message = Some(format!("Type “{}” to confirm.", connection.name).into());
+            cx.notify();
+            return;
+        }
+        let (mount, path, version, undelete) = (secret.mount.clone(), secret.path.clone(), state.version, state.undelete);
+        state.running = true;
+        state.message = None;
+        state._task = Some(cx.spawn(async move |this, cx| {
+            let result = async {
+                let client = client_for(&connection, cx).await.map_err(WriteError::Failed)?;
+                if undelete {
+                    client.undelete_version(&mount, &path, version).await
+                } else {
+                    client.delete_version(&mount, &path, version).await
+                }
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                let full_path = format!("{}/{}", mount.path, path);
+                match result {
+                    Ok(()) => {
+                        append_audit(
+                            serde_json::json!({
+                                "time": time::OffsetDateTime::now_utc().unix_timestamp(),
+                                "connection": connection.label(),
+                                "address": connection.address,
+                                "path": full_path,
+                                "action": if undelete { "undelete" } else { "delete" },
+                                "version": version,
+                            })
+                            .to_string(),
+                            cx,
+                        );
+                        this.delete = None;
+                        this.secret = None;
+                        this.open_secret(mount.clone(), path.clone(), None, cx);
+                        this.notice = Some(if undelete {
+                            format!("Restored version {version} of {full_path}. The newest version is unchanged.")
+                        } else {
+                            format!("Deleted version {version} of {full_path}. It can be restored from the version menu.")
+                        }
+                        .into());
+                    }
+                    Err(error) => {
+                        if let Some(state) = &mut this.delete {
+                            state.running = false;
+                            state.message = Some(match error {
+                                WriteError::OutcomeUnknown(_) => format!("{error} Reopen the secret to see its state."),
+                                other => other.to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub(super) fn render_delete(&self, state: &DeleteState, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let connection = self
+            .session
+            .as_ref()
+            .and_then(|session| self.connections.iter().find(|c| c.id == session.connection_id));
+        let protected = connection.is_some_and(|c| c.is_protected());
+        v_flex()
+            .p_3()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(if state.undelete { colors.border } else { cx.theme().status().error })
+            .child(
+                Label::new(if state.undelete {
+                    format!("Restore version {}? It will not become the newest version again.", state.version)
+                } else {
+                    format!(
+                        "Delete version {}? Vault keeps it as deleted, so it can be restored until it is destroyed or pruned.",
+                        state.version
+                    )
+                })
+                .size(LabelSize::Small),
+            )
+            .when(protected, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Label::new(format!(
+                                "Protected connection: type “{}”",
+                                connection.map_or(String::new(), |c| c.name.clone())
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Warning),
+                        )
+                        .child(
+                            div()
+                                .w(px(240.))
+                                .px_2()
+                                .py_0p5()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(colors.border)
+                                .child(state.confirm.clone()),
+                        ),
+                )
+            })
+            .when_some(state.message.clone(), |this, message| {
+                this.child(Label::new(message).size(LabelSize::Small).color(Color::Error))
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("vault-delete-confirm", if state.undelete { "Restore" } else { "Delete version" })
+                            .style(if state.undelete { ButtonStyle::Filled } else { ButtonStyle::Tinted(ui::TintColor::Error) })
+                            .disabled(state.running)
+                            .on_click(cx.listener(|this, _, _, cx| this.run_delete(cx))),
+                    )
+                    .child(Button::new("vault-delete-cancel", "Cancel").disabled(state.running).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.delete = None;
+                            cx.notify();
+                        },
+                    ))),
+            )
+            .into_any_element()
+    }
+
     fn new_row(&self, key: &str, value: &str, json: bool, window: &mut Window, cx: &mut Context<Self>) -> EditRow {
         EditRow {
             key: editor("KEY", key, false, window, cx),
@@ -371,14 +545,7 @@ impl VaultView {
                     Ok(version) => {
                         let full_path = format!("{}/{}", mount.path, path);
                         let line = audit_line(&connection.label(), &connection.address, &full_path, base, version, &changes);
-                        cx.background_spawn(async move {
-                            let mut file = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(paths::config_dir().join("vault_audit.log"))?;
-                            writeln!(file, "{line}")
-                        })
-                        .detach_and_log_err(cx);
+                        append_audit(line, cx);
                         this.edit = None;
                         // Listings and history may now be stale.
                         this.folders.retain(|(mount_path, _), _| mount_path != &mount.path);
