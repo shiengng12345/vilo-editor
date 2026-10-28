@@ -1,4 +1,5 @@
 mod compare;
+mod edit;
 mod import;
 
 use std::{
@@ -47,6 +48,14 @@ struct Connection {
     /// The user accepted that this http address sends the token and values in plain text.
     #[serde(default)]
     plaintext_acknowledged: bool,
+    /// Every write must be confirmed by typing the connection name. Connections
+    /// saved before this existed are protected until the user says otherwise.
+    #[serde(default = "protected_by_default")]
+    protected: bool,
+}
+
+fn protected_by_default() -> bool {
+    true
 }
 
 impl Connection {
@@ -56,6 +65,12 @@ impl Connection {
 
     fn credential_url(&self) -> String {
         format!("vilo-vault://{}", self.id)
+    }
+
+    /// Production-looking environments are always protected, whatever the setting says.
+    fn is_protected(&self) -> bool {
+        let environment = self.environment.to_lowercase();
+        self.protected || environment.contains("prod") || environment.contains("live")
     }
 
     fn label(&self) -> String {
@@ -150,6 +165,7 @@ struct ConnectionForm {
     token: Entity<Editor>,
     acknowledge_plaintext: bool,
     accept_root: bool,
+    protected: bool,
     message: Option<SharedString>,
     checking: bool,
     _task: Option<Task<()>>,
@@ -170,6 +186,11 @@ pub struct VaultView {
     revealed: HashSet<String>,
     confirm_reveal_all: bool,
     form: Option<ConnectionForm>,
+    edit: Option<edit::EditState>,
+    /// The last write's outcome, shown above the secret.
+    notice: Option<SharedString>,
+    /// Value rows showing their formatted JSON.
+    expanded_values: HashSet<String>,
     collapsed_sites: HashSet<String>,
     import: Option<import::ImportState>,
     compare: Option<compare::CompareState>,
@@ -208,10 +229,9 @@ impl VaultView {
         let focus_handle = cx.focus_handle();
         // Revealed values are masked again whenever the page loses focus.
         let subscriptions = vec![cx.on_focus_out(&focus_handle, window, |this, _, _, cx| {
-            if !this.revealed.is_empty() {
-                this.revealed.clear();
-                cx.notify();
-            }
+            this.revealed.clear();
+            this.remask_edit(cx);
+            cx.notify();
         })];
         let mut view = Self {
             focus_handle,
@@ -226,6 +246,9 @@ impl VaultView {
             revealed: HashSet::default(),
             confirm_reveal_all: false,
             form: None,
+            edit: None,
+            notice: None,
+            expanded_values: HashSet::default(),
             collapsed_sites: HashSet::default(),
             import: None,
             compare: None,
@@ -271,6 +294,9 @@ impl VaultView {
         self.folders.clear();
         self.expanded.clear();
         self.secret = None;
+        self.edit = None;
+        self.notice = None;
+        self.expanded_values.clear();
         self.revealed.clear();
         self.confirm_reveal_all = false;
         self.tasks.clear();
@@ -570,6 +596,7 @@ impl VaultView {
             // Asked again on every save, so an edited address never inherits it.
             acknowledge_plaintext: false,
             accept_root: false,
+            protected: existing.as_ref().is_none_or(|c| c.protected),
             message: None,
             checking: false,
             _task: None,
@@ -632,6 +659,7 @@ impl VaultView {
             environment,
             address: origin.to_string(),
             plaintext_acknowledged: plaintext,
+            protected: form.protected,
         };
         let accept_root = form.accept_root;
         form.checking = true;
@@ -1163,6 +1191,16 @@ impl VaultView {
                     })),
                 )
             })
+            .child(
+                Checkbox::new("vault-protected", ToggleState::from(form.protected))
+                    .label("Protected: confirm every write by typing the connection name (always on for prod/live)")
+                    .on_click(cx.listener(|this, state: &ToggleState, _, cx| {
+                        if let Some(form) = &mut this.form {
+                            form.protected = state.selected();
+                        }
+                        cx.notify();
+                    })),
+            )
             .when(root_rejected || form.accept_root, |this| {
                 this.child(
                     Checkbox::new("vault-accept-root", ToggleState::from(form.accept_root))
@@ -1316,6 +1354,26 @@ impl VaultView {
                         )
                     })
                     .child(div().flex_1())
+                    .child({
+                        let blocked = if secret.mount.version != KvVersion::V2 {
+                            Some("KV v1 secrets are read-only in Vilo.")
+                        } else if secret.version.is_some() {
+                            Some("Open the current version to edit.")
+                        } else if !found.exact_numbers {
+                            Some("This secret has numbers Vilo cannot keep exactly; edit it in the Vault UI.")
+                        } else {
+                            None
+                        };
+                        Button::new("vault-edit-secret", "Edit")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::Pencil).size(IconSize::Small))
+                            .disabled(blocked.is_some())
+                            .when_some(blocked, |this, reason| this.tooltip(Tooltip::text(reason)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.notice = None;
+                                this.start_edit(window, cx)
+                            }))
+                    })
                     .child(
                         Button::new(
                             "vault-reveal-all",
@@ -1363,12 +1421,16 @@ impl VaultView {
                         "••••••••".to_string()
                     };
                     let reveal_key = key.clone();
+                    let pretty = pretty_json(value);
+                    let expanded = revealed && self.expanded_values.contains(key);
+                    let expand_key = key.clone();
                     rows = rows.child(
-                        h_flex()
+                        v_flex()
+                        .when(index > 0, |this| this.border_t_1().border_color(colors.border_variant))
+                        .child(h_flex()
                             .px_3()
                             .py_1p5()
                             .gap_3()
-                            .when(index > 0, |this| this.border_t_1().border_color(colors.border_variant))
                             .child(
                                 div()
                                     .w(px(280.))
@@ -1398,6 +1460,23 @@ impl VaultView {
                                     cx.notify();
                                 })),
                             )
+                            .when(pretty.is_some(), |this| {
+                                this.child(
+                                    IconButton::new(SharedString::from(format!("vault-json-{key}")), IconName::Code)
+                                        .icon_size(IconSize::Small)
+                                        .toggle_state(expanded)
+                                        .tooltip(Tooltip::text("Show formatted JSON (reveals the value)"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if this.expanded_values.remove(&expand_key) {
+                                                this.revealed.remove(&expand_key);
+                                            } else {
+                                                this.expanded_values.insert(expand_key.clone());
+                                                this.revealed.insert(expand_key.clone());
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .child(
                                 IconButton::new(SharedString::from(format!("vault-copy-{key}")), IconName::Copy)
                                     .icon_size(IconSize::Small)
@@ -1405,7 +1484,22 @@ impl VaultView {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.copy_value(text.clone(), cx)
                                     })),
-                            ),
+                            ))
+                        .when_some(pretty.filter(|_| expanded), |this, pretty| {
+                            this.child(
+                                v_flex()
+                                    .mx_3()
+                                    .mb_2()
+                                    .p_2()
+                                    .rounded_sm()
+                                    .bg(colors.editor_subheader_background)
+                                    .children(pretty.lines().map(|line| {
+                                        Label::new(line.to_string())
+                                            .size(LabelSize::Small)
+                                            .buffer_font(cx)
+                                    })),
+                            )
+                        }),
                     );
                 }
                 v_flex().flex_1().min_h_0().gap_2().child(toolbar).child(rows).into_any_element()
@@ -1421,7 +1515,8 @@ impl Render for VaultView {
         let connection = self.active_connection().cloned();
         let info = self.session.as_ref().and_then(|session| session.info.clone());
 
-        let editing_elsewhere = self.form.is_some() || self.import.is_some() || self.compare.is_some();
+        let editing_elsewhere =
+            self.form.is_some() || self.import.is_some() || self.compare.is_some() || self.edit.is_some();
 
         let header = h_flex()
             .px_4()
@@ -1589,12 +1684,23 @@ impl Render for VaultView {
                             Button::new("vault-go", "Open")
                                 .label_size(LabelSize::Small)
                                 .on_click(cx.listener(|this, _, _, cx| this.go_to_path(cx))),
+                        )
+                        .child(
+                            IconButton::new("vault-new-secret", IconName::Plus)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("New secret"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.notice = None;
+                                    this.start_create(window, cx)
+                                })),
                         ),
                 )
         });
 
         let main = if let Some(form) = &self.form {
             self.render_form(form, cx).into_any_element()
+        } else if let Some(edit) = &self.edit {
+            self.render_edit(edit, cx)
         } else if let Some(import) = &self.import {
             self.render_import(import, cx)
         } else if let Some(compare) = &self.compare {
@@ -1654,6 +1760,14 @@ impl Render for VaultView {
                             .min_h_0()
                             .p_4()
                             .gap_3()
+                            .when_some(self.notice.clone().filter(|_| !editing_elsewhere), |this, notice| {
+                                this.child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Success))
+                                        .child(Label::new(notice).size(LabelSize::Small)),
+                                )
+                            })
                             .child(main),
                     ),
             )
@@ -1736,6 +1850,26 @@ fn section_header(title: impl Into<SharedString>, actions: impl IntoElement) -> 
                 .truncate(),
         )
         .child(actions)
+}
+
+/// Formatted JSON for objects and arrays, including strings that hold one.
+/// Large values are left as they are.
+fn pretty_json(value: &serde_json::Value) -> Option<String> {
+    const MAX_PRETTY_BYTES: usize = 64 * 1024;
+    let parsed;
+    let value = match value {
+        serde_json::Value::String(text) if text.len() <= MAX_PRETTY_BYTES => {
+            parsed = serde_json::from_str::<serde_json::Value>(text).ok()?;
+            &parsed
+        }
+        other => other,
+    };
+    if !matches!(value, serde_json::Value::Object(_) | serde_json::Value::Array(_)) {
+        return None;
+    }
+    serde_json::to_string_pretty(value)
+        .ok()
+        .filter(|pretty| pretty.len() <= MAX_PRETTY_BYTES)
 }
 
 /// QA-like environments orange, UAT blue, production red, as in the site list sample.

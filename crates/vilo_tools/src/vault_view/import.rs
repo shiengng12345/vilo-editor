@@ -240,6 +240,8 @@ impl VaultView {
                     site: entry.site.clone(),
                     environment: entry.environment.clone(),
                     plaintext_acknowledged: origin.starts_with("http://"),
+                    // New connections start protected; an update keeps the user's choice.
+                    protected: existing.as_ref().is_none_or(|existing| existing.protected),
                     address: origin,
                 };
                 if !token.is_empty()
