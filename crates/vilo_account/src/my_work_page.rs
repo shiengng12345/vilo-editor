@@ -428,11 +428,13 @@ impl MyWorkPage {
                             let known = state
                                 .items
                                 .iter()
-                                .map(|item| item.id)
+                                .map(|item| (item.id, item.state.clone()))
                                 .collect::<HashSet<_>>();
-                            state
-                                .items
-                                .extend(items.into_iter().filter(|item| !known.contains(&item.id)));
+                            state.items.extend(
+                                items
+                                    .into_iter()
+                                    .filter(|item| !known.contains(&(item.id, item.state.clone()))),
+                            );
                             state.total = total;
                             state.pages_loaded = page_num;
                         }
@@ -924,13 +926,13 @@ fn parse_work_items(response: &serde_json::Value) -> Result<(Vec<WorkItem>, usiz
         .iter()
         .filter_map(|entry| {
             let id = entry.pointer("/work_item_info/work_item_id")?.as_u64()?;
-            // An item waiting on several of your nodes is listed once per node.
-            if !seen.insert(id) {
-                return None;
-            }
             let state = text(entry, "/node_info/node_name")
                 .or_else(|| text(entry, "/state_info/start_state_key_name"))
                 .unwrap_or_default();
+            // An item on several of your nodes is one row per node; exact repeats are dropped.
+            if !seen.insert((id, state.clone())) {
+                return None;
+            }
             Some(WorkItem {
                 id,
                 name: text(entry, "/work_item_info/work_item_name")
@@ -1511,10 +1513,17 @@ impl MyWorkPage {
                                     .into_any_element(),
                             }
                         };
-                        let status = brief
+                        // Rows of one item on several nodes differ only by node, so name it.
+                        let status = match brief
                             .map(|brief| brief.status.clone())
                             .filter(|status| !status.is_empty())
-                            .unwrap_or_else(|| item.state.clone());
+                        {
+                            Some(status) if !item.state.is_empty() && item.state != status => {
+                                SharedString::from(format!("{status} · {}", item.state))
+                            }
+                            Some(status) => status,
+                            None => item.state.clone(),
+                        };
                         let owners = brief
                             .map(|brief| brief.owners.join(", "))
                             .map(SharedString::from);
@@ -2262,6 +2271,17 @@ mod tests {
         assert_eq!(items[0].state.as_ref(), "Pending Approval");
         assert_eq!(items[0].due.as_deref(), Some("2026-01-22"));
         assert!(parse_work_items(&serde_json::json!({ "error": "x" })).is_err());
+
+        let node = |name: &str| serde_json::json!({
+            "work_item_info": { "work_item_id": 7, "work_item_name": "Story" },
+            "node_info": { "node_name": name }
+        });
+        let (items, _) = parse_work_items(&serde_json::json!({
+            "list": [node("Dev"), node("Test"), node("Dev")]
+        }))
+        .unwrap();
+        let nodes = items.iter().map(|item| item.state.as_ref()).collect::<Vec<_>>();
+        assert_eq!(nodes, ["Dev", "Test"]);
     }
 
     #[test]
