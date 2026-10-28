@@ -314,33 +314,35 @@ impl MyWorkPage {
         let generation = self.generation;
         let store = self.store.clone();
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = with_session(&store, cx, async |session| {
-                let calls = WorkList::ALL.map(|list| {
-                    session.call(
-                        "list_todo",
-                        serde_json::json!({ "action": list.action(), "page_num": 1 }),
-                    )
-                });
-                let responses = join_all(calls).await;
-                if responses.iter().any(|response| {
-                    response
-                        .as_ref()
-                        .is_err_and(|error| error.is::<TokenRejected>())
-                }) {
-                    return Err(TokenRejected.into());
-                }
-                Ok(WorkList::ALL
-                    .into_iter()
-                    .zip(responses)
-                    .map(|(list, response)| {
-                        (
-                            list,
-                            response.and_then(|response| parse_work_items(&response)),
-                        )
+            let started = std::time::Instant::now();
+            // A session sends its requests one at a time, so each list gets its own.
+            let calls = WorkList::ALL.map(|list| {
+                let store = store.clone();
+                let mut cx = cx.clone();
+                async move {
+                    let result = with_session(&store, &mut cx, async |session| {
+                        let response = session
+                            .call(
+                                "list_todo",
+                                serde_json::json!({ "action": list.action(), "page_num": 1 }),
+                            )
+                            .await?;
+                        parse_work_items(&response)
                     })
-                    .collect::<Vec<_>>())
-            })
-            .await;
+                    .await;
+                    (list, result)
+                }
+            });
+            let lists = join_all(calls).await;
+            log::info!("my work: loaded lists in {:?}", started.elapsed());
+            let result = if lists.iter().all(|(_, result)| result.is_err()) {
+                match lists.into_iter().next() {
+                    Some((_, Err(error))) => Err(error),
+                    _ => Ok(Vec::new()),
+                }
+            } else {
+                Ok(lists)
+            };
             this.update(cx, |this, cx| {
                 if this.generation != generation {
                     return;
@@ -504,9 +506,26 @@ impl MyWorkPage {
             if let Some(previous) = previous {
                 previous.await;
             }
-            let session = match open_session(&store, cx).await {
-                Ok(session) => session,
-                Err(error) => {
+            // A session sends its requests one at a time, so open one per lane.
+            let lane_count = ENRICH_CONCURRENCY.min(missing.len());
+            let opened = join_all((0..lane_count).map(|_| {
+                let store = store.clone();
+                let mut cx = cx.clone();
+                async move { open_session(&store, &mut cx).await }
+            }))
+            .await;
+            let mut sessions = Vec::new();
+            let mut first_error = None;
+            for result in opened {
+                match result {
+                    Ok(session) => sessions.push(session),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            let sessions = match first_error {
+                Some(error) if sessions.is_empty() => {
                     log::warn!("loading Meegle item details failed: {error:#}");
                     this.update(cx, |this, cx| {
                         if this.generation == generation {
@@ -520,23 +539,32 @@ impl MyWorkPage {
                     .ok();
                     return;
                 }
+                _ => sessions,
             };
-            let session = &session;
-            let mut results = stream::iter(missing)
-                .map(|item| async move {
-                    let response = session
-                        .call(
-                            "get_workitem_brief",
-                            serde_json::json!({
-                                "project_key": item.project_key,
-                                "work_item_id": item.id.to_string(),
-                            }),
-                        )
-                        .await
-                        .and_then(|response| parse_brief(&response));
-                    (item.id, response)
-                })
-                .buffer_unordered(ENRICH_CONCURRENCY);
+            // Each lane works through every n-th row, so the top rows load first.
+            let mut lanes = sessions.iter().map(|_| Vec::new()).collect::<Vec<_>>();
+            for (index, item) in missing.into_iter().enumerate() {
+                if let Some(lane) = lanes.get_mut(index % sessions.len()) {
+                    lane.push(item);
+                }
+            }
+            let mut results = stream::select_all(sessions.iter().zip(lanes).map(
+                |(session, items)| {
+                    Box::pin(stream::iter(items).then(move |item| async move {
+                        let response = session
+                            .call(
+                                "get_workitem_brief",
+                                serde_json::json!({
+                                    "project_key": item.project_key,
+                                    "work_item_id": item.id.to_string(),
+                                }),
+                            )
+                            .await
+                            .and_then(|response| parse_brief(&response));
+                        (item.id, response)
+                    }))
+                },
+            ));
             while let Some((id, result)) = results.next().await {
                 let applied = this.update(cx, |this, cx| {
                     if this.generation != generation {
@@ -1840,7 +1868,7 @@ impl MyWorkPage {
                                     })),
                             ),
                     )
-                    .child(Label::new(item.name.clone()).size(LabelSize::Large))
+                    .child(Label::new(item.name).size(LabelSize::Large))
                     .child(
                         h_flex()
                             .gap_2()
@@ -2029,7 +2057,7 @@ impl Render for MyWorkPage {
                 Some(("my-work-sign-in", "Sign In with Meegle")),
                 cx,
             )
-        } else if self.lists.get(&self.list).is_none() {
+        } else if !self.lists.contains_key(&self.list) {
             match self.error.as_ref().or(self.list_errors.get(&self.list)) {
                 Some(error) => self.render_message(
                     format!("Couldn’t load your work: {error}"),
