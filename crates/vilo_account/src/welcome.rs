@@ -91,7 +91,7 @@ impl WelcomeModal {
             .child(
                 h_flex()
                     .w_full()
-                    .h(px(40.))
+                    .h(px(52.))
                     .justify_center()
                     .gap_2()
                     .child(Icon::new(icon).size(IconSize::Medium))
@@ -123,21 +123,28 @@ impl ModalView for WelcomeModal {
         workspace::DismissDecision::Dismiss(true)
     }
 
-    fn fade_out_background(&self) -> bool {
+    // Drawn as its own full-window overlay so the card can be sized to the window.
+    fn render_bare(&self) -> bool {
         true
     }
 }
 
+/// Share of the window the welcome card covers.
+const CARD_FRACTION: f32 = 0.7;
+
 impl Render for WelcomeModal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
+        let viewport = window.viewport_size();
+        let mut overlay = colors.elevated_surface_background;
+        overlay.fade_out(0.2);
         let status = self.store.read(cx).status().clone();
         let in_progress = matches!(status, SignInStatus::InProgress { .. });
 
         let logo = div()
-            .size(px(48.))
+            .size(px(72.))
             .flex_none()
-            .rounded_lg()
+            .rounded_xl()
             .bg(colors.text_accent.opacity(0.35))
             .flex()
             .items_center()
@@ -152,21 +159,18 @@ impl Render for WelcomeModal {
             SignInStatus::Idle => self.notice.clone().map(|notice| (notice, Color::Muted)),
         };
 
-        v_flex()
-            .key_context("ViloWelcome")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.skip(cx)))
-            .elevation_3(cx)
-            .w(px(480.))
-            .p_6()
-            .gap_5()
+        let content = v_flex()
+            .w_full()
+            .max_w(px(560.))
+            .gap_6()
             .child(
-                h_flex().gap_4().child(logo).child(
+                h_flex().gap_5().child(logo).child(
                     v_flex()
-                        .gap_0p5()
-                        .child(Headline::new("Welcome to Vilo").size(HeadlineSize::Large))
+                        .gap_1()
+                        .child(Headline::new("Welcome to Vilo").size(HeadlineSize::XLarge))
                         .child(
                             Label::new("Your workspace. Your tools. Your flow.")
+                                .size(LabelSize::Large)
                                 .color(Color::Muted),
                         ),
                 ),
@@ -225,6 +229,36 @@ impl Render for WelcomeModal {
                             .end_icon(Icon::new(IconName::ArrowRight).size(IconSize::Small))
                             .on_click(cx.listener(|this, _, _, cx| this.skip(cx))),
                     ),
+            );
+
+        div()
+            .absolute()
+            .inset_0()
+            .size_full()
+            .occlude()
+            .bg(overlay)
+            .flex()
+            .items_center()
+            .justify_center()
+            // A click outside the card means "continue without signing in".
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.skip(cx)),
+            )
+            .child(
+                v_flex()
+                    .key_context("ViloWelcome")
+                    .track_focus(&self.focus_handle)
+                    .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.skip(cx)))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .elevation_3(cx)
+                    .w(viewport.width * CARD_FRACTION)
+                    .h(viewport.height * CARD_FRACTION)
+                    .p_8()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .child(content),
             )
     }
 }
