@@ -708,6 +708,7 @@ pub fn token_refresh_params(
 const SUPPORTED_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token"];
 
 pub fn dcr_registration_body(
+    client_name: &str,
     redirect_uri: &str,
     server_grant_types: Option<&[String]>,
     scopes: &[String],
@@ -725,7 +726,7 @@ pub fn dcr_registration_body(
     };
 
     let mut body = serde_json::json!({
-        "client_name": "Zed",
+        "client_name": client_name,
         "redirect_uris": [redirect_uri],
         "grant_types": grant_types,
         "response_types": ["code"],
@@ -915,6 +916,7 @@ pub async fn resolve_client_registration(
             perform_dcr(
                 http_client,
                 &registration_endpoint,
+                "Vilo",
                 redirect_uri,
                 discovery
                     .auth_server_metadata
@@ -936,13 +938,14 @@ pub async fn resolve_client_registration(
 pub async fn perform_dcr(
     http_client: &Arc<dyn HttpClient>,
     registration_endpoint: &Url,
+    client_name: &str,
     redirect_uri: &str,
     server_grant_types: Option<&[String]>,
     scopes: &[String],
 ) -> Result<OAuthClientRegistration> {
     validate_oauth_url(registration_endpoint)?;
 
-    let body = dcr_registration_body(redirect_uri, server_grant_types, scopes);
+    let body = dcr_registration_body(client_name, redirect_uri, server_grant_types, scopes);
     let body_bytes = serde_json::to_vec(&body)?;
 
     let request = Request::builder()
@@ -955,13 +958,8 @@ pub async fn perform_dcr(
     let mut response = http_client.send(request).await?;
 
     if !response.status().is_success() {
-        let mut error_body = String::new();
-        response.body_mut().read_to_string(&mut error_body).await?;
-        bail!(
-            "DCR failed with status {}: {}",
-            response.status(),
-            error_body
-        );
+        // Error bodies can echo credentials or personal data, so only the status is reported.
+        bail!("DCR failed with status {}", response.status());
     }
 
     let mut response_body = String::new();
@@ -1041,11 +1039,16 @@ async fn post_token_request(
         let mut error_body = String::new();
         response.body_mut().read_to_string(&mut error_body).await?;
         let status = response.status();
-        // Try to parse as an OAuth error response (RFC 6749 Section 5.2).
+        // Try to parse as an OAuth error response (RFC 6749 Section 5.2). Only the error
+        // code is kept: descriptions and raw bodies can echo credentials or personal data.
         if let Ok(token_error) = serde_json::from_str::<OAuthTokenError>(&error_body) {
-            return Err(token_error.into());
+            return Err(OAuthTokenError {
+                error: token_error.error,
+                error_description: None,
+            }
+            .into());
         }
-        bail!("token request failed with status {status}: {error_body}");
+        bail!("token request failed with status {status}");
     }
 
     let mut response_body = String::new();
@@ -1908,8 +1911,8 @@ mod tests {
     #[test]
     fn test_dcr_registration_body_without_server_metadata() {
         // When server metadata is unavailable, include all supported grant types.
-        let body = dcr_registration_body("http://127.0.0.1:12345/callback", None, &[]);
-        assert_eq!(body["client_name"], "Zed");
+        let body = dcr_registration_body("Vilo", "http://127.0.0.1:12345/callback", None, &[]);
+        assert_eq!(body["client_name"], "Vilo");
         assert_eq!(body["redirect_uris"][0], "http://127.0.0.1:12345/callback");
         assert_eq!(body["grant_types"][0], "authorization_code");
         assert_eq!(body["grant_types"][1], "refresh_token");
@@ -1923,7 +1926,7 @@ mod tests {
         // When the server only supports authorization_code, omit refresh_token.
         let server_types = vec!["authorization_code".to_string()];
         let body =
-            dcr_registration_body("http://127.0.0.1:12345/callback", Some(&server_types), &[]);
+            dcr_registration_body("Vilo", "http://127.0.0.1:12345/callback", Some(&server_types), &[]);
         assert_eq!(body["grant_types"][0], "authorization_code");
         assert!(body["grant_types"].as_array().unwrap().len() == 1);
 
@@ -1933,7 +1936,7 @@ mod tests {
             "refresh_token".to_string(),
         ];
         let body =
-            dcr_registration_body("http://127.0.0.1:12345/callback", Some(&server_types), &[]);
+            dcr_registration_body("Vilo", "http://127.0.0.1:12345/callback", Some(&server_types), &[]);
         assert_eq!(body["grant_types"][0], "authorization_code");
         assert_eq!(body["grant_types"][1], "refresh_token");
     }
@@ -1942,7 +1945,7 @@ mod tests {
     fn test_dcr_registration_body_mirrors_server_scopes() {
         // When the server requests certain scopes, include those in the request
         let scopes = vec!["mcp".to_string(), "read_api".to_string()];
-        let body = dcr_registration_body("http://127.0.0.1:12345/callback", None, &scopes);
+        let body = dcr_registration_body("Vilo", "http://127.0.0.1:12345/callback", None, &scopes);
         assert_eq!(body["scope"], "mcp read_api");
     }
 
@@ -2600,6 +2603,7 @@ mod tests {
             let registration = perform_dcr(
                 &client,
                 &endpoint,
+                "Vilo",
                 "http://127.0.0.1:9999/callback",
                 None,
                 &[],
@@ -2628,6 +2632,7 @@ mod tests {
             let result = perform_dcr(
                 &client,
                 &endpoint,
+                "Vilo",
                 "http://127.0.0.1:9999/callback",
                 None,
                 &[],
