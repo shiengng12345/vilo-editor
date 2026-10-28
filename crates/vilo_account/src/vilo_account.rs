@@ -1,6 +1,6 @@
 mod callback;
 mod meegle;
-mod my_work_panel;
+mod my_work_page;
 mod welcome;
 
 use std::{
@@ -25,7 +25,7 @@ use util::ResultExt as _;
 use workspace::Workspace;
 
 pub use meegle::MEEGLE_HOSTS;
-pub use my_work_panel::MyWorkPanel;
+pub use my_work_page::OpenMyWork;
 pub use welcome::{AccountButton, WelcomeModal};
 
 /// The person signed in to this Vilo installation. Non-secret: written to the
@@ -158,7 +158,7 @@ pub fn init(cx: &mut App) {
         persist_lock: Arc::default(),
     });
     cx.set_global(GlobalAccountStore(store.clone()));
-    my_work_panel::init(cx);
+    my_work_page::init(store.clone(), cx);
 
     cx.observe_new(move |_: &mut Workspace, window, cx| {
         let Some(window) = window else {

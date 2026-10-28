@@ -62,6 +62,7 @@ pub struct HttpTransport {
     /// the start of each send so it always describes the most recent attempt.
     /// See [`Transport::auth_challenge`].
     auth_challenge: SyncMutex<Option<WwwAuthenticate>>,
+    redact_message_logs: bool,
 }
 
 impl HttpTransport {
@@ -97,6 +98,7 @@ impl HttpTransport {
             headers,
             token_provider,
             auth_challenge: SyncMutex::new(None),
+            redact_message_logs: false,
         }
     }
 
@@ -336,8 +338,20 @@ impl HttpTransport {
     }
 }
 
+impl HttpTransport {
+    /// Keeps request and response bodies out of the logs.
+    pub fn with_redacted_message_logs(mut self) -> Self {
+        self.redact_message_logs = true;
+        self
+    }
+}
+
 #[async_trait]
 impl Transport for HttpTransport {
+    fn redacts_message_logs(&self) -> bool {
+        self.redact_message_logs
+    }
+
     async fn send(&self, message: String) -> Result<()> {
         self.send_message(message).await
     }

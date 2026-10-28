@@ -6,7 +6,7 @@ use collections::HashMap;
 use context_server::{
     client::{Client, ContextServerId},
     oauth::{self, AuthServerMetadata, OAuthTokens, WwwAuthenticate},
-    protocol::ModelContextProtocol,
+    protocol::{InitializedContextServerProtocol, ModelContextProtocol},
     transport::{HttpTransport, Transport as _},
     types::{CallToolParams, Implementation, ToolResponseContent, requests::CallTool},
 };
@@ -172,7 +172,15 @@ async fn fetch_identity(resource: &Url, access_token: &str, cx: &mut AsyncApp) -
 
 /// Read-only Meegle MCP tools Vilo may call with the account's token. The token
 /// itself can do more, so this list is the boundary (VILO_IDENTITY_LOGIN_PLAN §4.1).
-const ALLOWED_TOOLS: &[&str] = &[IDENTITY_TOOL, "list_todo", "search_project_info"];
+const ALLOWED_TOOLS: &[&str] = &[
+    IDENTITY_TOOL,
+    "list_todo",
+    "search_project_info",
+    "get_workitem_brief",
+    "list_workitem_comments",
+    "get_workitem_op_record",
+    "get_node_detail",
+];
 
 /// Meegle rejected the access token (HTTP 401).
 #[derive(Debug)]
@@ -187,35 +195,35 @@ impl std::fmt::Display for TokenRejected {
 impl std::error::Error for TokenRejected {}
 
 /// Calls one Meegle MCP tool and returns the JSON document in its text output.
-pub(crate) async fn call_tool(
-    resource: &Url,
-    access_token: &str,
-    name: &str,
-    arguments: serde_json::Value,
-    cx: &mut AsyncApp,
-) -> Result<serde_json::Value> {
-    if !ALLOWED_TOOLS.contains(&name) {
-        bail!("Vilo does not call the Meegle tool {name}");
-    }
-    let http = cx.update(|cx| cx.http_client());
-    let headers = HashMap::from_iter([(
-        "Authorization".to_string(),
-        format!("Bearer {access_token}"),
-    )]);
-    let transport = Arc::new(HttpTransport::new(
-        http,
-        resource.to_string(),
-        headers,
-        cx.background_executor().clone(),
-    ));
-    let client = Client::new(
-        ContextServerId("vilo-account".into()),
-        "Vilo account".into(),
-        transport.clone(),
-        Some(REQUEST_TIMEOUT),
-        cx.clone(),
-    )?;
-    let result = async {
+/// One initialized connection to the Meegle MCP server, shared by a batch of calls.
+pub(crate) struct MeegleSession {
+    protocol: InitializedContextServerProtocol,
+    transport: Arc<HttpTransport>,
+}
+
+impl MeegleSession {
+    pub async fn connect(resource: &Url, access_token: &str, cx: &mut AsyncApp) -> Result<Self> {
+        let http = cx.update(|cx| cx.http_client());
+        let headers = HashMap::from_iter([(
+            "Authorization".to_string(),
+            format!("Bearer {access_token}"),
+        )]);
+        let transport = Arc::new(
+            HttpTransport::new(
+                http,
+                resource.to_string(),
+                headers,
+                cx.background_executor().clone(),
+            )
+            .with_redacted_message_logs(),
+        );
+        let client = Client::new(
+            ContextServerId("vilo-account".into()),
+            "Vilo account".into(),
+            transport.clone(),
+            Some(REQUEST_TIMEOUT),
+            cx.clone(),
+        )?;
         let protocol = ModelContextProtocol::new(client)
             .initialize(Implementation {
                 name: "Vilo".to_string(),
@@ -223,32 +231,63 @@ pub(crate) async fn call_tool(
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 description: None,
             })
-            .await?;
-        protocol
+            .await;
+        // The transport records a 401 separately; only that means the token is bad.
+        if transport.auth_challenge().is_some() {
+            return Err(TokenRejected.into());
+        }
+        Ok(Self {
+            protocol: protocol?,
+            transport,
+        })
+    }
+
+    /// Calls one read-only Meegle tool and returns the JSON document in its text output.
+    pub async fn call(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        if !ALLOWED_TOOLS.contains(&name) {
+            bail!("Vilo does not call the Meegle tool {name}");
+        }
+        let response = self
+            .protocol
             .request::<CallTool>(CallToolParams {
                 name: name.to_string(),
                 arguments: Some(arguments),
                 meta: None,
             })
-            .await
+            .await;
+        if self.transport.auth_challenge().is_some() {
+            return Err(TokenRejected.into());
+        }
+        let response = response?;
+        if response.is_error == Some(true) {
+            bail!("Meegle reported an error for {name}");
+        }
+        response
+            .content
+            .iter()
+            .find_map(|content| match content {
+                ToolResponseContent::Text { text } => serde_json::from_str(text).ok(),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("Meegle returned no data for {name}"))
     }
-    .await;
-    // The transport records a 401 separately; only that means the token is bad.
-    if transport.auth_challenge().is_some() {
-        return Err(TokenRejected.into());
-    }
-    let response = result?;
-    if response.is_error == Some(true) {
-        bail!("Meegle reported an error for {name}");
-    }
-    response
-        .content
-        .iter()
-        .find_map(|content| match content {
-            ToolResponseContent::Text { text } => serde_json::from_str(text).ok(),
-            _ => None,
-        })
-        .ok_or_else(|| anyhow!("Meegle returned no data for {name}"))
+}
+
+pub(crate) async fn call_tool(
+    resource: &Url,
+    access_token: &str,
+    name: &str,
+    arguments: serde_json::Value,
+    cx: &mut AsyncApp,
+) -> Result<serde_json::Value> {
+    MeegleSession::connect(resource, access_token, cx)
+        .await?
+        .call(name, arguments)
+        .await
 }
 
 /// Exchanges the stored refresh token for a fresh access token.

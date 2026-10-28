@@ -33,4 +33,9 @@ pub trait Transport: Send + Sync {
     fn auth_challenge(&self) -> Option<WwwAuthenticate> {
         None
     }
+
+    /// Whether message bodies must stay out of logs because they carry personal data.
+    fn redacts_message_logs(&self) -> bool {
+        false
+    }
 }

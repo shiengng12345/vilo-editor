@@ -1,5 +1,6 @@
+use crate::Workspace;
 use crate::dock::{Dock, PanelHandle};
-use gpui::{Action, Anchor, Entity, Focusable, Subscription};
+use gpui::{Action, Anchor, Entity, Focusable, Subscription, WeakEntity};
 use settings::SettingsStore;
 use std::sync::Arc;
 use ui::{ContextMenu, CountBadge, IconButton, PopoverMenu, Tooltip, prelude::*, rems_from_px};
@@ -7,13 +8,7 @@ use ui::{ContextMenu, CountBadge, IconButton, PopoverMenu, Tooltip, prelude::*, 
 pub const ACTIVITY_BAR_WIDTH: Pixels = px(48.);
 const ACTIVE_INDICATOR_WIDTH: Pixels = px(2.);
 /// VS Code's activity bar order; other panels follow in dock order.
-const VS_CODE_ORDER: &[&str] = &[
-    "Project Panel",
-    "Search Panel",
-    "GitPanel",
-    "My Work Panel",
-    "DebugPanel",
-];
+const VS_CODE_ORDER: &[&str] = &["Project Panel", "Search Panel", "GitPanel", "DebugPanel"];
 
 /// VS Code's Codicon and view name for a panel, keyed by its persistent name.
 fn vs_code_view(persistent_name: &str) -> Option<(&'static str, &'static str)> {
@@ -23,7 +18,6 @@ fn vs_code_view(persistent_name: &str) -> Option<(&'static str, &'static str)> {
         "GitPanel" => ("icons/vilo/codicons/source-control.svg", "Source Control"),
         "DebugPanel" => ("icons/vilo/codicons/debug-alt.svg", "Run and Debug"),
         "Outline Panel" => ("icons/vilo/codicons/list-tree.svg", "Outline"),
-        "My Work Panel" => ("icons/vilo/codicons/checklist.svg", "My Work"),
         _ => return None,
     })
 }
@@ -35,19 +29,47 @@ fn vs_code_view(persistent_name: &str) -> Option<(&'static str, &'static str)> {
 /// dock's own panel buttons.
 pub struct ActivityBar {
     left_dock: Entity<Dock>,
+    workspace: WeakEntity<Workspace>,
+    modules: Vec<ModuleItem>,
+    active_module: Option<&'static str>,
     _subscriptions: Vec<Subscription>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ModuleItem {
+    pub id: &'static str,
+    pub icon_path: &'static str,
+    pub tooltip: SharedString,
+}
+
 impl ActivityBar {
-    pub fn new(left_dock: Entity<Dock>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        left_dock: Entity<Dock>,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let subscriptions = vec![
             cx.observe(&left_dock, |_, _, cx| cx.notify()),
             cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
         ];
         Self {
             left_dock,
+            workspace,
+            modules: Vec::new(),
+            active_module: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    pub(crate) fn set_modules(
+        &mut self,
+        modules: Vec<ModuleItem>,
+        active_module: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        self.modules = modules;
+        self.active_module = active_module;
+        cx.notify();
     }
 
     fn panel_item(
@@ -63,13 +85,19 @@ impl ActivityBar {
             Some((path, name)) => (Icon::from_path(path), SharedString::from(name)),
             None => (Icon::new(zed_icon), panel.icon_tooltip(window, cx)?.into()),
         };
-        let is_active = dock.is_open() && dock.active_panel_index() == Some(index);
+        // While a module covers the code layout, no panel reads as active, and a click
+        // returns to the code layout with that panel shown.
+        let in_module = self.active_module.is_some();
+        let is_active = !in_module && dock.is_open() && dock.active_panel_index() == Some(index);
         // Clicking the active view collapses the side bar, as in VS Code.
         let action = if is_active {
             dock.toggle_action()
         } else {
             panel.toggle_action(window, cx)
         };
+        let focus_handle = dock.focus_handle(cx);
+        let workspace = self.workspace.clone();
+        let dispatch = action.boxed_clone();
         let badge = panel
             .icon_label(window, cx)
             .and_then(|label| label.parse::<usize>().ok());
@@ -77,12 +105,42 @@ impl ActivityBar {
             format!("activity-bar-{}", panel.persistent_name()).into(),
             icon,
             tooltip,
-            action,
+            Some(action),
             is_active,
             badge,
-            dock.focus_handle(cx),
+            Box::new(move |window, cx| {
+                if in_module {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.show_code(false, window, cx))
+                        .ok();
+                }
+                // Actions route through the focused element, so focus the dock first.
+                window.focus(&focus_handle, cx);
+                window.dispatch_action(dispatch.boxed_clone(), cx);
+            }),
             cx,
         ))
+    }
+
+    fn module_item(&self, module: &ModuleItem, cx: &App) -> AnyElement {
+        let id = module.id;
+        let workspace = self.workspace.clone();
+        render_item(
+            format!("activity-bar-module-{id}").into(),
+            Icon::from_path(module.icon_path),
+            module.tooltip.clone(),
+            None,
+            self.active_module == Some(id),
+            None,
+            Box::new(move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.activate_module(id, window, cx)
+                    })
+                    .ok();
+            }),
+            cx,
+        )
     }
 }
 
@@ -91,10 +149,10 @@ fn render_item(
     id: SharedString,
     icon: Icon,
     tooltip: SharedString,
-    action: Box<dyn Action>,
+    tooltip_action: Option<Box<dyn Action>>,
     is_active: bool,
     badge: Option<usize>,
-    focus_handle: gpui::FocusHandle,
+    on_click: Box<dyn Fn(&mut Window, &mut App)>,
     cx: &App,
 ) -> AnyElement {
     let colors = cx.theme().colors();
@@ -137,15 +195,11 @@ fn render_item(
                     .child(CountBadge::new(count)),
             )
         })
-        .tooltip({
-            let action = action.boxed_clone();
-            move |_window, cx| Tooltip::for_action(tooltip.clone(), &*action, cx)
+        .tooltip(move |_window, cx| match &tooltip_action {
+            Some(action) => Tooltip::for_action(tooltip.clone(), &**action, cx),
+            None => Tooltip::simple(tooltip.clone(), cx),
         })
-        .on_click(move |_, window, cx| {
-            // Actions route through the focused element, so focus the dock first.
-            window.focus(&focus_handle, cx);
-            window.dispatch_action(action.boxed_clone(), cx);
-        })
+        .on_click(move |_, window, cx| on_click(window, cx))
         .hover(move |style| style.bg(colors.ghost_element_hover).opacity(1.))
         .into_any_element()
 }
@@ -168,14 +222,23 @@ impl Render for ActivityBar {
             .into_iter()
             .filter_map(|(index, panel)| self.panel_item(index, panel, window, cx))
             .collect::<Vec<_>>();
+        items.extend(
+            self.modules
+                .iter()
+                .map(|module| self.module_item(module, cx)),
+        );
+        let extensions = zed_actions::Extensions::default().boxed_clone();
         items.push(render_item(
             "activity-bar-extensions".into(),
             Icon::from_path("icons/vilo/codicons/extensions.svg"),
             "Extensions".into(),
-            zed_actions::Extensions::default().boxed_clone(),
+            Some(extensions.boxed_clone()),
             false,
             None,
-            focus_handle,
+            Box::new(move |window, cx| {
+                window.focus(&focus_handle, cx);
+                window.dispatch_action(extensions.boxed_clone(), cx);
+            }),
             cx,
         ));
 

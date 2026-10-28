@@ -1596,6 +1596,11 @@ pub struct Workspace {
     last_active_view_id: Option<proto::ViewId>,
     status_bar: Entity<StatusBar>,
     activity_bar: Entity<activity_bar::ActivityBar>,
+    /// Vilo: full-window views (like My Work) that replace the code layout while active.
+    modules: Vec<WorkspaceModule>,
+    active_module: Option<&'static str>,
+    /// Where focus was in the code layout when a module was opened, restored on return.
+    focus_before_module: Option<FocusHandle>,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -1973,7 +1978,9 @@ impl Workspace {
         let left_dock = Dock::new(DockPosition::Left, modal_layer.clone(), window, cx);
         let bottom_dock = Dock::new(DockPosition::Bottom, modal_layer.clone(), window, cx);
         let right_dock = Dock::new(DockPosition::Right, modal_layer.clone(), window, cx);
-        let activity_bar = cx.new(|cx| activity_bar::ActivityBar::new(left_dock.clone(), cx));
+        let workspace_handle = cx.weak_entity();
+        let activity_bar =
+            cx.new(|cx| activity_bar::ActivityBar::new(left_dock.clone(), workspace_handle, cx));
         let bottom_dock_buttons = cx.new(|cx| PanelButtons::new(bottom_dock.clone(), cx));
         let right_dock_buttons = cx.new(|cx| PanelButtons::new(right_dock.clone(), cx));
         let multi_workspace = window
@@ -2101,6 +2108,9 @@ impl Workspace {
             last_active_view_id: None,
             status_bar,
             activity_bar,
+            modules: Vec::new(),
+            active_module: None,
+            focus_before_module: None,
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -4530,6 +4540,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.active_module.is_some() {
+            // The docks are hidden behind a module: reveal rather than toggle closed.
+            self.show_code(false, window, cx);
+            let dock = self.dock_at_position(dock_side).clone();
+            dock.update(cx, |dock, cx| dock.set_open(true, window, cx));
+            if let Some(panel) = dock.read(cx).active_panel() {
+                window.focus(&panel.panel_focus_handle(cx), cx);
+            }
+            return;
+        }
         let mut focus_center = false;
         let mut reveal_dock = false;
 
@@ -4760,6 +4780,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         should_focus: &mut dyn FnMut(&dyn PanelHandle, &mut Window, &mut Context<Dock>) -> bool,
     ) -> Option<Arc<dyn PanelHandle>> {
+        self.show_code(false, window, cx);
         let mut result_panel = None;
         let mut serialize = false;
         for dock in self.all_docks() {
@@ -4801,6 +4822,7 @@ impl Workspace {
 
     /// Open the panel of the given type
     pub fn open_panel<T: Panel>(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_code(false, window, cx);
         for dock in self.all_docks() {
             if let Some(panel_index) = dock.read(cx).panel_index_for_type::<T>() {
                 dock.update(cx, |dock, cx| {
@@ -4842,6 +4864,9 @@ impl Workspace {
     // Otherwise, focusing the center pane triggers dismiss_zoomed_items_to_reveal
     // which closes the zoomed dock.
     pub fn fallback_focus_handle(&self, window: &Window, cx: &App) -> FocusHandle {
+        if let Some((_, focus_handle)) = self.active_module_view() {
+            return focus_handle.clone();
+        }
         self.all_docks()
             .into_iter()
             .find_map(|dock| {
@@ -6125,6 +6150,11 @@ impl Workspace {
                 local,
                 focus_changed,
             } => {
+                // Anything that focuses an editor item (go to file, definitions, links,
+                // agent edits) must bring the code layout back into view.
+                if *focus_changed {
+                    self.show_code(false, window, cx);
+                }
                 window.invalidate_character_coordinates();
 
                 pane.update(cx, |pane, _| {
@@ -9548,9 +9578,119 @@ fn adjust_open_docks_size_by_px(
     }
 }
 
+/// Vilo: a full-window view shown instead of the code layout (docks, panes and
+/// zoomed items), selected from the activity bar. The code layout stays alive
+/// while hidden, so returning to it restores everything as it was.
+pub struct WorkspaceModule {
+    pub id: &'static str,
+    pub icon_path: &'static str,
+    pub tooltip: SharedString,
+    build: Box<dyn Fn(&mut Window, &mut Context<Workspace>) -> (AnyView, FocusHandle)>,
+    /// Built on first use and kept so the module's state survives switching away.
+    view: Option<(AnyView, FocusHandle)>,
+}
+
+impl Workspace {
+    pub fn register_module(
+        &mut self,
+        id: &'static str,
+        icon_path: &'static str,
+        tooltip: impl Into<SharedString>,
+        build: impl Fn(&mut Window, &mut Context<Workspace>) -> (AnyView, FocusHandle) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modules.iter().any(|module| module.id == id) {
+            return;
+        }
+        self.modules.push(WorkspaceModule {
+            id,
+            icon_path,
+            tooltip: tooltip.into(),
+            build: Box::new(build),
+            view: None,
+        });
+        self.sync_activity_bar(cx);
+    }
+
+    fn sync_activity_bar(&self, cx: &mut Context<Self>) {
+        let modules = self
+            .modules
+            .iter()
+            .map(|module| activity_bar::ModuleItem {
+                id: module.id,
+                icon_path: module.icon_path,
+                tooltip: module.tooltip.clone(),
+            })
+            .collect();
+        let active_module = self.active_module;
+        self.activity_bar.update(cx, |activity_bar, cx| {
+            activity_bar.set_modules(modules, active_module, cx)
+        });
+    }
+
+    pub fn modules(&self) -> &[WorkspaceModule] {
+        &self.modules
+    }
+
+    pub fn active_module(&self) -> Option<&'static str> {
+        self.active_module
+    }
+
+    pub fn activate_module(
+        &mut self,
+        id: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.modules.iter().position(|module| module.id == id) else {
+            return;
+        };
+        if self.modules[index].view.is_none() {
+            let view = (self.modules[index].build)(window, cx);
+            self.modules[index].view = Some(view);
+        }
+        if self.active_module.is_none() {
+            self.focus_before_module = window.focused(cx);
+        }
+        self.active_module = Some(id);
+        if let Some((_, focus_handle)) = &self.modules[index].view {
+            window.focus(focus_handle, cx);
+        }
+        self.sync_activity_bar(cx);
+        cx.notify();
+    }
+
+    /// Returns to the code layout. `restore_focus` is false when the caller is
+    /// about to focus something in the code layout itself.
+    pub fn show_code(&mut self, restore_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_module.take().is_none() {
+            return;
+        }
+        let previous_focus = self.focus_before_module.take();
+        if restore_focus {
+            let focus = previous_focus.unwrap_or_else(|| self.fallback_focus_handle(window, cx));
+            window.focus(&focus, cx);
+        }
+        self.sync_activity_bar(cx);
+        cx.notify();
+    }
+
+    fn active_module_view(&self) -> Option<&(AnyView, FocusHandle)> {
+        let id = self.active_module?;
+        self.modules
+            .iter()
+            .find(|module| module.id == id)?
+            .view
+            .as_ref()
+    }
+}
+
 impl Focusable for Workspace {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.active_pane.focus_handle(cx)
+        match self.active_module_view() {
+            Some((_, focus_handle)) => focus_handle.clone(),
+            None => self.active_pane.focus_handle(cx),
+        }
     }
 }
 
@@ -9565,6 +9705,7 @@ impl Render for DraggedDock {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let module_view = self.active_module_view().map(|(view, _)| view.clone());
         static FIRST_PAINT: AtomicBool = AtomicBool::new(true);
         if FIRST_PAINT.swap(false, std::sync::atomic::Ordering::Relaxed) {
             log::info!("Rendered first frame");
@@ -9743,7 +9884,7 @@ impl Render for Workspace {
                                         .absolute()
                                         .size_full()
                                     })
-                                    .when(self.zoomed.is_none(), |this| {
+                                    .when(self.zoomed.is_none() && module_view.is_none(), |this| {
                                         this.on_drag_move(cx.listener(
                                             move |workspace,
                                                   e: &DragMoveEvent<DraggedDock>,
@@ -9786,8 +9927,12 @@ impl Render for Workspace {
                                             },
                                         ))
                                     })
-                                    .child({
-                                        match bottom_dock_layout {
+                                    .when_some(module_view.clone(), |this, view| {
+                                        this.child(div().size_full().child(view))
+                                    })
+                                    .when(module_view.is_none(), |this| {
+                                        this.child({
+                                            match bottom_dock_layout {
                                     BottomDockLayout::Full => div()
                                         .flex()
                                         .flex_col()
@@ -10027,10 +10172,15 @@ impl Render for Workspace {
                                             cx,
                                         )),
                                 }
+                                        })
                                     })
-                                    .children(self.zoomed.as_ref().and_then(|view| {
-                                        let zoomed_view = view.upgrade()?;
-                                        let zoomed_element = match zoomed_paddings {
+                                    .children(
+                                        self.zoomed
+                                            .as_ref()
+                                            .filter(|_| module_view.is_none())
+                                            .and_then(|view| {
+                                                let zoomed_view = view.upgrade()?;
+                                                let zoomed_element = match zoomed_paddings {
                                             (None, None) => zoomed_view.into_any_element(),
                                             (left, right) => h_flex()
                                                 .size_full()
@@ -10060,38 +10210,40 @@ impl Render for Workspace {
                                                 })
                                                 .into_any_element(),
                                         };
-                                        let overlay = div()
-                                            .occlude()
-                                            .absolute()
-                                            .overflow_hidden()
-                                            .border_color(colors.border)
-                                            .bg(colors.background)
-                                            .child(zoomed_element)
-                                            .inset_0()
-                                            .shadow_lg();
+                                                let overlay = div()
+                                                    .occlude()
+                                                    .absolute()
+                                                    .overflow_hidden()
+                                                    .border_color(colors.border)
+                                                    .bg(colors.background)
+                                                    .child(zoomed_element)
+                                                    .inset_0()
+                                                    .shadow_lg();
 
-                                        if !WorkspaceSettings::get_global(cx).zoomed_padding {
-                                            return Some(overlay);
-                                        }
+                                                if !WorkspaceSettings::get_global(cx).zoomed_padding
+                                                {
+                                                    return Some(overlay);
+                                                }
 
-                                        Some(match self.zoomed_position {
-                                            Some(DockPosition::Left) => {
-                                                overlay.right_2().border_r_1()
-                                            }
-                                            Some(DockPosition::Right) => {
-                                                overlay.left_2().border_l_1()
-                                            }
-                                            Some(DockPosition::Bottom) => {
-                                                overlay.top_2().border_t_1()
-                                            }
-                                            None => overlay
-                                                .top_2()
-                                                .bottom_2()
-                                                .left_2()
-                                                .right_2()
-                                                .border_1(),
-                                        })
-                                    }))
+                                                Some(match self.zoomed_position {
+                                                    Some(DockPosition::Left) => {
+                                                        overlay.right_2().border_r_1()
+                                                    }
+                                                    Some(DockPosition::Right) => {
+                                                        overlay.left_2().border_l_1()
+                                                    }
+                                                    Some(DockPosition::Bottom) => {
+                                                        overlay.top_2().border_t_1()
+                                                    }
+                                                    None => overlay
+                                                        .top_2()
+                                                        .bottom_2()
+                                                        .left_2()
+                                                        .right_2()
+                                                        .border_1(),
+                                                })
+                                            }),
+                                    )
                                     .children(self.render_notifications(window, cx)),
                             ),
                     )
@@ -14672,6 +14824,58 @@ mod tests {
             let (top, nested) = nested_axis(workspace);
             assert_eq!(*top.flexes.lock(), vec![1.0; top.members.len()]);
             assert_eq!(*nested.flexes.lock(), vec![1.0; nested.members.len()]);
+        });
+    }
+
+    struct TestModuleView(FocusHandle);
+
+    impl Render for TestModuleView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.0)
+        }
+    }
+
+    #[gpui::test]
+    async fn test_modules_cover_code_and_return_on_code_actions(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.register_module(
+                "test-module",
+                "icons/test.svg",
+                "Test",
+                |_, cx| {
+                    let focus_handle = cx.focus_handle();
+                    let view = cx.new(|_| TestModuleView(focus_handle.clone()));
+                    (view.into(), focus_handle)
+                },
+                cx,
+            );
+
+            workspace.activate_module("test-module", window, cx);
+            assert_eq!(workspace.active_module(), Some("test-module"));
+            // A dock shortcut reveals the code layout with that dock open, never closes it.
+            workspace.toggle_dock(DockPosition::Left, window, cx);
+            assert_eq!(workspace.active_module(), None);
+            assert!(workspace.left_dock().read(cx).is_open());
+
+            workspace.activate_module("test-module", window, cx);
+        });
+
+        // Opening an item with focus (go to file, links, ...) returns to the code layout.
+        let item = cx.new(TestItem::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.active_module(), None)
         });
     }
 

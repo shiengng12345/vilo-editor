@@ -288,9 +288,14 @@ impl Client {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<()> {
         let mut receiver = transport.receive();
+        let redact = transport.redacts_message_logs();
 
         while let Some(message) = receiver.next().await {
-            log::trace!("recv: {message}");
+            if redact {
+                log::trace!("recv: <{} bytes, redacted>", message.len());
+            } else {
+                log::trace!("recv: {message}");
+            }
             if let Ok(request) = serde_json::from_str::<AnyRequest>(&message) {
                 let mut request_handlers = request_handlers.lock();
                 if let Some(handler) = request_handlers.get_mut(request.method) {
@@ -313,7 +318,14 @@ impl Client {
                     cx,
                 )
             } else {
-                log::error!("Unhandled JSON from context_server: {}", message);
+                if redact {
+                    log::error!(
+                        "Unhandled JSON from context_server ({} bytes)",
+                        message.len()
+                    );
+                } else {
+                    log::error!("Unhandled JSON from context_server: {}", message);
+                }
             }
         }
 
@@ -348,8 +360,13 @@ impl Client {
                 response_handlers.lock().take();
             }
         });
+        let redact = transport.redacts_message_logs();
         while let Ok(message) = outbound_rx.recv().await {
-            log::trace!("outgoing message: {}", message);
+            if redact {
+                log::trace!("outgoing message: <{} bytes, redacted>", message.len());
+            } else {
+                log::trace!("outgoing message: {}", message);
+            }
             if let Err(err) = transport.send(message).await {
                 log::debug!("transport send failed: {:#}", err);
                 *last_transport_error.lock() = Some(err);
