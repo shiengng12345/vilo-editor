@@ -1,4 +1,5 @@
 mod callback;
+mod github;
 mod meegle;
 mod my_work_page;
 mod welcome;
@@ -45,12 +46,25 @@ pub struct AccountRecord {
     pub credential_url: String,
 }
 
+/// A GitHub account verified with `/user`. Identity only: the token is dropped
+/// right after the check, so nothing about GitHub is kept in the keychain.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GithubIdentity {
+    pub id: u64,
+    pub login: String,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub verified_at_unix: u64,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct AccountFile {
     #[serde(default)]
     welcome_seen: bool,
     #[serde(default)]
     account: Option<AccountRecord>,
+    #[serde(default)]
+    github: Option<GithubIdentity>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -92,6 +106,8 @@ struct CachedAccess {
 pub enum SignInStatus {
     Idle,
     InProgress { host: SharedString },
+    /// GitHub Device Flow: the user types this code on GitHub's page.
+    GithubCode { user_code: SharedString },
     Failed(SharedString),
 }
 
@@ -109,6 +125,7 @@ pub struct AccountStore {
     path: PathBuf,
     welcome_seen: bool,
     account: Option<AccountRecord>,
+    github: Option<GithubIdentity>,
     /// Bumped on every sign-in, sign-out and cancel, so work started under an
     /// older epoch can tell it was superseded and must not commit.
     epoch: u64,
@@ -146,6 +163,7 @@ pub fn init(cx: &mut App) {
         path,
         welcome_seen: file.welcome_seen,
         account: file.account,
+        github: file.github,
         epoch: 0,
         pending: None,
         status: SignInStatus::Idle,
@@ -165,7 +183,11 @@ pub fn init(cx: &mut App) {
             return;
         };
         let state = store.read(cx);
-        if state.welcome_seen || state.account.is_some() || welcome_disabled() {
+        if state.welcome_seen
+            || state.account.is_some()
+            || state.github.is_some()
+            || welcome_disabled()
+        {
             return;
         }
         let store = store.clone();
@@ -191,6 +213,10 @@ impl AccountStore {
 
     pub fn account(&self) -> Option<&AccountRecord> {
         self.account.as_ref()
+    }
+
+    pub fn github(&self) -> Option<&GithubIdentity> {
+        self.github.as_ref()
     }
 
     pub fn status(&self) -> &SignInStatus {
@@ -324,6 +350,90 @@ impl AccountStore {
         cx.notify();
     }
 
+    pub fn sign_in_with_github(&mut self, cx: &mut Context<Self>) {
+        self.epoch += 1;
+        let epoch = self.epoch;
+        let attempt_id = uuid::Uuid::new_v4().simple().to_string();
+        self.status = SignInStatus::InProgress {
+            host: "github.com".into(),
+        };
+        self.pending = Some(PendingSignIn {
+            attempt_id,
+            _task: cx.spawn(async move |this, cx| {
+                let result = async {
+                    let http = cx.update(|cx| cx.http_client());
+                    let code = github::request_device_code(&http).await?;
+                    this.update(cx, |this, cx| {
+                        if this.epoch == epoch {
+                            this.status = SignInStatus::GithubCode {
+                                user_code: code.user_code.clone().into(),
+                            };
+                            cx.notify();
+                        }
+                    })?;
+                    cx.update(|cx| cx.open_url(github::VERIFICATION_URL));
+                    let token = github::wait_for_token(&http, &code, cx).await?;
+                    let user = github::fetch_user(&http, &token).await?;
+                    let identity = GithubIdentity {
+                        id: user.id,
+                        login: user.login,
+                        name: user.name.filter(|name| !name.is_empty()),
+                        avatar_url: user.avatar_url,
+                        verified_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+                    };
+                    let committed = this.update(cx, |this, cx| {
+                        if this.epoch != epoch {
+                            return None;
+                        }
+                        let previous = this.github.replace(identity);
+                        let previous_welcome_seen = std::mem::replace(&mut this.welcome_seen, true);
+                        Some((previous, previous_welcome_seen, this.persist(cx)))
+                    })?;
+                    let Some((previous, previous_welcome_seen, persist)) = committed else {
+                        return Ok(());
+                    };
+                    if let Err(error) = persist.await {
+                        // Keep memory and disk in agreement.
+                        this.update(cx, |this, cx| {
+                            this.github = previous;
+                            this.welcome_seen = previous_welcome_seen;
+                            cx.notify();
+                        })?;
+                        return Err(error.context("Vilo could not save the account"));
+                    }
+                    this.update(cx, |this, cx| {
+                        if this.epoch == epoch {
+                            this.pending = None;
+                            this.status = SignInStatus::Idle;
+                        }
+                        cx.emit(AccountEvent::SignedIn);
+                        cx.notify();
+                    })
+                }
+                .await;
+                if let Err(error) = result {
+                    log::warn!("GitHub sign-in failed: {error:#}");
+                    this.update(cx, |this, cx| {
+                        if this.epoch == epoch {
+                            this.pending = None;
+                            this.status = SignInStatus::Failed(error.to_string().into());
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }
+            }),
+        });
+        cx.notify();
+    }
+
+    pub fn disconnect_github(&mut self, cx: &mut Context<Self>) {
+        if self.github.take().is_some() {
+            self.persist(cx).detach_and_log_err(cx);
+            cx.notify();
+        }
+    }
+
     pub fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
         if self.pending.take().is_some() {
             self.epoch += 1;
@@ -365,6 +475,7 @@ impl AccountStore {
         let file = AccountFile {
             welcome_seen: self.welcome_seen,
             account: self.account.clone(),
+            github: self.github.clone(),
         };
         cx.background_spawn(async move {
             let _guard = lock.lock().await;

@@ -8,7 +8,7 @@ use ui::{
 };
 use workspace::{ModalView, Workspace};
 
-use crate::{AccountEvent, AccountStore, MEEGLE_HOSTS, SignInStatus};
+use crate::{AccountEvent, AccountStore, MEEGLE_HOSTS, SignInStatus, github::VERIFICATION_URL as GITHUB_VERIFICATION_URL};
 
 /// The sign-in screen shown on first launch and from the title bar. Skipping it
 /// is always allowed: Vilo works the same without an account.
@@ -62,7 +62,11 @@ impl WelcomeModal {
                 });
                 None
             }
-            Provider::GitHub => Some("Signing in with GitHub is coming soon.".into()),
+            Provider::GitHub => {
+                self.store
+                    .update(cx, |store, cx| store.sign_in_with_github(cx));
+                None
+            }
             Provider::Google => Some("Signing in with Google is coming soon.".into()),
         };
         cx.notify();
@@ -139,7 +143,10 @@ impl Render for WelcomeModal {
         let mut overlay = colors.elevated_surface_background;
         overlay.fade_out(0.2);
         let status = self.store.read(cx).status().clone();
-        let in_progress = matches!(status, SignInStatus::InProgress { .. });
+        let in_progress = matches!(
+            status,
+            SignInStatus::InProgress { .. } | SignInStatus::GithubCode { .. }
+        );
 
         let logo = div()
             .size(px(72.))
@@ -151,10 +158,18 @@ impl Render for WelcomeModal {
             .justify_center()
             .child(Headline::new("V").size(HeadlineSize::Large));
 
+        let github_code = match &status {
+            SignInStatus::GithubCode { user_code } => Some(user_code.clone()),
+            _ => None,
+        };
         let note: Option<(SharedString, Color)> = match &status {
             SignInStatus::InProgress { .. } => {
                 Some(("Finish signing in in your browser…".into(), Color::Muted))
             }
+            SignInStatus::GithubCode { .. } => Some((
+                "Enter this code on the GitHub page that just opened:".into(),
+                Color::Muted,
+            )),
             SignInStatus::Failed(message) => Some((message.clone(), Color::Error)),
             SignInStatus::Idle => self.notice.clone().map(|notice| (notice, Color::Muted)),
         };
@@ -202,6 +217,30 @@ impl Render for WelcomeModal {
                     h_flex()
                         .gap_2()
                         .child(Label::new(message).size(LabelSize::Small).color(color))
+                        .when_some(github_code.clone(), |this, user_code| {
+                            this.child(
+                                Label::new(user_code.clone())
+                                    .size(LabelSize::Large)
+                                    .weight(gpui::FontWeight::BOLD)
+                                    .buffer_font(cx),
+                            )
+                            .child(
+                                Button::new("copy-github-code", "Copy")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            user_code.to_string(),
+                                        ))
+                                    }),
+                            )
+                            .child(
+                                Button::new("open-github-device", "Open GitHub")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(|_, _, cx| cx.open_url(GITHUB_VERIFICATION_URL)),
+                            )
+                        })
                         .when(in_progress, |this| {
                             this.child(
                                 Button::new("cancel-sign-in", "Cancel")
@@ -280,53 +319,97 @@ impl RenderOnce for AccountButton {
         let Some(store) = AccountStore::global(cx) else {
             return gpui::Empty.into_any_element();
         };
-        let Some(account) = store.read(cx).account().cloned() else {
-            let workspace = self.workspace;
+        let workspace = self.workspace;
+        let open_welcome = {
+            let store = store.clone();
+            let workspace = workspace.clone();
+            move |window: &mut Window, cx: &mut App| {
+                let store = store.clone();
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, |window, cx| {
+                            WelcomeModal::new(store, window, cx)
+                        })
+                    })
+                    .ok();
+            }
+        };
+        let account = store.read(cx).account().cloned();
+        let github = store.read(cx).github().cloned();
+        if account.is_none() && github.is_none() {
             return Button::new("vilo-sign-in", "Sign In")
                 .label_size(LabelSize::Small)
-                .on_click(move |_, window, cx| {
-                    let store = store.clone();
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.toggle_modal(window, cx, |window, cx| {
-                                WelcomeModal::new(store, window, cx)
-                            })
-                        })
-                        .ok();
-                })
+                .on_click(move |_, window, cx| open_welcome(window, cx))
                 .into_any_element();
-        };
+        }
 
+        let (display_name, avatar_url) = match (&account, &github) {
+            (Some(account), _) => (account.display_name.clone(), account.avatar_url.clone()),
+            (None, Some(github)) => (
+                github.name.clone().unwrap_or_else(|| github.login.clone()),
+                github.avatar_url.clone(),
+            ),
+            (None, None) => return gpui::Empty.into_any_element(),
+        };
         let trigger = ButtonLike::new("vilo-account")
-            .tooltip(Tooltip::text(account.display_name.clone()))
-            .child(match account.avatar_url.clone() {
+            .tooltip(Tooltip::text(display_name.clone()))
+            .child(match avatar_url {
                 Some(avatar) => Avatar::new(avatar).size(rems(1.)).into_any_element(),
-                None => Label::new(account.display_name.clone())
+                None => Label::new(display_name.clone())
                     .size(LabelSize::Small)
                     .into_any_element(),
             });
-        let host = url::Url::parse(&account.issuer)
-            .ok()
-            .and_then(|issuer| issuer.host_str().map(str::to_string))
-            .unwrap_or_default();
 
         PopoverMenu::new("vilo-account-menu")
             .trigger(trigger)
             .anchor(gpui::Anchor::TopRight)
             .menu(move |window, cx| {
                 let store = store.clone();
-                let mut title = account.display_name.clone();
-                if let Some(email) = &account.email {
-                    title = format!("{title} · {email}");
-                }
-                let host = host.clone();
-                Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                    menu.header(title)
-                        .label(format!("Signed in with Meegle ({host})"))
-                        .separator()
-                        .entry("Sign Out", None, move |_, cx| {
-                            store.update(cx, |store, cx| store.sign_out(cx));
-                        })
+                let account = account.clone();
+                let github = github.clone();
+                let open_welcome = open_welcome.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    if let Some(account) = &account {
+                        let mut title = account.display_name.clone();
+                        if let Some(email) = &account.email {
+                            title = format!("{title} · {email}");
+                        }
+                        let host = url::Url::parse(&account.issuer)
+                            .ok()
+                            .and_then(|issuer| issuer.host_str().map(str::to_string))
+                            .unwrap_or_default();
+                        let store = store.clone();
+                        menu = menu
+                            .header(title)
+                            .label(format!("Signed in with Meegle ({host})"))
+                            .entry("Sign Out of Meegle", None, move |_, cx| {
+                                store.update(cx, |store, cx| store.sign_out(cx));
+                            })
+                            .separator();
+                    }
+                    match &github {
+                        Some(github) => {
+                            let store = store.clone();
+                            menu = menu
+                                .header(format!("GitHub · @{}", github.login))
+                                .entry("Disconnect GitHub", None, move |_, cx| {
+                                    store.update(cx, |store, cx| store.disconnect_github(cx));
+                                });
+                        }
+                        None => {
+                            let open_welcome = open_welcome.clone();
+                            menu = menu.entry("Connect GitHub…", None, move |window, cx| {
+                                open_welcome(window, cx)
+                            });
+                        }
+                    }
+                    if account.is_none() {
+                        let open_welcome = open_welcome.clone();
+                        menu = menu.entry("Connect Meegle…", None, move |window, cx| {
+                            open_welcome(window, cx)
+                        });
+                    }
+                    menu
                 }))
             })
             .into_any_element()
