@@ -329,18 +329,32 @@ impl JenkinsClient {
         })
     }
 
+    /// Parameter names, types and static choices. Fast: it leaves out default
+    /// values, which Active Choices computes by running scripts.
     pub async fn parameter_definitions(&self, job: &[String]) -> Result<Vec<ParameterDefinition>, JenkinsError> {
         let (body, _) = self
             .get(
-                &format!(
-                    "{}api/json?tree=property[parameterDefinitions[name,type,description,choices,defaultParameterValue[value]]]",
-                    job_path(job)
-                ),
+                &format!("{}api/json?tree=property[parameterDefinitions[name,type,description,choices]]", job_path(job)),
                 false,
             )
             .await?;
         let value: serde_json::Value = parse_lenient(&body)?;
         Ok(parse_definitions(&value))
+    }
+
+    /// Each parameter's default value, by name. Slow on jobs with Active Choices.
+    pub async fn parameter_defaults(&self, job: &[String]) -> Result<Vec<(String, Option<String>)>, JenkinsError> {
+        let (body, _) = self
+            .get(
+                &format!("{}api/json?tree=property[parameterDefinitions[name,type,defaultParameterValue[value]]]", job_path(job)),
+                false,
+            )
+            .await?;
+        let value: serde_json::Value = parse_lenient(&body)?;
+        Ok(parse_definitions(&value)
+            .into_iter()
+            .map(|definition| (definition.name, definition.default))
+            .collect())
     }
 
     /// The build a queue item turned into. Polled after a build request.

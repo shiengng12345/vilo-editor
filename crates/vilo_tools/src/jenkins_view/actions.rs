@@ -1,4 +1,8 @@
-use std::{io::Write as _, sync::Arc, time::Duration};
+use std::{
+    io::Write as _,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use editor::Editor;
 use gpui::{Entity, Subscription, Task, Window, prelude::*};
@@ -10,6 +14,20 @@ use crate::jenkins::{
     WriteError, WriteOutcome,
 };
 
+/// Parameter definitions, build page sessions and cascade choices are reused
+/// for this long, so reopening a job is instant.
+pub(super) const FORM_CACHE: Duration = Duration::from_secs(5 * 60);
+
+/// What Vilo remembers about a job's build form.
+#[derive(Default)]
+pub(super) struct JobCache {
+    /// With default values filled in; only stored once those arrived.
+    definitions: Option<(Vec<ParameterDefinition>, Instant)>,
+    form: Option<(Arc<FormSession>, Instant)>,
+    /// Choices per cascade and referenced values.
+    choices: collections::HashMap<String, (Vec<ChoiceOption>, Instant)>,
+}
+
 /// How long Vilo follows a queued build before leaving it to the builds list.
 const QUEUE_FOLLOW: Duration = Duration::from_secs(10 * 60);
 const QUEUE_POLL: Duration = Duration::from_secs(1);
@@ -20,6 +38,10 @@ enum FieldValue {
     Flag(bool),
     /// An Active Choices cascade, recomputed by Jenkins from the fields it references.
     Cascade(Cascade),
+    /// A cascade whose wiring on the build page is still loading.
+    PendingCascade { wanted: Option<Vec<String>> },
+    /// A parameter Vilo cannot fill; the job is sent to Jenkins' own page.
+    Unavailable,
 }
 
 #[derive(Clone, PartialEq)]
@@ -43,6 +65,8 @@ struct Cascade {
 struct Field {
     definition: ParameterDefinition,
     value: FieldValue,
+    /// Set by the user or copied from a build: defaults arriving later leave it alone.
+    keep: bool,
 }
 
 enum Status {
@@ -69,6 +93,9 @@ enum Kind {
 pub(super) struct ActionState {
     job: Vec<String>,
     kind: Kind,
+    /// Default values arrive after the form is shown; submitting waits for them.
+    defaults_ready: bool,
+    _loads: Vec<Task<()>>,
     /// The build page session that the cascades' choices are computed in.
     form: Option<Arc<FormSession>>,
     /// Bumped per cascade run; a run that is no longer the latest stops applying.
@@ -98,6 +125,12 @@ fn append_audit(line: serde_json::Value, cx: &mut gpui::App) {
         writeln!(file, "{line}")
     })
     .detach_and_log_err(cx);
+}
+
+fn needs_form(definitions: &[ParameterDefinition]) -> bool {
+    definitions
+        .iter()
+        .any(|definition| matches!(&definition.kind, ParameterKind::Unsupported(kind) if kind == "CascadeChoiceParameter"))
 }
 
 /// Cascades sorted so that each comes after the cascades it reads.
@@ -176,98 +209,15 @@ impl JenkinsView {
         let Some(client) = self.session.as_ref().map(|session| session.client.clone()) else {
             return;
         };
-        let generation = self.generation;
-        let definitions_job = job.clone();
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let result = client.parameter_definitions(&definitions_job).await;
-            let needs_form = result.as_ref().is_ok_and(|list| {
-                list.iter()
-                    .any(|definition| matches!(&definition.kind, ParameterKind::Unsupported(kind) if kind == "CascadeChoiceParameter"))
-            });
-            let form = if needs_form { Some(client.open_form(&definitions_job).await) } else { None };
-            this.update_in(cx, |this, window, cx| {
-                if this.generation != generation {
-                    return;
-                }
-                let Some(action) = &mut this.action else {
-                    return;
-                };
-                let form = match form {
-                    Some(Ok(form)) => Some(Arc::new(form)),
-                    Some(Err(error)) => {
-                        action.status = Status::Editing(Some(format!("Could not load the job's build page: {error}").into()));
-                        None
-                    }
-                    None => None,
-                };
-                let Kind::Build { definitions, fields, from } = &mut action.kind else {
-                    return;
-                };
-                let mut subscriptions = Vec::new();
-                match result {
-                    Ok(list) => {
-                        let previous = from.as_ref().map(|(_, parameters)| parameters.clone()).unwrap_or_default();
-                        let referenced = form
-                            .as_ref()
-                            .map(|form| form.cascades.iter().flat_map(|cascade| cascade.referenced.clone()).collect::<Vec<_>>())
-                            .unwrap_or_default();
-                        *fields = list
-                            .iter()
-                            .map(|definition| {
-                                // Passwords are never copied from an earlier build.
-                                let copied = (definition.kind != ParameterKind::Password)
-                                    .then(|| previous.iter().find(|(name, _)| *name == definition.name).map(|(_, value)| value.clone()))
-                                    .flatten();
-                                let spec = form.as_ref().and_then(|form| {
-                                    form.cascades.iter().find(|cascade| cascade.name == definition.name).cloned()
-                                });
-                                let initial = copied.clone().or_else(|| definition.default.clone()).unwrap_or_default();
-                                let value = match (&definition.kind, spec) {
-                                    (ParameterKind::Unsupported(kind), Some(spec)) if kind == "CascadeChoiceParameter" => {
-                                        FieldValue::Cascade(Cascade {
-                                            spec,
-                                            options: Vec::new(),
-                                            selected: Vec::new(),
-                                            state: CascadeState::Loading,
-                                            wanted: copied.map(|value| {
-                                                value.split(',').map(str::to_string).filter(|value| !value.is_empty()).collect()
-                                            }),
-                                            note: None,
-                                        })
-                                    }
-                                    (ParameterKind::Choice(_), _) => FieldValue::Choice(initial),
-                                    (ParameterKind::Boolean, _) => FieldValue::Flag(initial == "true"),
-                                    (ParameterKind::Password, _) => FieldValue::Text(editor("value", "", true, window, cx)),
-                                    _ => {
-                                        let input = editor("value", &initial, false, window, cx);
-                                        // Typing in a field that cascades read recomputes them.
-                                        if referenced.contains(&definition.name) {
-                                            subscriptions.push(cx.subscribe(&input, |this, _, event: &editor::EditorEvent, cx| {
-                                                if matches!(event, editor::EditorEvent::BufferEdited) {
-                                                    this.run_cascades(cx);
-                                                }
-                                            }));
-                                        }
-                                        FieldValue::Text(input)
-                                    }
-                                };
-                                Field { definition: definition.clone(), value }
-                            })
-                            .collect();
-                        *definitions = Fetch::Loaded(list);
-                    }
-                    Err(error) => *definitions = Fetch::Failed(error.to_string().into()),
-                }
-                action.form = form;
-                action._subscriptions = subscriptions;
-                this.run_cascades(cx);
-                cx.notify();
-            })
-            .ok();
-        });
+        let fresh = |at: &Instant| at.elapsed() < FORM_CACHE;
+        let cache = self.job_cache.entry(job.clone()).or_default();
+        let cached_definitions = cache.definitions.as_ref().filter(|(_, at)| fresh(at)).map(|(list, _)| list.clone());
+        let cached_form = cache.form.as_ref().filter(|(_, at)| fresh(at)).map(|(form, _)| form.clone());
         self.action = Some(ActionState {
-            job,
+            job: job.clone(),
             kind: Kind::Build { definitions: Fetch::Loading, fields: Vec::new(), from },
+            defaults_ready: false,
+            _loads: Vec::new(),
             form: None,
             cascade_revision: 0,
             cascade_rerun: false,
@@ -276,15 +226,241 @@ impl JenkinsView {
             review: false,
             confirm: editor("Type the job name", "", false, window, cx),
             status: Status::Editing(None),
-            _task: Some(task),
+            _task: None,
         });
+        if let Some(definitions) = cached_definitions {
+            let needs_form = needs_form(&definitions);
+            self.install_fields(definitions, true, window, cx);
+            match (needs_form, cached_form) {
+                (true, Some(form)) => self.attach_form(form, cx),
+                (true, None) => self.load_form(job, client, window, cx),
+                (false, _) => {}
+            }
+            cx.notify();
+            return;
+        }
+        let generation = self.generation;
+        let task = cx.spawn_in(window, async move |this, cx| {
+            // Names, types and static choices come back fast; show the form with them.
+            let fast = client.parameter_definitions(&job).await;
+            this.update_in(cx, |this, window, cx| {
+                if this.generation != generation || !this.action.as_ref().is_some_and(|action| action.job == job) {
+                    return;
+                }
+                match fast {
+                    Ok(list) => {
+                        let needs_form = needs_form(&list);
+                        this.install_fields(list, false, window, cx);
+                        if needs_form {
+                            this.load_form(job.clone(), client.clone(), window, cx);
+                        }
+                        this.load_defaults(job.clone(), client.clone(), window, cx);
+                    }
+                    Err(error) => {
+                        if let Some(ActionState { kind: Kind::Build { definitions, .. }, .. }) = &mut this.action {
+                            *definitions = Fetch::Failed(error.to_string().into());
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(action) = &mut self.action {
+            action._task = Some(task);
+        }
         cx.notify();
+    }
+
+    /// Builds the fields. Values copied from a build win over defaults.
+    fn install_fields(&mut self, list: Vec<ParameterDefinition>, defaults_ready: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = &mut self.action else {
+            return;
+        };
+        let Kind::Build { definitions, fields, from } = &mut action.kind else {
+            return;
+        };
+        let previous = from.as_ref().map(|(_, parameters)| parameters.clone()).unwrap_or_default();
+        let mut subscriptions = Vec::new();
+        *fields = list
+            .iter()
+            .map(|definition| {
+                // Passwords are never copied from an earlier build.
+                let copied = (definition.kind != ParameterKind::Password)
+                    .then(|| previous.iter().find(|(name, _)| *name == definition.name).map(|(_, value)| value.clone()))
+                    .flatten();
+                let keep = copied.is_some();
+                let initial = copied.clone().or_else(|| definition.default.clone()).unwrap_or_default();
+                let value = match &definition.kind {
+                    ParameterKind::Unsupported(kind) if kind == "CascadeChoiceParameter" => FieldValue::PendingCascade {
+                        wanted: copied.map(|value| value.split(',').map(str::to_string).filter(|value| !value.is_empty()).collect()),
+                    },
+                    ParameterKind::Unsupported(_) => FieldValue::Unavailable,
+                    ParameterKind::Choice(_) => FieldValue::Choice(initial),
+                    ParameterKind::Boolean => FieldValue::Flag(initial == "true"),
+                    ParameterKind::Password => FieldValue::Text(editor("value", "", true, window, cx)),
+                    ParameterKind::String | ParameterKind::Text => {
+                        let input = editor("value", &initial, false, window, cx);
+                        let name = definition.name.clone();
+                        // Typing in a field that cascades read recomputes them.
+                        subscriptions.push(cx.subscribe(&input, move |this, _, event: &editor::EditorEvent, cx| {
+                            if matches!(event, editor::EditorEvent::BufferEdited) {
+                                this.field_changed(&name, cx);
+                            }
+                        }));
+                        FieldValue::Text(input)
+                    }
+                };
+                Field { definition: definition.clone(), value, keep }
+            })
+            .collect();
+        *definitions = Fetch::Loaded(list);
+        action._subscriptions = subscriptions;
+        action.defaults_ready = defaults_ready;
+    }
+
+    fn load_form(&mut self, job: Vec<String>, client: crate::jenkins::JenkinsClient, window: &mut Window, cx: &mut Context<Self>) {
+        let generation = self.generation;
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let form = client.open_form(&job).await;
+            this.update(cx, |this, cx| {
+                if this.generation != generation || !this.action.as_ref().is_some_and(|action| action.job == job) {
+                    return;
+                }
+                match form {
+                    Ok(form) => {
+                        let form = Arc::new(form);
+                        this.job_cache.entry(job.clone()).or_default().form = Some((form.clone(), Instant::now()));
+                        this.attach_form(form, cx);
+                    }
+                    Err(error) => {
+                        if let Some(action) = &mut this.action {
+                            action.status = Status::Editing(Some(format!("Could not load the job's build page: {error}").into()));
+                            if let Kind::Build { fields, .. } = &mut action.kind {
+                                for field in fields.iter_mut() {
+                                    if matches!(field.value, FieldValue::PendingCascade { .. }) {
+                                        field.value = FieldValue::Unavailable;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(action) = &mut self.action {
+            action._loads.push(task);
+        }
+    }
+
+    fn load_defaults(&mut self, job: Vec<String>, client: crate::jenkins::JenkinsClient, window: &mut Window, cx: &mut Context<Self>) {
+        let generation = self.generation;
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let defaults = client.parameter_defaults(&job).await;
+            this.update_in(cx, |this, window, cx| {
+                if this.generation != generation || !this.action.as_ref().is_some_and(|action| action.job == job) {
+                    return;
+                }
+                match defaults {
+                    Ok(defaults) => this.apply_defaults(&job, defaults, window, cx),
+                    Err(error) => {
+                        if let Some(action) = &mut this.action {
+                            action.status = Status::Editing(Some(format!("Could not load default values: {error}").into()));
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(action) = &mut self.action {
+            action._loads.push(task);
+        }
+    }
+
+    /// Fills defaults into fields nobody has set yet, then remembers the definitions.
+    fn apply_defaults(&mut self, job: &[String], defaults: Vec<(String, Option<String>)>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = &mut self.action else {
+            return;
+        };
+        let Kind::Build { definitions, fields, .. } = &mut action.kind else {
+            return;
+        };
+        let mut changed = Vec::new();
+        for field in fields.iter_mut() {
+            let Some(default) = defaults.iter().find(|(name, _)| *name == field.definition.name).and_then(|(_, value)| value.clone()) else {
+                continue;
+            };
+            field.definition.default = (field.definition.kind != ParameterKind::Password).then(|| default.clone());
+            if field.keep {
+                continue;
+            }
+            match &mut field.value {
+                FieldValue::Choice(choice) => *choice = default,
+                FieldValue::Flag(flag) => *flag = default == "true",
+                FieldValue::Text(input) if field.definition.kind != ParameterKind::Password => {
+                    if input.read(cx).text(cx).is_empty() {
+                        input.update(cx, |editor, cx| editor.set_text(default, window, cx));
+                    }
+                }
+                _ => continue,
+            }
+            changed.push(field.definition.name.clone());
+        }
+        if let Fetch::Loaded(list) = definitions {
+            for definition in list.iter_mut() {
+                if let Some((_, value)) = defaults.iter().find(|(name, _)| *name == definition.name)
+                    && definition.kind != ParameterKind::Password
+                {
+                    definition.default = value.clone();
+                }
+            }
+            self.job_cache.entry(job.to_vec()).or_default().definitions = Some((list.clone(), Instant::now()));
+        }
+        action.defaults_ready = true;
+        // Cascades that read a value that just changed need recomputing.
+        if action.form.is_some() && !changed.is_empty() {
+            self.run_cascades(cx);
+        }
+    }
+
+    /// Wires the cascades found on the build page to their fields.
+    fn attach_form(&mut self, form: Arc<FormSession>, cx: &mut Context<Self>) {
+        let Some(action) = &mut self.action else {
+            return;
+        };
+        let Kind::Build { fields, .. } = &mut action.kind else {
+            return;
+        };
+        for field in fields.iter_mut() {
+            let FieldValue::PendingCascade { wanted } = &mut field.value else {
+                continue;
+            };
+            field.value = match form.cascades.iter().find(|cascade| cascade.name == field.definition.name) {
+                Some(spec) => FieldValue::Cascade(Cascade {
+                    spec: spec.clone(),
+                    options: Vec::new(),
+                    selected: Vec::new(),
+                    state: CascadeState::Loading,
+                    wanted: wanted.take(),
+                    note: None,
+                }),
+                // Not recognizable on the page: leave this job to Jenkins.
+                None => FieldValue::Unavailable,
+            };
+        }
+        action.form = Some(form);
+        self.run_cascades(cx);
     }
 
     pub(super) fn start_stop(&mut self, job: Vec<String>, number: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.action = Some(ActionState {
             job,
             kind: Kind::Stop { number },
+            defaults_ready: true,
+            _loads: Vec::new(),
             form: None,
             cascade_revision: 0,
             cascade_rerun: false,
@@ -300,9 +476,12 @@ impl JenkinsView {
 
     /// The values to send, or why they cannot be sent yet.
     fn collected(&self, cx: &App) -> Result<Vec<(String, String)>, String> {
-        let Some(ActionState { kind: Kind::Build { fields, .. }, .. }) = &self.action else {
+        let Some(ActionState { kind: Kind::Build { fields, .. }, defaults_ready, .. }) = &self.action else {
             return Ok(Vec::new());
         };
+        if !defaults_ready {
+            return Err("Default values are still loading.".into());
+        }
         let mut values = Vec::new();
         for field in fields {
             let value = match (&field.value, &field.definition.kind) {
@@ -315,6 +494,12 @@ impl JenkinsView {
                 (FieldValue::Flag(flag), _) => flag.to_string(),
                 (FieldValue::Text(editor), _) => editor.read(cx).text(cx),
                 (FieldValue::Choice(choice), _) => choice.clone(),
+                (FieldValue::PendingCascade { .. }, _) => {
+                    return Err(format!("{}: choices are still loading.", field.definition.name));
+                }
+                (FieldValue::Unavailable, _) => {
+                    return Err(format!("{}: Vilo cannot fill this parameter.", field.definition.name));
+                }
                 (FieldValue::Cascade(cascade), _) => match &cascade.state {
                     CascadeState::Ready => cascade.selected.join(","),
                     CascadeState::Loading => return Err(format!("{}: choices are still loading.", field.definition.name)),
@@ -400,7 +585,31 @@ impl JenkinsView {
                     }
                     None => {
                         let values = values.into_iter().map(|(name, value)| (name, value.unwrap_or_default())).collect::<Vec<_>>();
-                        client.cascade_choices(&form, &spec, &values).await.map_err(|error| error.to_string())
+                        let key = format!("{}|{values:?}", spec.name);
+                        let cached = this
+                            .read_with(cx, |this, _| {
+                                let job = &this.action.as_ref()?.job;
+                                let (choices, at) = this.job_cache.get(job)?.choices.get(&key)?;
+                                (at.elapsed() < FORM_CACHE).then(|| choices.clone())
+                            })
+                            .ok()
+                            .flatten();
+                        match cached {
+                            Some(choices) => Ok(choices),
+                            None => {
+                                let fetched = client.cascade_choices(&form, &spec, &values).await.map_err(|error| error.to_string());
+                                if let Ok(choices) = &fetched {
+                                    let choices = choices.clone();
+                                    this.update(cx, |this, _| {
+                                        if let Some(job) = this.action.as_ref().map(|action| action.job.clone()) {
+                                            this.job_cache.entry(job).or_default().choices.insert(key, (choices, Instant::now()));
+                                        }
+                                    })
+                                    .ok();
+                                }
+                                fetched
+                            }
+                        }
                     }
                 };
                 if result.is_err() && failed.is_none() {
@@ -675,6 +884,7 @@ impl JenkinsView {
                                 && let Kind::Build { from, .. } = &action.kind
                             {
                                 let (job, from) = (action.job.clone(), from.clone());
+                                this.job_cache.remove(&job);
                                 this.start_build_form(job, from, window, cx);
                             }
                         }),
@@ -778,8 +988,9 @@ impl JenkinsView {
                     unsupported = fields
                         .iter()
                         .filter_map(|field| match (&field.definition.kind, &field.value) {
-                            (ParameterKind::Unsupported(_), FieldValue::Cascade(_)) => None,
-                            (ParameterKind::Unsupported(kind), _) => Some(format!("{} ({kind})", field.definition.name)),
+                            (ParameterKind::Unsupported(kind), FieldValue::Unavailable) => {
+                                Some(format!("{} ({kind})", field.definition.name))
+                            }
                             _ => None,
                         })
                         .collect();
@@ -829,6 +1040,7 @@ impl JenkinsView {
                                                             && let Some(field) = fields.get_mut(index)
                                                         {
                                                             field.value = FieldValue::Choice(choice.clone());
+                                                            field.keep = true;
                                                             let name = field.definition.name.clone();
                                                             this.field_changed(&name, cx);
                                                         }
@@ -848,6 +1060,7 @@ impl JenkinsView {
                                         && let Some(field) = fields.get_mut(index)
                                     {
                                         field.value = FieldValue::Flag(state.selected());
+                                        field.keep = true;
                                     }
                                     cx.notify();
                                 }))
@@ -855,6 +1068,14 @@ impl JenkinsView {
                             (FieldValue::Text(editor), _) => boxed(editor.clone().into_any_element()).into_any_element(),
                             (FieldValue::Choice(current), _) => Label::new(current.clone()).into_any_element(),
                             (FieldValue::Cascade(cascade), _) => self.render_cascade(index, cascade, cx),
+                            (FieldValue::PendingCascade { .. }, _) => Label::new("Loading choices from Jenkins…")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .into_any_element(),
+                            (FieldValue::Unavailable, _) => Label::new("Vilo cannot fill this parameter.")
+                                .size(LabelSize::Small)
+                                .color(Color::Warning)
+                                .into_any_element(),
                         };
                         body = body.child(
                             v_flex()
@@ -1065,6 +1286,7 @@ mod tests {
                 kind: ParameterKind::Unsupported("CascadeChoiceParameter".into()),
                 default: None,
             },
+            keep: false,
             value: FieldValue::Cascade(Cascade {
                 spec,
                 options: Vec::new(),

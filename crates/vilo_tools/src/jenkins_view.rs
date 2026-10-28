@@ -146,6 +146,7 @@ pub struct JenkinsView {
     build: Option<BuildState>,
     form: Option<Form>,
     action: Option<actions::ActionState>,
+    job_cache: HashMap<Vec<String>, actions::JobCache>,
     tasks: Vec<Task<()>>,
 }
 
@@ -281,6 +282,7 @@ impl JenkinsView {
             build: None,
             form: None,
             action: None,
+            job_cache: HashMap::default(),
             tasks: Vec::new(),
         };
         if view.connections.is_empty() {
@@ -317,6 +319,7 @@ impl JenkinsView {
         self.build = None;
         self.form = None;
         self.action = None;
+        self.job_cache.clear();
         self.tasks.clear();
         self.session_error = Some("Connecting…".into());
         self.tasks.push(cx.spawn(async move |this, cx| {
