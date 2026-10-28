@@ -1,4 +1,6 @@
 mod vault;
+mod vault_compare;
+mod vault_import;
 mod vault_view;
 
 use gpui::{App, Entity, FocusHandle, Focusable, prelude::*};

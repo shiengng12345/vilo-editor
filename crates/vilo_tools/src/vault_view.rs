@@ -1,12 +1,19 @@
-use std::{path::PathBuf, time::Duration};
+mod import_compare;
+
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use editor::Editor;
 use gpui::{
-    App, ClipboardItem, Entity, FocusHandle, Focusable, Subscription, Task, TaskExt as _, Window,
-    prelude::*,
+    App, AsyncApp, ClipboardItem, Entity, FocusHandle, Focusable, Subscription, Task,
+    TaskExt as _, Window, prelude::*,
 };
+use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 use ui::{
     Button, ButtonStyle, Checkbox, ContextMenu, Divider, IconButton, PopoverMenu, ToggleState,
@@ -29,6 +36,9 @@ const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(30);
 struct Connection {
     id: String,
     name: String,
+    #[serde(default)]
+    site: String,
+    #[serde(default)]
     environment: String,
     /// Normalized origin, e.g. `http://127.0.0.1:8200/`.
     address: String,
@@ -45,6 +55,63 @@ impl Connection {
     fn credential_url(&self) -> String {
         format!("vilo-vault://{}", self.id)
     }
+
+    fn label(&self) -> String {
+        [self.site.as_str(), self.environment.as_str(), self.name.as_str()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+}
+
+/// Checks a token against its Vault, then saves it to the keychain bound to the
+/// connection's address and reads it back. Root tokens need `accept_root`.
+async fn store_token(
+    connection: &Connection,
+    token: &str,
+    accept_root: bool,
+    http: Arc<dyn HttpClient>,
+    cx: &AsyncApp,
+) -> Result<()> {
+    let origin = normalize_origin(&connection.address)?;
+    match VaultClient::new(http, origin, token.to_string())
+        .lookup_self()
+        .await
+    {
+        Ok(info) if info.is_root() && !accept_root => return Err(anyhow!(RootTokenNeedsConsent)),
+        // A token that may not look itself up can still be valid for reads.
+        Ok(_) | Err(VaultError::Forbidden) => {}
+        Err(error) => return Err(anyhow!(error.to_string())),
+    }
+    let url = connection.credential_url();
+    cx.update(|cx| cx.write_credentials(&url, &connection.address, token.as_bytes()))
+        .await
+        .context("Vilo could not save the token to the keychain")?;
+    let read_back = cx.update(|cx| cx.read_credentials(&url)).await?;
+    if read_back.as_ref().is_none_or(|(address, saved)| {
+        address != &connection.address || saved.as_slice() != token.as_bytes()
+    }) {
+        return Err(anyhow!("The keychain did not keep the token."));
+    }
+    Ok(())
+}
+
+/// A client for a saved connection, or why there is none. The token is only
+/// used when it was saved for this exact address.
+async fn client_for(connection: &Connection, cx: &AsyncApp) -> Result<VaultClient, String> {
+    let credential = cx
+        .update(|cx| cx.read_credentials(&connection.credential_url()))
+        .await
+        .map_err(|_| "Could not read the token from the keychain.".to_string())?;
+    let token = match credential {
+        Some((address, token)) if address == connection.address => {
+            String::from_utf8(token).map_err(|_| "The saved token is unreadable.".to_string())?
+        }
+        _ => return Err("No token saved for this address.".to_string()),
+    };
+    let origin = normalize_origin(&connection.address).map_err(|error| error.to_string())?;
+    Ok(VaultClient::new(cx.update(|cx| cx.http_client()), origin, token))
 }
 
 enum Fetch<T> {
@@ -74,6 +141,7 @@ struct ConnectionForm {
     /// The connection being edited, or `None` for a new one.
     editing: Option<String>,
     name: Entity<Editor>,
+    site: Entity<Editor>,
     environment: Entity<Editor>,
     address: Entity<Editor>,
     token: Entity<Editor>,
@@ -99,7 +167,12 @@ pub struct VaultView {
     revealed: HashSet<String>,
     confirm_reveal_all: bool,
     form: Option<ConnectionForm>,
+    import: Option<import_compare::ImportState>,
+    compare: Option<import_compare::CompareState>,
     go_to: Entity<Editor>,
+    /// Sequence of the newest connections snapshot written to disk.
+    persisted: Arc<Mutex<u64>>,
+    persist_sequence: u64,
     tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -107,14 +180,22 @@ pub struct VaultView {
 impl VaultView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let path = paths::config_dir().join("vault_connections.json");
+        // Entries are read one by one so a single bad entry does not drop the rest.
         let connections = std::fs::read(&path)
             .ok()
             .and_then(|bytes| {
-                serde_json::from_slice::<Vec<Connection>>(&bytes)
+                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes)
                     .map_err(|error| log::error!("ignoring unreadable {path:?}: {error}"))
                     .ok()
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| {
+                serde_json::from_value::<Connection>(entry)
+                    .map_err(|error| log::error!("skipping a Vault connection: {error}"))
+                    .ok()
+            })
+            .collect();
         let go_to = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Go to path, e.g. FPMS-NT-V2/ccms/uat", window, cx);
@@ -141,7 +222,11 @@ impl VaultView {
             revealed: HashSet::default(),
             confirm_reveal_all: false,
             form: None,
+            import: None,
+            compare: None,
             go_to,
+            persisted: Arc::default(),
+            persist_sequence: 0,
             tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -151,16 +236,25 @@ impl VaultView {
         view
     }
 
-    fn persist(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
+    fn persist(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.persist_sequence += 1;
+        let sequence = self.persist_sequence;
+        let persisted = self.persisted.clone();
         let path = self.path.clone();
         let connections = self.connections.clone();
         cx.background_spawn(async move {
+            // Writes may finish out of order; an older snapshot never replaces a newer one.
+            let mut written = persisted.lock().map_err(|_| anyhow!("connection store poisoned"))?;
+            if *written > sequence {
+                return Ok(());
+            }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             let temporary = path.with_extension("json.tmp");
             std::fs::write(&temporary, serde_json::to_vec_pretty(&connections)?)?;
             std::fs::rename(&temporary, &path)?;
+            *written = sequence;
             Ok(())
         })
     }
@@ -183,25 +277,14 @@ impl VaultView {
         };
         self.clear_session();
         self.form = None;
+        self.import = None;
+        self.compare = None;
         let generation = self.generation;
         self.session_error = Some("Connecting…".into());
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             let result: Result<()> = async {
-            let credential = cx
-                .update(|_, cx| cx.read_credentials(&connection.credential_url()))?
-                .await;
-            let token = match credential {
-                // The token only goes to the address it was saved for.
-                Ok(Some((address, token))) if address == connection.address => {
-                    String::from_utf8(token).ok()
-                }
-                Ok(_) => None,
-                Err(error) => {
-                    log::warn!("reading the Vault token failed: {error:#}");
-                    None
-                }
-            };
-            let Some(token) = token else {
+            let app = cx.update(|_, cx| cx.to_async())?;
+            let Ok(client) = client_for(&connection, &app).await else {
                 this.update_in(cx, |this, window, cx| {
                     if this.generation == generation {
                         this.open_form(Some(connection.id.clone()), window, cx);
@@ -214,9 +297,6 @@ impl VaultView {
                 })?;
                 return Ok(());
             };
-            let origin = normalize_origin(&connection.address)?;
-            let http = cx.update(|_, cx| cx.http_client())?;
-            let client = VaultClient::new(http, origin, token);
             let info = client.lookup_self().await;
             let info = match info {
                 Ok(info) => Some(info),
@@ -447,6 +527,7 @@ impl VaultView {
             })
         };
         let name = field("Name, e.g. FPMS UAT", existing.as_ref().map(|c| c.name.as_str()), false, window, cx);
+        let site = field("Site, e.g. CP", existing.as_ref().map(|c| c.site.as_str()), false, window, cx);
         let environment = field(
             "Environment, e.g. UAT",
             existing.as_ref().map(|c| c.environment.as_str()),
@@ -472,9 +553,12 @@ impl VaultView {
             window,
             cx,
         );
+        self.import = None;
+        self.compare = None;
         self.form = Some(ConnectionForm {
             editing,
             name,
+            site,
             environment,
             address,
             token,
@@ -493,6 +577,7 @@ impl VaultView {
             return;
         };
         let name = form.name.read(cx).text(cx).trim().to_string();
+        let site = form.site.read(cx).text(cx).trim().to_string();
         let environment = form.environment.read(cx).text(cx).trim().to_string();
         let address_input = form.address.read(cx).text(cx);
         let token_input = form.token.read(cx).text(cx).trim().to_string();
@@ -538,6 +623,7 @@ impl VaultView {
                 .map(|existing| existing.id.clone())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()),
             name,
+            site,
             environment,
             address: origin.to_string(),
             plaintext_acknowledged: plaintext,
@@ -549,27 +635,8 @@ impl VaultView {
         form._task = Some(cx.spawn_in(window, async move |this, cx| {
             let result: Result<()> = async {
                 if !token_input.is_empty() {
-                    let client = VaultClient::new(http, origin.clone(), token_input.clone());
-                    match client.lookup_self().await {
-                        Ok(info) if info.is_root() && !accept_root => {
-                            return Err(anyhow!(RootTokenNeedsConsent));
-                        }
-                        Ok(_) | Err(VaultError::Forbidden) => {}
-                        Err(error) => return Err(anyhow!(error.to_string())),
-                    }
-                    let url = connection.credential_url();
-                    cx.update(|_, cx| {
-                        cx.write_credentials(&url, connection.address.as_str(), token_input.as_bytes())
-                    })?
-                    .await
-                    .context("Vilo could not save the token to the keychain")?;
-                    let read_back = cx.update(|_, cx| cx.read_credentials(&url))?.await?;
-                    if read_back
-                        .as_ref()
-                        .is_none_or(|(address, token)| address != &connection.address || token != token_input.as_bytes())
-                    {
-                        return Err(anyhow!("The keychain did not keep the token."));
-                    }
+                    let app = cx.update(|_, cx| cx.to_async())?;
+                    store_token(&connection, &token_input, accept_root, http, &app).await?;
                 }
                 let persist = this.update(cx, |this, cx| {
                     match this.connections.iter_mut().find(|c| c.id == connection.id) {
@@ -666,7 +733,30 @@ impl VaultView {
         let colors = cx.theme().colors().clone();
         let active_id = self.session.as_ref().map(|session| session.connection_id.clone());
         let mut list = v_flex().gap_0p5();
-        for connection in &self.connections {
+        let mut ordered = self.connections.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|c| {
+            (
+                c.site.to_lowercase(),
+                c.environment.to_lowercase(),
+                c.name.to_lowercase(),
+            )
+        });
+        let mut current_site = None;
+        for connection in ordered {
+            if current_site != Some(connection.site.as_str()) {
+                current_site = Some(connection.site.as_str());
+                list = list.child(
+                    div().px_2().pt_1().child(
+                        Label::new(if connection.site.is_empty() {
+                            "No site".to_string()
+                        } else {
+                            connection.site.clone()
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    ),
+                );
+            }
             let id = connection.id.clone();
             let is_active = active_id.as_ref() == Some(&connection.id);
             list = list.child(
@@ -726,12 +816,39 @@ impl VaultView {
                     .justify_between()
                     .child(Label::new("Connections").size(LabelSize::Small).color(Color::Muted))
                     .child(
-                        IconButton::new("vault-add-connection", IconName::Plus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Add a Vault connection"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_form(None, window, cx)
-                            })),
+                        h_flex()
+                            .child(
+                                IconButton::new("vault-compare", IconName::Diff)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Compare secrets"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_compare(None, window, cx)
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("vault-import", IconName::Download)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Import connections"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_import(window, cx)
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("vault-export", IconName::ArrowUpRight)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Export connections (without tokens)"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.export_connections(cx)
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("vault-add-connection", IconName::Plus)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Add a Vault connection"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_form(None, window, cx)
+                                    })),
+                            ),
                     ),
             )
             .child(list)
@@ -895,6 +1012,7 @@ impl VaultView {
                 .size(HeadlineSize::Small),
             )
             .child(input("Name", &form.name))
+            .child(input("Site", &form.site))
             .child(input("Environment", &form.environment))
             .child(input("Address", &form.address))
             .child(input("Token", &form.token))
@@ -979,7 +1097,17 @@ impl VaultView {
         let title = format!("{}/{}", secret.mount.path, secret.path);
         let mut header = h_flex()
             .gap_3()
-            .child(Headline::new(title).size(HeadlineSize::Small));
+            .child(Headline::new(title.clone()).size(HeadlineSize::Small));
+        if let Some(connection_id) = self.session.as_ref().map(|session| session.connection_id.clone()) {
+            header = header.child(
+                Button::new("vault-compare-secret", "Compare…")
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::Diff).size(IconSize::Small))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_compare(Some((connection_id.clone(), title.clone())), window, cx)
+                    })),
+            );
+        }
         if let Some(Fetch::Loaded(versions)) = &secret.versions
             && !versions.is_empty()
         {
@@ -1225,6 +1353,10 @@ impl Render for VaultView {
 
         let main = if let Some(form) = &self.form {
             self.render_form(form, cx).into_any_element()
+        } else if let Some(import) = &self.import {
+            self.render_import(import, cx)
+        } else if let Some(compare) = &self.compare {
+            self.render_compare(compare, cx)
         } else if let Some(message) = &self.session_error {
             Label::new(message.clone()).color(Color::Muted).into_any_element()
         } else if let Some(secret) = &self.secret {
@@ -1254,7 +1386,7 @@ impl Render for VaultView {
                     .gap_4()
                     .bg(colors.editor_background)
                     .child(status)
-                    .when(self.session.is_some() && self.form.is_none(), |this| {
+                    .when(self.session.is_some() && self.form.is_none() && self.import.is_none() && self.compare.is_none(), |this| {
                         this.child(
                             h_flex()
                                 .gap_2()
