@@ -201,8 +201,15 @@ pub struct MyWorkPage {
     page: usize,
     selected: Option<u64>,
     drawer: Option<Drawer>,
+    /// Lists whose first page failed while others loaded.
+    list_errors: HashMap<WorkList, SharedString>,
+    /// Width of the page the last time it was laid out; decides drawer placement.
+    page_width: Pixels,
     _subscriptions: Vec<Subscription>,
 }
+
+/// After this long away, coming back to the page refreshes it.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl MyWorkPage {
     fn new(
@@ -252,8 +259,22 @@ impl MyWorkPage {
             page: 0,
             selected: None,
             drawer: None,
+            list_errors: HashMap::default(),
+            page_width: px(0.),
             _subscriptions: subscriptions,
         };
+        // Returning to the module after a while shows fresh data, not a stale snapshot.
+        let focus_handle = page.focus_handle.clone();
+        page._subscriptions
+            .push(cx.on_focus_in(&focus_handle, window, |this, _, cx| {
+                let stale = this
+                    .updated_at
+                    .and_then(|updated_at| updated_at.elapsed().ok())
+                    .is_some_and(|elapsed| elapsed > STALE_AFTER);
+                if stale && !this.loading {
+                    this.refresh(cx);
+                }
+            }));
         page.refresh(cx);
         page
     }
@@ -271,6 +292,7 @@ impl MyWorkPage {
         self.drawer = None;
         self.selected = None;
         self.error = None;
+        self.list_errors.clear();
         self.loading = false;
         self.page = 0;
         cx.notify();
@@ -278,16 +300,21 @@ impl MyWorkPage {
 
     /// Loads the first page of every list; their totals feed the count cards.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.reset(cx);
         if self.store.read(cx).account().is_none() {
+            self.reset(cx);
             return;
         }
+        // Keep showing the current data until the new answer arrives.
+        self.generation += 1;
+        self.more_task = None;
+        self.enrich_task = None;
+        self.briefs_pending.clear();
+        self.error = None;
         self.loading = true;
         let generation = self.generation;
         let store = self.store.clone();
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = async {
-                let session = open_session(&store, cx).await?;
+            let result = with_session(&store, cx, async |session| {
                 let calls = WorkList::ALL.map(|list| {
                     session.call(
                         "list_todo",
@@ -295,23 +322,24 @@ impl MyWorkPage {
                     )
                 });
                 let responses = join_all(calls).await;
-                let mut lists = HashMap::default();
-                let mut first_error = None;
-                for (list, response) in WorkList::ALL.into_iter().zip(responses) {
-                    match response.and_then(|response| parse_work_items(&response)) {
-                        Ok((items, total)) => {
-                            lists.insert(list, (items, total));
-                        }
-                        Err(error) => {
-                            first_error.get_or_insert(error);
-                        }
-                    }
+                if responses.iter().any(|response| {
+                    response
+                        .as_ref()
+                        .is_err_and(|error| error.is::<TokenRejected>())
+                }) {
+                    return Err(TokenRejected.into());
                 }
-                if lists.is_empty() {
-                    return Err(first_error.unwrap_or_else(|| anyhow!("no data")));
-                }
-                anyhow::Ok(lists)
-            }
+                Ok(WorkList::ALL
+                    .into_iter()
+                    .zip(responses)
+                    .map(|(list, response)| {
+                        (
+                            list,
+                            response.and_then(|response| parse_work_items(&response)),
+                        )
+                    })
+                    .collect::<Vec<_>>())
+            })
             .await;
             this.update(cx, |this, cx| {
                 if this.generation != generation {
@@ -320,16 +348,28 @@ impl MyWorkPage {
                 this.loading = false;
                 match result {
                     Ok(lists) => {
-                        for (list, (items, total)) in lists {
-                            this.counts.insert(list, total);
-                            this.lists.insert(
-                                list,
-                                ListState {
-                                    items,
-                                    total,
-                                    pages_loaded: 1,
-                                },
-                            );
+                        this.lists.clear();
+                        this.counts.clear();
+                        this.list_errors.clear();
+                        this.briefs.clear();
+                        this.brief_failures.clear();
+                        for (list, result) in lists {
+                            match result {
+                                Ok((items, total)) => {
+                                    this.counts.insert(list, total);
+                                    this.lists.insert(
+                                        list,
+                                        ListState {
+                                            items,
+                                            total,
+                                            pages_loaded: 1,
+                                        },
+                                    );
+                                }
+                                Err(error) => {
+                                    this.list_errors.insert(list, describe_error(&error));
+                                }
+                            }
                         }
                         this.updated_at = Some(SystemTime::now());
                         this.enrich_visible(cx);
@@ -352,8 +392,7 @@ impl MyWorkPage {
         let generation = self.generation;
         let store = self.store.clone();
         self.more_task = Some(cx.spawn(async move |this, cx| {
-            let result = async {
-                let session = open_session(&store, cx).await?;
+            let result = with_session(&store, cx, async |session| {
                 let response = session
                     .call(
                         "list_todo",
@@ -361,7 +400,7 @@ impl MyWorkPage {
                     )
                     .await?;
                 parse_work_items(&response)
-            }
+            })
             .await;
             this.update(cx, |this, cx| {
                 if this.generation != generation {
@@ -523,6 +562,55 @@ impl MyWorkPage {
         }));
     }
 
+    fn enrich_item(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.briefs.remove(&id);
+        self.enrich_visible(cx);
+        if let Some(item) = self
+            .drawer
+            .as_ref()
+            .map(|drawer| drawer.item.clone())
+            .filter(|item| item.id == id && !self.briefs_pending.contains(&id))
+        {
+            // The drawer's item may be outside the visible page.
+            self.briefs_pending.insert(item.id);
+            let generation = self.generation;
+            let store = self.store.clone();
+            cx.spawn(async move |this, cx| {
+                let result = with_session(&store, cx, async |session| {
+                    session
+                        .call(
+                            "get_workitem_brief",
+                            serde_json::json!({
+                                "project_key": item.project_key,
+                                "work_item_id": item.id.to_string(),
+                            }),
+                        )
+                        .await
+                        .and_then(|response| parse_brief(&response))
+                })
+                .await;
+                this.update(cx, |this, cx| {
+                    if this.generation != generation {
+                        return;
+                    }
+                    this.briefs_pending.remove(&item.id);
+                    match result {
+                        Ok(brief) => {
+                            this.briefs.insert(item.id, brief);
+                        }
+                        Err(_) => {
+                            this.brief_failures.insert(item.id);
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
     fn open_drawer(&mut self, item: WorkItem, cx: &mut Context<Self>) {
         self.selected = Some(item.id);
         let mut drawer = Drawer {
@@ -570,10 +658,9 @@ impl MyWorkPage {
         let generation = self.generation;
         let store = self.store.clone();
         drawer._tasks.push(cx.spawn(async move |this, cx| {
-            let result = async {
-                let session = open_session(&store, cx).await?;
-                session.call(tool, arguments).await
-            }
+            let result = with_session(&store, cx, async |session| {
+                session.call(tool, arguments.clone()).await
+            })
             .await;
             this.update(cx, |this, cx| {
                 if this.generation != generation {
@@ -628,7 +715,11 @@ impl MyWorkPage {
             .ok();
     }
 
-    fn handle_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Arrow keys belong to the filter box while it is being typed in.
+        if self.filter_editor.focus_handle(cx).is_focused(window) {
+            return;
+        }
         let visible = self.visible(cx);
         let position = self
             .selected
@@ -676,6 +767,35 @@ fn describe_error(error: &anyhow::Error) -> SharedString {
         "Your Meegle session needs to be renewed.".into()
     } else {
         format!("{error:#}").into()
+    }
+}
+
+/// Runs a batch of calls on one session. If Meegle rejects the token part-way,
+/// the batch runs once more on a session with a renewed token.
+async fn with_session<T>(
+    store: &Entity<AccountStore>,
+    cx: &mut AsyncApp,
+    batch: impl AsyncFn(&MeegleSession) -> Result<T>,
+) -> Result<T> {
+    let session = open_session(store, cx).await?;
+    match batch(&session).await {
+        Err(error) if error.is::<TokenRejected>() => {
+            store.update(cx, |store, _| {
+                store.invalidate_access_token(session.access_token())
+            });
+            let session = open_session(store, cx).await?;
+            let result = batch(&session).await;
+            if result
+                .as_ref()
+                .is_err_and(|error| error.is::<TokenRejected>())
+            {
+                store.update(cx, |store, cx| {
+                    store.reject_access_token(session.access_token(), cx)
+                });
+            }
+            result
+        }
+        result => result,
     }
 }
 
@@ -801,7 +921,10 @@ fn parse_brief(response: &serde_json::Value) -> Result<Brief> {
 
 /// `2026-04-09T02:15:36Z` → `2026-04-09 02:15` (UTC as Meegle sends it).
 fn short_time(time: &str) -> String {
-    time.replace('T', " ").chars().take(16).collect()
+    time::OffsetDateTime::parse(time, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .and_then(|time| format_millis(time.unix_timestamp() * 1000))
+        .unwrap_or_else(|| time.replace('T', " ").chars().take(16).collect())
 }
 
 fn parse_comments(response: &serde_json::Value) -> Result<Vec<Comment>> {
@@ -911,6 +1034,9 @@ fn parse_nodes(response: &serde_json::Value) -> Result<Vec<Node>> {
 /// `https://<issuer host>/<simple_name>/<type>/detail/<id>`. Scheme and host come
 /// from the signed-in account; Meegle data only fills single, encoded path segments.
 fn detail_url(issuer: &Url, simple_name: &str, type_key: &str, id: u64) -> Result<Url> {
+    if issuer.scheme() != "https" {
+        return Err(anyhow!("Meegle links must use https"));
+    }
     let id = id.to_string();
     let segments = [simple_name, type_key, "detail", id.as_str()];
     for segment in segments {
@@ -926,6 +1052,12 @@ fn detail_url(issuer: &Url, simple_name: &str, type_key: &str, id: u64) -> Resul
         .clear()
         .extend(segments);
     Ok(url)
+}
+
+/// Up to nine page numbers centred on the current page.
+fn page_window(current: usize, pages: usize) -> std::ops::Range<usize> {
+    let start = current.saturating_sub(4).min(pages.saturating_sub(9));
+    start..(start + 9).min(pages)
 }
 
 fn today() -> String {
@@ -947,7 +1079,8 @@ fn relative_time(time: SystemTime) -> String {
     match seconds {
         0..60 => "just now".into(),
         60..3600 => format!("{} min ago", seconds / 60),
-        _ => format!("{} h ago", seconds / 3600),
+        3600..86400 => format!("{} h ago", seconds / 3600),
+        _ => format!("{} d ago", seconds / 86400),
     }
 }
 
@@ -1033,7 +1166,7 @@ impl MyWorkPage {
                             v_flex()
                                 .flex_1()
                                 .child(Label::new(account.display_name.clone()))
-                                .when_some(account.email.clone(), |this, email| {
+                                .when_some(account.email, |this, email| {
                                     this.child(
                                         Label::new(email)
                                             .size(LabelSize::Small)
@@ -1302,7 +1435,10 @@ impl MyWorkPage {
                             .map(|brief| brief.owners.join(", "))
                             .map(SharedString::from);
                         let creator = brief.and_then(|brief| brief.creator.clone());
-                        let late = item.due.as_ref().is_some_and(|due| *due < today)
+                        let late = item
+                            .due
+                            .as_ref()
+                            .is_some_and(|due| due.get(..10).unwrap_or(due) < today.as_str())
                             && self.list != WorkList::Done;
                         let selected = self.selected == Some(item.id);
                         let open = item.clone();
@@ -1454,7 +1590,7 @@ impl MyWorkPage {
                                 cx.notify();
                             })),
                     )
-                    .children((0..pages).take(9).map(|index| {
+                    .children(page_window(self.page, pages).map(|index| {
                         Button::new(("my-work-page", index), (index + 1).to_string())
                             .label_size(LabelSize::Small)
                             .style(ButtonStyle::Subtle)
@@ -1565,6 +1701,26 @@ impl MyWorkPage {
                             .child(row("Template", brief.template.clone().unwrap_or_default()))
                             .child(row("Due", item.due.clone().unwrap_or_default().into()))
                             .into_any_element(),
+                        None if self.brief_failures.contains(&item.id) => section("DETAILS")
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Label::new("Couldn’t load the details.")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Warning),
+                                    )
+                                    .child({
+                                        let id = item.id;
+                                        Button::new("my-work-drawer-retry", "Retry")
+                                            .label_size(LabelSize::Small)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.brief_failures.remove(&id);
+                                                this.enrich_item(id, cx);
+                                            }))
+                                    }),
+                            )
+                            .into_any_element(),
                         None => section("DETAILS")
                             .child(
                                 Label::new("Loading…")
@@ -1642,9 +1798,10 @@ impl MyWorkPage {
         };
 
         let copy_url = url.clone();
-        let open_url = url.clone();
+        let open_url = url;
         v_flex()
             .id("my-work-drawer")
+            .occlude()
             .w(DRAWER_WIDTH)
             .flex_none()
             .h_full()
@@ -1815,6 +1972,7 @@ fn filter_menu(
                     all.update(cx, |this, cx| {
                         apply(this, None);
                         this.page = 0;
+                        this.enrich_visible(cx);
                         cx.notify();
                     })
                     .ok();
@@ -1838,7 +1996,7 @@ fn filter_menu(
 }
 
 impl Render for MyWorkPage {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let background = cx.theme().colors().editor_background;
         let signed_in = self.store.read(cx).account().is_some();
         let filtered = self.filtered(cx);
@@ -1848,7 +2006,22 @@ impl Render for MyWorkPage {
             .take(self.page_size)
             .cloned()
             .collect::<Vec<_>>();
-        let overlay_drawer = window.viewport_size().width < DRAWER_OVERLAY_BELOW;
+        let overlay_drawer = self.page_width < DRAWER_OVERLAY_BELOW;
+        let this = cx.entity();
+        // Measures the module's real width (the window may also hold sidebars).
+        let measure = gpui::canvas(
+            move |bounds, _, cx| {
+                this.update(cx, |this, cx| {
+                    if this.page_width != bounds.size.width {
+                        this.page_width = bounds.size.width;
+                        cx.notify();
+                    }
+                })
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
 
         let content: AnyElement = if !signed_in {
             self.render_message(
@@ -1857,13 +2030,18 @@ impl Render for MyWorkPage {
                 cx,
             )
         } else if self.lists.get(&self.list).is_none() {
-            match &self.error {
+            match self.error.as_ref().or(self.list_errors.get(&self.list)) {
                 Some(error) => self.render_message(
                     format!("Couldn’t load your work: {error}"),
                     Some(("my-work-retry", "Retry")),
                     cx,
                 ),
-                None => self.render_message("Loading your work…", None, cx),
+                None if self.loading => self.render_message("Loading your work…", None, cx),
+                None => self.render_message(
+                    "This list hasn’t loaded.",
+                    Some(("my-work-retry", "Retry")),
+                    cx,
+                ),
             }
         } else {
             let table: AnyElement = if rows.is_empty() {
@@ -1942,6 +2120,7 @@ impl Render for MyWorkPage {
             .relative()
             .size_full()
             .bg(background)
+            .child(measure)
             .child(
                 h_flex()
                     .size_full()
@@ -2022,7 +2201,8 @@ mod tests {
             vec![SharedString::from("Alex Doe"), "Robin Ho".into()]
         );
         assert_eq!(brief.creator.as_deref(), Some("Pat Lee"));
-        assert_eq!(brief.created.as_deref(), Some("2026-04-09 02:15"));
+        // Shown in local time, so only the shape is fixed here.
+        assert!(brief.created.as_deref().is_some_and(|created| created.len() == 16));
         assert_eq!(brief.simple_name.as_deref(), Some("spaces"));
         assert_eq!(brief.roles.len(), 1);
     }

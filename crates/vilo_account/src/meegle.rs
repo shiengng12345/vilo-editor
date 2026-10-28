@@ -194,11 +194,11 @@ impl std::fmt::Display for TokenRejected {
 
 impl std::error::Error for TokenRejected {}
 
-/// Calls one Meegle MCP tool and returns the JSON document in its text output.
 /// One initialized connection to the Meegle MCP server, shared by a batch of calls.
 pub(crate) struct MeegleSession {
     protocol: InitializedContextServerProtocol,
     transport: Arc<HttpTransport>,
+    access_token: String,
 }
 
 impl MeegleSession {
@@ -239,7 +239,12 @@ impl MeegleSession {
         Ok(Self {
             protocol: protocol?,
             transport,
+            access_token: access_token.to_string(),
         })
+    }
+
+    pub fn access_token(&self) -> &str {
+        &self.access_token
     }
 
     /// Calls one read-only Meegle tool and returns the JSON document in its text output.

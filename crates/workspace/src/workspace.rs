@@ -1601,6 +1601,9 @@ pub struct Workspace {
     active_module: Option<&'static str>,
     /// Where focus was in the code layout when a module was opened, restored on return.
     focus_before_module: Option<FocusHandle>,
+    /// Counts module activations, so a slow file open that finishes after the user
+    /// switched to a module does not pull them back to the code layout.
+    module_activations: u64,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -2111,6 +2114,7 @@ impl Workspace {
             modules: Vec::new(),
             active_module: None,
             focus_before_module: None,
+            module_activations: 0,
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -4822,7 +4826,9 @@ impl Workspace {
 
     /// Open the panel of the given type
     pub fn open_panel<T: Panel>(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_code(false, window, cx);
+        if self.panel::<T>(cx).is_some() {
+            self.show_code(false, window, cx);
+        }
         for dock in self.all_docks() {
             if let Some(panel_index) = dock.read(cx).panel_index_for_type::<T>() {
                 dock.update(cx, |dock, cx| {
@@ -5106,8 +5112,16 @@ impl Workspace {
         let workspace = self.weak_self.clone();
         let project_path = path.into();
         let task = self.load_path(project_path.clone(), window, cx);
+        let module_activations = self.module_activations;
         window.spawn(cx, async move |cx| {
             let (project_entry_id, build_item) = task.await?;
+            // The user switched to a module while this loaded: open it without focus.
+            let focus_item = focus_item
+                && workspace
+                    .read_with(cx, |workspace, _| {
+                        workspace.module_activations == module_activations
+                    })
+                    .unwrap_or(true);
             let pane = if reveal_if_open {
                 workspace
                     .read_with(cx, |workspace, cx| {
@@ -5619,6 +5633,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_code(false, window, cx);
         let panes = self.center.panes();
         if let Some(pane) = panes.get(action.0).map(|p| (*p).clone()) {
             window.focus(&pane.focus_handle(cx), cx);
@@ -5680,6 +5695,7 @@ impl Workspace {
     }
 
     pub fn activate_next_pane(&mut self, window: &mut Window, cx: &mut App) {
+        self.show_code(false, window, cx);
         let panes = self.center.panes();
         if let Some(ix) = panes.iter().position(|pane| **pane == self.active_pane) {
             let next_ix = (ix + 1) % panes.len();
@@ -5689,6 +5705,7 @@ impl Workspace {
     }
 
     pub fn activate_previous_pane(&mut self, window: &mut Window, cx: &mut App) {
+        self.show_code(false, window, cx);
         let panes = self.center.panes();
         if let Some(ix) = panes.iter().position(|pane| **pane == self.active_pane) {
             let prev_ix = cmp::min(ix.wrapping_sub(1), panes.len() - 1);
@@ -5698,6 +5715,7 @@ impl Workspace {
     }
 
     pub fn activate_last_pane(&mut self, window: &mut Window, cx: &mut App) {
+        self.show_code(false, window, cx);
         let last_pane = self.center.last_pane();
         window.focus(&last_pane.focus_handle(cx), cx);
     }
@@ -9612,7 +9630,7 @@ impl Workspace {
         self.sync_activity_bar(cx);
     }
 
-    fn sync_activity_bar(&self, cx: &mut Context<Self>) {
+    fn sync_activity_bar(&self, cx: &mut App) {
         let modules = self
             .modules
             .iter()
@@ -9653,6 +9671,7 @@ impl Workspace {
             self.focus_before_module = window.focused(cx);
         }
         self.active_module = Some(id);
+        self.module_activations += 1;
         if let Some((_, focus_handle)) = &self.modules[index].view {
             window.focus(focus_handle, cx);
         }
@@ -9662,17 +9681,22 @@ impl Workspace {
 
     /// Returns to the code layout. `restore_focus` is false when the caller is
     /// about to focus something in the code layout itself.
-    pub fn show_code(&mut self, restore_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn show_code(&mut self, restore_focus: bool, window: &mut Window, cx: &mut App) {
         if self.active_module.take().is_none() {
             return;
         }
         let previous_focus = self.focus_before_module.take();
         if restore_focus {
-            let focus = previous_focus.unwrap_or_else(|| self.fallback_focus_handle(window, cx));
-            window.focus(&focus, cx);
+            if let Some(previous_focus) = previous_focus {
+                window.focus(&previous_focus, cx);
+            }
+            // The element that had focus may have been closed meanwhile.
+            if window.focused(cx).is_none() {
+                window.focus(&self.fallback_focus_handle(window, cx), cx);
+            }
         }
         self.sync_activity_bar(cx);
-        cx.notify();
+        cx.notify(self.weak_self.entity_id());
     }
 
     fn active_module_view(&self) -> Option<&(AnyView, FocusHandle)> {
