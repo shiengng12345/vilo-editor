@@ -780,7 +780,7 @@ fn main() {
         svg_preview::init(cx);
         onboarding::init(cx);
         vilo_account::init(cx);
-        zed::vilo_tools::init(cx);
+        vilo_tools::init(cx);
         settings_ui::init(cx);
         keymap_editor::init(cx);
         extensions_ui::init(cx);

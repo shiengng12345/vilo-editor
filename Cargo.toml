@@ -230,6 +230,7 @@ members = [
     "crates/util",
     "crates/util_macros",
     "crates/vilo_account",
+    "crates/vilo_tools",
     "crates/vim",
     "crates/vim_mode_setting",
     "crates/watch",
@@ -501,6 +502,7 @@ ui_prompt = { path = "crates/ui_prompt" }
 util = { path = "crates/util" }
 util_macros = { path = "crates/util_macros" }
 vilo_account = { path = "crates/vilo_account" }
+vilo_tools = { path = "crates/vilo_tools" }
 vim = { path = "crates/vim" }
 vim_mode_setting = { path = "crates/vim_mode_setting" }
 watch = { path = "crates/watch" }

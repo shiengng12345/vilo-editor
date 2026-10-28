@@ -19589,6 +19589,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "vilo_tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "editor",
+ "futures 0.3.34",
+ "gpui",
+ "http_client",
+ "log",
+ "paths",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "time",
+ "ui",
+ "util",
+ "uuid",
+ "workspace",
+]
+
+[[package]]
 name = "vim"
 version = "0.1.0"
 dependencies = [
@@ -22562,6 +22584,7 @@ dependencies = [
  "util",
  "uuid",
  "vilo_account",
+ "vilo_tools",
  "vim",
  "vim_mode_setting",
  "watch",
