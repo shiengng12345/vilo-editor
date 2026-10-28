@@ -322,7 +322,6 @@ impl RenderOnce for AccountButton {
         let workspace = self.workspace;
         let open_welcome = {
             let store = store.clone();
-            let workspace = workspace.clone();
             move |window: &mut Window, cx: &mut App| {
                 let store = store.clone();
                 workspace
@@ -355,7 +354,7 @@ impl RenderOnce for AccountButton {
             .tooltip(Tooltip::text(display_name.clone()))
             .child(match avatar_url {
                 Some(avatar) => Avatar::new(avatar).size(rems(1.)).into_any_element(),
-                None => Label::new(display_name.clone())
+                None => Label::new(display_name)
                     .size(LabelSize::Small)
                     .into_any_element(),
             });
