@@ -16,7 +16,7 @@ use crate::jenkins::{
 
 /// Parameter definitions, build page sessions and cascade choices are reused
 /// for this long, so reopening a job is instant.
-pub(super) const FORM_CACHE: Duration = Duration::from_secs(5 * 60);
+pub(super) const FORM_CACHE: Duration = Duration::from_secs(60);
 
 /// What Vilo remembers about a job's build form.
 #[derive(Default)]
