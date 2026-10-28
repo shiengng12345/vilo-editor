@@ -5,7 +5,7 @@ use base64::Engine as _;
 use collections::HashMap;
 use context_server::{
     client::{Client, ContextServerId},
-    oauth::{self, AuthServerMetadata, WwwAuthenticate},
+    oauth::{self, AuthServerMetadata, OAuthTokens, WwwAuthenticate},
     protocol::ModelContextProtocol,
     transport::HttpTransport,
     types::{CallToolParams, Implementation, ToolResponseContent, requests::CallTool},
@@ -34,7 +34,8 @@ pub(crate) struct VerifiedIdentity {
     pub email: Option<String>,
     pub avatar_url: Option<String>,
     pub client_id: String,
-    pub refresh_token: Option<String>,
+    pub token_endpoint: Url,
+    pub tokens: OAuthTokens,
 }
 
 pub(crate) async fn sign_in(host: &str, cx: &mut AsyncApp) -> Result<VerifiedIdentity> {
@@ -91,7 +92,7 @@ pub(crate) async fn sign_in(host: &str, cx: &mut AsyncApp) -> Result<VerifiedIde
     )
     .await?;
 
-    let identity = fetch_identity(&http, &resource, &tokens.access_token, cx).await?;
+    let identity = fetch_identity(&resource, &tokens.access_token, cx).await?;
     Ok(VerifiedIdentity {
         issuer,
         resource,
@@ -100,7 +101,8 @@ pub(crate) async fn sign_in(host: &str, cx: &mut AsyncApp) -> Result<VerifiedIde
         email: identity.email,
         avatar_url: identity.avatar_url,
         client_id: registration.client_id,
-        refresh_token: tokens.refresh_token,
+        token_endpoint: metadata.token_endpoint,
+        tokens,
     })
 }
 
@@ -155,18 +157,41 @@ struct Identity {
 
 /// Asks the Meegle MCP server who the token belongs to. The account is only
 /// accepted when the answer carries a `user_key`; names and email are display only.
-async fn fetch_identity(
-    http: &Arc<dyn HttpClient>,
+async fn fetch_identity(resource: &Url, access_token: &str, cx: &mut AsyncApp) -> Result<Identity> {
+    let response = call_tool(
+        resource,
+        access_token,
+        IDENTITY_TOOL,
+        serde_json::json!({ "user_keys": ["current_login_user()"] }),
+        cx,
+    )
+    .await?;
+    parse_identity(&response)
+        .ok_or_else(|| anyhow!("Meegle did not return a user_key for the signed-in user"))
+}
+
+/// Read-only Meegle MCP tools Vilo may call with the account's token. The token
+/// itself can do more, so this list is the boundary (VILO_IDENTITY_LOGIN_PLAN §4.1).
+const ALLOWED_TOOLS: &[&str] = &[IDENTITY_TOOL, "list_todo", "search_project_info"];
+
+/// Calls one Meegle MCP tool and returns the JSON document in its text output.
+pub(crate) async fn call_tool(
     resource: &Url,
     access_token: &str,
+    name: &str,
+    arguments: serde_json::Value,
     cx: &mut AsyncApp,
-) -> Result<Identity> {
+) -> Result<serde_json::Value> {
+    if !ALLOWED_TOOLS.contains(&name) {
+        bail!("Vilo does not call the Meegle tool {name}");
+    }
+    let http = cx.update(|cx| cx.http_client());
     let headers = HashMap::from_iter([(
         "Authorization".to_string(),
         format!("Bearer {access_token}"),
     )]);
     let transport = Arc::new(HttpTransport::new(
-        http.clone(),
+        http,
         resource.to_string(),
         headers,
         cx.background_executor().clone(),
@@ -188,23 +213,45 @@ async fn fetch_identity(
         .await?;
     let response = protocol
         .request::<CallTool>(CallToolParams {
-            name: IDENTITY_TOOL.to_string(),
-            arguments: Some(serde_json::json!({ "user_keys": ["current_login_user()"] })),
+            name: name.to_string(),
+            arguments: Some(arguments),
             meta: None,
         })
         .await?;
     if response.is_error == Some(true) {
-        bail!("Meegle could not report the signed-in user");
+        bail!("Meegle reported an error for {name}");
     }
     response
         .content
         .iter()
-        .filter_map(|content| match content {
+        .find_map(|content| match content {
             ToolResponseContent::Text { text } => serde_json::from_str(text).ok(),
             _ => None,
         })
-        .find_map(|value: serde_json::Value| parse_identity(&value))
-        .ok_or_else(|| anyhow!("Meegle did not return a user_key for the signed-in user"))
+        .ok_or_else(|| anyhow!("Meegle returned no data for {name}"))
+}
+
+/// Exchanges the stored refresh token for a fresh access token.
+pub(crate) async fn refresh(
+    token_endpoint: &Url,
+    refresh_token: &str,
+    client_id: &str,
+    resource: &Url,
+    cx: &mut AsyncApp,
+) -> Result<OAuthTokens> {
+    if token_endpoint.scheme() != "https" || token_endpoint.host_str() != resource.host_str() {
+        bail!("stored Meegle token endpoint does not match the account");
+    }
+    let http = cx.update(|cx| cx.http_client());
+    oauth::refresh_tokens(
+        &http,
+        token_endpoint,
+        refresh_token,
+        client_id,
+        resource.as_str(),
+        None,
+    )
+    .await
 }
 
 fn parse_identity(value: &serde_json::Value) -> Option<Identity> {

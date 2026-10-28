@@ -7,7 +7,13 @@ use ui::{ContextMenu, CountBadge, IconButton, PopoverMenu, Tooltip, prelude::*, 
 pub const ACTIVITY_BAR_WIDTH: Pixels = px(48.);
 const ACTIVE_INDICATOR_WIDTH: Pixels = px(2.);
 /// VS Code's activity bar order; other panels follow in dock order.
-const VS_CODE_ORDER: &[&str] = &["Project Panel", "Search Panel", "GitPanel", "DebugPanel"];
+const VS_CODE_ORDER: &[&str] = &[
+    "Project Panel",
+    "Search Panel",
+    "GitPanel",
+    "DebugPanel",
+    "My Work Panel",
+];
 
 /// VS Code's Codicon and view name for a panel, keyed by its persistent name.
 fn vs_code_view(persistent_name: &str) -> Option<(&'static str, &'static str)> {
@@ -17,6 +23,7 @@ fn vs_code_view(persistent_name: &str) -> Option<(&'static str, &'static str)> {
         "GitPanel" => ("icons/vilo/codicons/source-control.svg", "Source Control"),
         "DebugPanel" => ("icons/vilo/codicons/debug-alt.svg", "Run and Debug"),
         "Outline Panel" => ("icons/vilo/codicons/list-tree.svg", "Outline"),
+        "My Work Panel" => ("icons/vilo/codicons/checklist.svg", "My Work"),
         _ => return None,
     })
 }

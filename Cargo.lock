@@ -19564,6 +19564,7 @@ name = "vilo_account"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-lock",
  "base64 0.22.1",
  "collections",
  "context_server",
@@ -19573,6 +19574,7 @@ dependencies = [
  "log",
  "menu",
  "paths",
+ "percent-encoding",
  "rand 0.9.4",
  "serde",
  "serde_json",

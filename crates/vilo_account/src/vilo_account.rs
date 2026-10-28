@@ -1,22 +1,31 @@
 mod callback;
 mod meegle;
+mod my_work_panel;
 mod welcome;
 
 use std::{
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result, anyhow};
+use context_server::oauth::OAuthTokenError;
+use futures::{FutureExt as _, future::Shared};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Global, SharedString, Task,
     TaskExt as _, WeakEntity,
 };
 use serde::{Deserialize, Serialize};
+use url::Url;
 use util::ResultExt as _;
 use workspace::Workspace;
 
 pub use meegle::MEEGLE_HOSTS;
+pub use my_work_panel::MyWorkPanel;
 pub use welcome::{AccountButton, WelcomeModal};
 
 /// The person signed in to this Vilo installation. Non-secret: written to the
@@ -50,6 +59,33 @@ struct StoredCredential {
     subject: String,
     client_id: String,
     refresh_token: Option<String>,
+    token_endpoint: Url,
+    resource: Url,
+}
+
+/// Refresh early so a token never expires between being handed out and used.
+const ACCESS_TOKEN_MARGIN: Duration = Duration::from_secs(60);
+/// Used when Meegle does not say how long an access token lives.
+const DEFAULT_ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
+
+/// The saved credential can no longer be used; only a new sign-in fixes it.
+#[derive(Debug)]
+struct SignInRequired(&'static str);
+
+impl std::fmt::Display for SignInRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for SignInRequired {}
+
+type AccessTokenTask = Shared<Task<Result<String, SharedString>>>;
+
+struct CachedAccess {
+    epoch: u64,
+    token: String,
+    expires_at: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,6 +114,17 @@ pub struct AccountStore {
     epoch: u64,
     pending: Option<PendingSignIn>,
     status: SignInStatus,
+    access: Option<CachedAccess>,
+    refreshing: Option<(u64, AccessTokenTask)>,
+    /// The saved credential was rejected; the record stays until the user signs in again.
+    needs_sign_in: bool,
+    /// Keychain writes and deletes run on background threads; holding this keeps a
+    /// late refresh from re-saving a credential that a sign-out just removed.
+    credential_lock: Arc<async_lock::Mutex<()>>,
+    /// Account-file writes may finish out of order; only the newest snapshot is written.
+    persist_sequence: u64,
+    persisted_sequence: Arc<AtomicU64>,
+    persist_lock: Arc<async_lock::Mutex<()>>,
 }
 
 struct GlobalAccountStore(Entity<AccountStore>);
@@ -102,8 +149,16 @@ pub fn init(cx: &mut App) {
         epoch: 0,
         pending: None,
         status: SignInStatus::Idle,
+        access: None,
+        refreshing: None,
+        needs_sign_in: false,
+        credential_lock: Arc::default(),
+        persist_sequence: 0,
+        persisted_sequence: Arc::default(),
+        persist_lock: Arc::default(),
     });
     cx.set_global(GlobalAccountStore(store.clone()));
+    my_work_panel::init(cx);
 
     cx.observe_new(move |_: &mut Workspace, window, cx| {
         let Some(window) = window else {
@@ -140,6 +195,86 @@ impl AccountStore {
 
     pub fn status(&self) -> &SignInStatus {
         &self.status
+    }
+
+    pub fn needs_sign_in(&self) -> bool {
+        self.needs_sign_in
+    }
+
+    /// Changes whenever the signed-in account changes; data fetched under an older
+    /// epoch belongs to a previous account and must be discarded.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Drops a cached token that the server rejected, so the next request refreshes.
+    pub fn invalidate_access_token(&mut self, token: &str) {
+        if self
+            .access
+            .as_ref()
+            .is_some_and(|access| access.token == token)
+        {
+            self.access = None;
+        }
+    }
+
+    /// A Meegle access token for the signed-in account, refreshed from the
+    /// keychain when missing or about to expire. Concurrent callers share one refresh.
+    pub fn access_token(&mut self, cx: &mut Context<Self>) -> AccessTokenTask {
+        let epoch = self.epoch;
+        if let Some(access) = &self.access
+            && access.epoch == epoch
+            && access
+                .expires_at
+                .is_none_or(|expires_at| expires_at > SystemTime::now() + ACCESS_TOKEN_MARGIN)
+        {
+            return Task::ready(Ok(access.token.clone())).shared();
+        }
+        if let Some((refresh_epoch, task)) = &self.refreshing
+            && *refresh_epoch == epoch
+        {
+            return task.clone();
+        }
+        let Some(account) = self.account.clone() else {
+            return Task::ready(Err("Sign in to Meegle first".into())).shared();
+        };
+        let task = cx
+            .spawn(async move |this, cx| {
+                let result = refresh_access(&this, &account, epoch, cx).await;
+                this.update(cx, |store, cx| {
+                    if store.epoch != epoch {
+                        return;
+                    }
+                    store.refreshing = None;
+                    match &result {
+                        Ok(access) => {
+                            store.needs_sign_in = false;
+                            store.access = Some(CachedAccess {
+                                epoch,
+                                token: access.0.clone(),
+                                expires_at: Some(access.1.unwrap_or_else(|| {
+                                    SystemTime::now() + DEFAULT_ACCESS_TOKEN_LIFETIME
+                                })),
+                            });
+                        }
+                        Err(error) if requires_sign_in(error) => store.needs_sign_in = true,
+                        Err(_) => {}
+                    }
+                    cx.notify();
+                })
+                .ok();
+                result
+                    .map(|(token, _)| token)
+                    .map_err(|error| SharedString::from(format!("{error:#}")))
+            })
+            .shared();
+        self.refreshing = Some((epoch, task.clone()));
+        task
+    }
+
+    pub fn resource(&self) -> Option<Url> {
+        let account = self.account.as_ref()?;
+        Url::parse(&account.issuer).ok()?.join("mcp_server/v1").ok()
     }
 
     pub fn mark_welcome_seen(&mut self, cx: &mut Context<Self>) {
@@ -194,14 +329,18 @@ impl AccountStore {
         self.epoch += 1;
         self.pending = None;
         self.status = SignInStatus::Idle;
+        self.access = None;
+        self.refreshing = None;
+        self.needs_sign_in = false;
         let Some(account) = self.account.take() else {
             return;
         };
         let persist = self.persist(cx);
-        let delete = cx.delete_credentials(&account.credential_url);
-        cx.spawn(async move |_, _| {
+        let credential_lock = self.credential_lock.clone();
+        cx.spawn(async move |_, cx| {
             persist.await?;
-            delete
+            let _guard = credential_lock.lock().await;
+            cx.update(|cx| cx.delete_credentials(&account.credential_url))
                 .await
                 .context("Vilo could not remove the saved Meegle credentials from the keychain")
         })
@@ -210,15 +349,25 @@ impl AccountStore {
         cx.notify();
     }
 
-    fn persist(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
+    fn persist(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.persist_sequence += 1;
+        let sequence = self.persist_sequence;
+        let persisted_sequence = self.persisted_sequence.clone();
+        let lock = self.persist_lock.clone();
         let path = self.path.clone();
         let file = AccountFile {
             welcome_seen: self.welcome_seen,
             account: self.account.clone(),
         };
-        cx.background_spawn(
-            async move { write_atomically(&path, &serde_json::to_vec_pretty(&file)?) },
-        )
+        cx.background_spawn(async move {
+            let _guard = lock.lock().await;
+            if persisted_sequence.load(Ordering::SeqCst) > sequence {
+                return Ok(());
+            }
+            write_atomically(&path, &serde_json::to_vec_pretty(&file)?)?;
+            persisted_sequence.store(sequence, Ordering::SeqCst);
+            Ok(())
+        })
     }
 }
 
@@ -245,7 +394,9 @@ async fn commit(
         issuer: identity.issuer.to_string(),
         subject: identity.subject.clone(),
         client_id: identity.client_id.clone(),
-        refresh_token: identity.refresh_token.clone(),
+        refresh_token: identity.tokens.refresh_token.clone(),
+        token_endpoint: identity.token_endpoint.clone(),
+        resource: identity.resource.clone(),
     })?;
     if !this.read_with(cx, |store, _| is_current(store))? {
         return Ok(());
@@ -315,6 +466,13 @@ async fn commit(
             store.epoch += 1;
             store.pending = None;
             store.status = SignInStatus::Idle;
+            store.needs_sign_in = false;
+            store.refreshing = None;
+            store.access = Some(CachedAccess {
+                epoch: store.epoch,
+                token: identity.tokens.access_token.clone(),
+                expires_at: identity.tokens.expires_at,
+            });
             cx.emit(AccountEvent::SignedIn);
             cx.notify();
         }
@@ -325,6 +483,72 @@ async fn commit(
             .log_err();
     }
     Ok(())
+}
+
+async fn refresh_access(
+    this: &WeakEntity<AccountStore>,
+    account: &AccountRecord,
+    epoch: u64,
+    cx: &mut AsyncApp,
+) -> Result<(String, Option<SystemTime>)> {
+    let (username, bytes) = cx
+        .update(|cx| cx.read_credentials(&account.credential_url))
+        .await?
+        .ok_or(SignInRequired(
+            "The saved Meegle session is missing. Sign in again.",
+        ))?;
+    let mut credential: StoredCredential = serde_json::from_slice(&bytes)
+        .map_err(|_| SignInRequired("Your Meegle session needs to be renewed. Sign in again."))?;
+    if credential.issuer != account.issuer || credential.subject != account.subject {
+        return Err(SignInRequired("The saved Meegle session belongs to another account.").into());
+    }
+    let refresh_token = credential.refresh_token.clone().ok_or(SignInRequired(
+        "Your Meegle session expired. Sign in again.",
+    ))?;
+    let tokens = meegle::refresh(
+        &credential.token_endpoint,
+        &refresh_token,
+        &credential.client_id,
+        &credential.resource,
+        cx,
+    )
+    .await?;
+
+    let Some(rotated) = tokens
+        .refresh_token
+        .clone()
+        .filter(|token| *token != refresh_token)
+    else {
+        return Ok((tokens.access_token, tokens.expires_at));
+    };
+    let credential_lock = this.read_with(cx, |store, _| store.credential_lock.clone())?;
+    let _guard = credential_lock.lock().await;
+    if this.read_with(cx, |store, _| store.epoch)? != epoch {
+        return Err(anyhow!("signed out while renewing the Meegle session"));
+    }
+    // Another window may have renewed it already; its newer token wins.
+    let stored = cx
+        .update(|cx| cx.read_credentials(&account.credential_url))
+        .await?
+        .and_then(|(_, bytes)| serde_json::from_slice::<StoredCredential>(&bytes).ok());
+    if stored.and_then(|stored| stored.refresh_token) != Some(refresh_token) {
+        return Ok((tokens.access_token, tokens.expires_at));
+    }
+    credential.refresh_token = Some(rotated);
+    let bytes = serde_json::to_vec(&credential)?;
+    cx.update(|cx| cx.write_credentials(&account.credential_url, &username, &bytes))
+        .await
+        .map_err(|_| {
+            SignInRequired("Vilo could not save the renewed Meegle session. Sign in again.")
+        })?;
+    Ok((tokens.access_token, tokens.expires_at))
+}
+
+fn requires_sign_in(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SignInRequired>().is_some()
+        || error
+            .downcast_ref::<OAuthTokenError>()
+            .is_some_and(|error| error.error == "invalid_grant")
 }
 
 fn write_atomically(path: &PathBuf, contents: &[u8]) -> Result<()> {
