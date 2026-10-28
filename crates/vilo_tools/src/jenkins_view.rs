@@ -1,3 +1,5 @@
+mod actions;
+
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -37,6 +39,13 @@ struct Connection {
     /// Normalized base URL, e.g. `https://jenkins.example.com/`.
     address: String,
     username: String,
+    /// Every change needs the job name typed. On unless the user turns it off.
+    #[serde(default = "protected_by_default")]
+    protected: bool,
+}
+
+fn protected_by_default() -> bool {
+    true
 }
 
 impl Connection {
@@ -112,6 +121,7 @@ impl BuildState {
 
 struct Form {
     editing: Option<String>,
+    protected: bool,
     name: Entity<Editor>,
     address: Entity<Editor>,
     username: Entity<Editor>,
@@ -135,6 +145,7 @@ pub struct JenkinsView {
     job: Option<(Vec<String>, Fetch<Vec<Build>>)>,
     build: Option<BuildState>,
     form: Option<Form>,
+    action: Option<actions::ActionState>,
     tasks: Vec<Task<()>>,
 }
 
@@ -269,6 +280,7 @@ impl JenkinsView {
             job: None,
             build: None,
             form: None,
+            action: None,
             tasks: Vec::new(),
         };
         if view.connections.is_empty() {
@@ -304,6 +316,7 @@ impl JenkinsView {
         self.job = None;
         self.build = None;
         self.form = None;
+        self.action = None;
         self.tasks.clear();
         self.session_error = Some("Connecting…".into());
         self.tasks.push(cx.spawn(async move |this, cx| {
@@ -379,6 +392,7 @@ impl JenkinsView {
         };
         self.build = None;
         self.form = None;
+        self.action = None;
         self.job = Some((job.clone(), Fetch::Loading));
         let generation = self.generation;
         self.tasks.push(cx.spawn(async move |this, cx| {
@@ -563,6 +577,7 @@ impl JenkinsView {
                 window,
                 cx,
             ),
+            protected: existing.as_ref().is_none_or(|c| c.protected),
             editing,
             message: None,
             checking: false,
@@ -603,6 +618,7 @@ impl JenkinsView {
             name,
             address: base.to_string(),
             username,
+            protected: form.protected,
         };
         // A saved secret is reused only for the same address and user.
         let keeps_secret = existing
@@ -897,6 +913,16 @@ impl JenkinsView {
             .child(input("Username", &form.username))
             .child(input("Password or API token", &form.secret))
             .child(
+                Checkbox::new("jenkins-protected", ToggleState::from(form.protected))
+                    .label("Protected: confirm every build and stop by typing the job name")
+                    .on_click(cx.listener(|this, state: &ToggleState, _, cx| {
+                        if let Some(form) = &mut this.form {
+                            form.protected = state.selected();
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
                 Label::new(
                     "Either works. An API token can be revoked on its own without changing the password. \
                      It is kept in the macOS keychain and only sent to this address. Vilo only reads from Jenkins.",
@@ -977,6 +1003,13 @@ impl JenkinsView {
                     .gap_2()
                     .child(Headline::new(job.join(" / ")).size(HeadlineSize::Small))
                     .child(div().flex_1())
+                    .child({
+                        let job = job.to_vec();
+                        Button::new("jenkins-build-now", "Build…")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::Small))
+                            .on_click(cx.listener(move |this, _, window, cx| this.start_build_form(job.clone(), None, window, cx)))
+                    })
                     .child(Label::new(format!("last {BUILDS_SHOWN} builds")).size(LabelSize::Small).color(Color::Muted))
                     .child(
                         IconButton::new("jenkins-refresh-builds", IconName::RotateCw)
@@ -1076,6 +1109,29 @@ impl JenkinsView {
                     )
                     .child(Label::new(format!("#{}", build.number)).buffer_font(cx))
                     .child(Label::new(status).color(color))
+                    .child(div().flex_1())
+                    .when(build.info.as_ref().is_some_and(|info| info.building), |this| {
+                        let job = build.job.clone();
+                        let number = build.number;
+                        this.child(
+                            Button::new("jenkins-stop", "Stop")
+                                .label_size(LabelSize::Small)
+                                .start_icon(Icon::new(IconName::Stop).size(IconSize::Small))
+                                .on_click(cx.listener(move |this, _, window, cx| this.start_stop(job.clone(), number, window, cx))),
+                        )
+                    })
+                    .child({
+                        let job = build.job.clone();
+                        let parameters = build.info.as_ref().map(|info| info.parameters.clone()).unwrap_or_default();
+                        let number = build.number;
+                        Button::new("jenkins-rebuild", "Rebuild…")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))
+                            .tooltip(Tooltip::text("A new build with this build's parameters, which you can change"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.start_build_form(job.clone(), Some((number, parameters.clone())), window, cx)
+                            }))
+                    })
                     .when_some(build.info.as_ref(), |this, info| {
                         this.child(
                             Label::new(format!(
@@ -1191,6 +1247,8 @@ impl Render for JenkinsView {
 
         let main = if let Some(form) = &self.form {
             self.render_form(form, cx)
+        } else if let Some(action) = &self.action {
+            self.render_action(action, cx)
         } else if let Some(message) = &self.session_error {
             Label::new(message.clone()).color(Color::Muted).into_any_element()
         } else if let Some(build) = &self.build {
