@@ -191,6 +191,9 @@ pub struct VaultView {
     notice: Option<SharedString>,
     /// Value rows showing their formatted JSON.
     expanded_values: HashSet<String>,
+    /// The whole secret shown as one JSON document; it reveals every value.
+    json_view: bool,
+    confirm_json_view: bool,
     collapsed_sites: HashSet<String>,
     import: Option<import::ImportState>,
     compare: Option<compare::CompareState>,
@@ -230,6 +233,8 @@ impl VaultView {
         // Revealed values are masked again whenever the page loses focus.
         let subscriptions = vec![cx.on_focus_out(&focus_handle, window, |this, _, _, cx| {
             this.revealed.clear();
+            this.json_view = false;
+            this.confirm_json_view = false;
             this.remask_edit(cx);
             cx.notify();
         })];
@@ -249,6 +254,8 @@ impl VaultView {
             edit: None,
             notice: None,
             expanded_values: HashSet::default(),
+            json_view: false,
+            confirm_json_view: false,
             collapsed_sites: HashSet::default(),
             import: None,
             compare: None,
@@ -297,6 +304,8 @@ impl VaultView {
         self.edit = None;
         self.notice = None;
         self.expanded_values.clear();
+        self.json_view = false;
+        self.confirm_json_view = false;
         self.revealed.clear();
         self.confirm_reveal_all = false;
         self.tasks.clear();
@@ -434,6 +443,8 @@ impl VaultView {
             None
         };
         self.generation += 1;
+        self.json_view = false;
+        self.confirm_json_view = false;
         self.revealed.clear();
         self.confirm_reveal_all = false;
         let generation = self.generation;
@@ -1354,6 +1365,34 @@ impl VaultView {
                         )
                     })
                     .child(div().flex_1())
+                    .child(
+                        Button::new(
+                            "vault-json-view",
+                            if self.json_view {
+                                "Table"
+                            } else if self.confirm_json_view {
+                                "Click again to show all values as JSON"
+                            } else {
+                                "JSON"
+                            },
+                        )
+                        .label_size(LabelSize::Small)
+                        .start_icon(
+                            Icon::new(if self.json_view { IconName::ListTree } else { IconName::Code })
+                                .size(IconSize::Small),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.json_view {
+                                this.json_view = false;
+                            } else if this.confirm_json_view {
+                                this.json_view = true;
+                                this.confirm_json_view = false;
+                            } else {
+                                this.confirm_json_view = true;
+                            }
+                            cx.notify();
+                        })),
+                    )
                     .child({
                         let blocked = if secret.mount.version != KvVersion::V2 {
                             Some("KV v1 secrets are read-only in Vilo.")
@@ -1502,7 +1541,36 @@ impl VaultView {
                         }),
                     );
                 }
-                v_flex().flex_1().min_h_0().gap_2().child(toolbar).child(rows).into_any_element()
+                let content = if self.json_view {
+                    let document = serde_json::to_string_pretty(&found.values).unwrap_or_default();
+                    let copy = document.clone();
+                    v_flex()
+                        .id("vault-json-document")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .p_3()
+                        .gap_0()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.editor_subheader_background)
+                        .child(
+                            h_flex().justify_end().child(
+                                Button::new("vault-copy-json", "Copy JSON")
+                                    .label_size(LabelSize::Small)
+                                    .start_icon(Icon::new(IconName::Copy).size(IconSize::Small))
+                                    .tooltip(Tooltip::text("Copied values are cleared from the clipboard after 30 s"))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.copy_value(copy.clone(), cx))),
+                            ),
+                        )
+                        .children(document.lines().map(|line| {
+                            Label::new(line.to_string()).size(LabelSize::Small).buffer_font(cx)
+                        }))
+                        .into_any_element()
+                } else {
+                    rows.into_any_element()
+                };
+                v_flex().flex_1().min_h_0().gap_2().child(toolbar).child(content).into_any_element()
             }
         };
         v_flex().flex_1().min_h_0().gap_3().child(header).child(body).into_any_element()
