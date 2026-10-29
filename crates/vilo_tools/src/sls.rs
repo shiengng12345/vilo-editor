@@ -200,10 +200,6 @@ impl SlsClient {
         })
     }
 
-    pub fn allowed_projects(&self) -> &[String] {
-        &self.allowed_projects
-    }
-
     /// Projects the AccessKey can list. Listing permission is not needed to query an allowed project.
     pub async fn list_projects(&self) -> Result<Vec<String>, SlsError> {
         let query = BTreeMap::from([("offset".into(), "0".into()), ("size".into(), "500".into())]);

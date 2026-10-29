@@ -3,6 +3,7 @@ mod argo_view;
 mod jenkins;
 mod jenkins_view;
 mod sls;
+mod sls_view;
 mod vault;
 mod vault_compare;
 mod vault_import;
@@ -15,6 +16,7 @@ use workspace::Workspace;
 
 use argo_view::ArgoView;
 use jenkins_view::JenkinsView;
+use sls_view::SlsView;
 use vault_view::VaultView;
 
 const MODULE_ID: &str = "tools";
@@ -32,6 +34,7 @@ pub fn init(cx: &mut App) {
                     vault: None,
                     jenkins: None,
                     argo: None,
+                    sls: None,
                     open: None,
                 });
                 let focus_handle = page.focus_handle(cx);
@@ -48,6 +51,7 @@ enum Tool {
     Vault,
     Jenkins,
     Argo,
+    Sls,
 }
 
 struct ToolsPage {
@@ -56,6 +60,7 @@ struct ToolsPage {
     vault: Option<Entity<VaultView>>,
     jenkins: Option<Entity<JenkinsView>>,
     argo: Option<Entity<ArgoView>>,
+    sls: Option<Entity<SlsView>>,
     open: Option<Tool>,
 }
 
@@ -73,6 +78,10 @@ impl ToolsPage {
             Tool::Argo => self
                 .argo
                 .get_or_insert_with(|| cx.new(|cx| ArgoView::new(window, cx)))
+                .focus_handle(cx),
+            Tool::Sls => self
+                .sls
+                .get_or_insert_with(|| cx.new(|cx| SlsView::new(window, cx)))
                 .focus_handle(cx),
         };
         self.open = Some(tool);
@@ -108,7 +117,8 @@ impl ToolsPage {
                     .flex_wrap()
                     .child(card("tool-vault", Tool::Vault, IconName::Lock, "Vault", "Browse, compare and edit HashiCorp Vault secrets.", cx))
                     .child(card("tool-jenkins", Tool::Jenkins, IconName::Server, "Jenkins", "Jobs, builds and logs; build, rebuild and stop.", cx))
-                    .child(card("tool-argo", Tool::Argo, IconName::Server, "Argo CD", "Applications, health, sync, history; refresh.", cx)),
+                    .child(card("tool-argo", Tool::Argo, IconName::Server, "Argo CD", "Applications, health, sync, history; refresh.", cx))
+                    .child(card("tool-sls", Tool::Sls, IconName::MagnifyingGlass, "SLS", "Alibaba Cloud log search. Read-only.", cx)),
             )
     }
 }
@@ -126,6 +136,7 @@ impl Render for ToolsPage {
             Some(Tool::Vault) => self.vault.clone().map(|view| ("Vault", view.into())),
             Some(Tool::Jenkins) => self.jenkins.clone().map(|view| ("Jenkins", view.into())),
             Some(Tool::Argo) => self.argo.clone().map(|view| ("Argo CD", view.into())),
+            Some(Tool::Sls) => self.sls.clone().map(|view| ("SLS", view.into())),
             None => None,
         };
         v_flex()
