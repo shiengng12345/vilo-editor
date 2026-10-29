@@ -1,3 +1,5 @@
+mod pod;
+
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -7,7 +9,11 @@ use serde::{Deserialize, Serialize};
 use ui::{Button, ButtonStyle, IconButton, Indicator, Tooltip, prelude::*};
 use util::ResultExt as _;
 
-use crate::argo::{AppDetail, AppSummary, ArgoClient, ArgoError, AuthMode, Event, Resource, normalize_base};
+use crate::argo::{
+    AppDetail, AppSummary, ArgoClient, ArgoError, AuthMode, Event, Resource, Workload, normalize_base, workloads,
+};
+
+const PODS_PER_PAGE: usize = 20;
 
 /// How often an open application is re-read while the page is in view.
 const DETAIL_POLL: Duration = Duration::from_secs(10);
@@ -48,6 +54,35 @@ impl Connection {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum PodView {
+    /// One line per workload; problem workloads open with their pods.
+    Grouped,
+    /// One row per pod, paginated.
+    Table,
+}
+
+/// A pod needs attention when it or its workload is not healthy. Restarts alone do not count.
+fn pod_has_problem(pod: &Resource) -> bool {
+    let status = pod.info("Status Reason").unwrap_or("");
+    pod.health.as_deref() != Some("Healthy") || !(status.is_empty() || status == "Running" || status == "Completed")
+}
+
+fn workload_has_problem(group: &Workload) -> bool {
+    group.resource.as_ref().is_some_and(|resource| resource.health.as_deref() != Some("Healthy"))
+        || group.pods.iter().any(pod_has_problem)
+}
+
+/// The tag part of each distinct image, so a rollout with two versions shows both.
+fn image_tags(images: &[String]) -> String {
+    let mut tags = images
+        .iter()
+        .map(|image| image.rsplit_once(':').map_or(image.as_str(), |(_, tag)| tag).to_string())
+        .collect::<Vec<_>>();
+    tags.dedup();
+    tags.join(", ")
+}
+
 enum Fetch<T> {
     Loading,
     Loaded(T),
@@ -75,6 +110,9 @@ struct Detail {
     events: Fetch<Vec<Event>>,
     refresh: RefreshState,
     confirm_hard: bool,
+    /// The pod opened from this application, shown instead of the application.
+    pod: Option<pod::PodPanel>,
+    pod_page: usize,
     _poll: Task<()>,
 }
 
@@ -103,6 +141,13 @@ pub struct ArgoView {
     generation: u64,
     apps: Fetch<Vec<AppSummary>>,
     filter: Entity<Editor>,
+    pod_filter: Entity<Editor>,
+    /// Keeps only log lines containing this text.
+    log_filter: Entity<Editor>,
+    pod_view: PodView,
+    only_problems: bool,
+    /// Healthy workloads the user opened in the grouped view.
+    expanded: collections::HashSet<String>,
     detail: Option<Detail>,
     /// Polling only runs while the page is in view.
     visible: bool,
@@ -183,6 +228,8 @@ impl ArgoView {
             .collect::<Vec<_>>();
         let focus_handle = cx.focus_handle();
         let filter = editor("Filter applications", "", false, window, cx);
+        let pod_filter = editor("Filter workloads and pods", "", false, window, cx);
+        let log_filter = editor("Only lines containing…", "", false, window, cx);
         let subscriptions = vec![
             cx.on_focus_in(&focus_handle, window, |this, _, cx| {
                 this.visible = true;
@@ -193,6 +240,13 @@ impl ArgoView {
                 cx.notify();
             }),
             cx.subscribe(&filter, |_, _, _: &editor::EditorEvent, cx| cx.notify()),
+            cx.subscribe(&log_filter, |_, _, _: &editor::EditorEvent, cx| cx.notify()),
+            cx.subscribe(&pod_filter, |this, _, _: &editor::EditorEvent, cx| {
+                if let Some(detail) = &mut this.detail {
+                    detail.pod_page = 0;
+                }
+                cx.notify();
+            }),
         ];
         let mut view = Self {
             focus_handle,
@@ -203,6 +257,11 @@ impl ArgoView {
             generation: 0,
             apps: Fetch::Loaded(Vec::new()),
             filter,
+            pod_filter,
+            log_filter,
+            pod_view: PodView::Grouped,
+            only_problems: false,
+            expanded: collections::HashSet::default(),
             detail: None,
             visible: true,
             form: None,
@@ -359,6 +418,8 @@ impl ArgoView {
             events: Fetch::Loading,
             refresh: RefreshState::Idle,
             confirm_hard: false,
+            pod: None,
+            pod_page: 0,
             _poll: poll,
         });
         cx.notify();
@@ -752,6 +813,7 @@ impl ArgoView {
     }
 
     fn render_detail(&self, detail: &Detail, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
         let section = |title: &'static str| Label::new(title).size(LabelSize::Small).weight(gpui::FontWeight::SEMIBOLD);
         let base = self
             .session
@@ -812,17 +874,263 @@ impl ArgoView {
                 }
             }
         }
-        body = body.child(section("Resources"));
+        body = body.child(section("Pods"));
         body = match &detail.resources {
             Fetch::Loading => body.child(Label::new("Loading…").size(LabelSize::Small).color(Color::Muted)),
             Fetch::Failed(message) => body.child(Label::new(message.clone()).size(LabelSize::Small).color(Color::Muted)),
-            Fetch::Loaded(resources) => body.children(resources.iter().take(200).map(|resource| {
-                h_flex()
-                    .gap_2()
-                    .child(Indicator::dot().color(resource.health.as_deref().map_or(Color::Muted, health_color)))
-                    .child(Label::new(format!("{} {}", resource.kind, resource.name)).size(LabelSize::Small))
-                    .when_some(resource.message.clone(), |this, message| this.child(Label::new(message).size(LabelSize::XSmall).color(Color::Muted).truncate()))
-            })),
+            Fetch::Loaded(resources) => {
+                let query = self.pod_filter.read(cx).text(cx).to_lowercase();
+                let groups = workloads(resources)
+                    .into_iter()
+                    .filter_map(|mut group| {
+                        let owner = group.resource.as_ref().map(|resource| resource.name.to_lowercase()).unwrap_or_default();
+                        if !query.is_empty() && !owner.contains(&query) {
+                            group.pods.retain(|pod| pod.name.to_lowercase().contains(&query));
+                            if group.pods.is_empty() {
+                                return None;
+                            }
+                        }
+                        if self.only_problems {
+                            if !workload_has_problem(&group) {
+                                return None;
+                            }
+                            if group.resource.as_ref().is_none_or(|resource| resource.health.as_deref() == Some("Healthy")) {
+                                group.pods.retain(pod_has_problem);
+                            }
+                        }
+                        Some(group)
+                    })
+                    .collect::<Vec<_>>();
+                let mode_button = |id: &'static str, label: &'static str, mode: PodView, cx: &mut Context<Self>| {
+                    Button::new(id, label)
+                        .label_size(LabelSize::Small)
+                        .style(if self.pod_view == mode { ButtonStyle::Filled } else { ButtonStyle::Subtle })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pod_view = mode;
+                            cx.notify();
+                        }))
+                };
+                body = body.child(
+                    h_flex()
+                        .gap_2()
+                        .child(mode_button("argo-view-grouped", "Grouped", PodView::Grouped, cx))
+                        .child(mode_button("argo-view-table", "Table", PodView::Table, cx))
+                        .child(
+                            div()
+                                .w(px(260.))
+                                .px_2()
+                                .py_0p5()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(colors.editor_background)
+                                .child(self.pod_filter.clone()),
+                        )
+                        .child(
+                            ui::Checkbox::new("argo-only-problems", ui::ToggleState::from(self.only_problems))
+                                .label("Only problems")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, state: &ui::ToggleState, _, cx| {
+                                    this.only_problems = state.selected();
+                                    if let Some(detail) = &mut this.detail {
+                                        detail.pod_page = 0;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                );
+                let pod_row = |owner: Option<String>, pod: &Resource, cx: &mut Context<Self>| {
+                    let selected = detail.pod.as_ref().is_some_and(|panel| panel.pod.uid == pod.uid);
+                    let status = pod.info("Status Reason").unwrap_or(pod.health.as_deref().unwrap_or("Unknown")).to_string();
+                    let created = pod.created_at.clone().unwrap_or_default().replace('T', " ").trim_end_matches('Z').to_string();
+                    let open = pod.clone();
+                    h_flex()
+                        .id(SharedString::from(format!("argo-pod-{}", pod.uid)))
+                        .px_3()
+                        .py_1()
+                        .gap_3()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .cursor_pointer()
+                        .when(selected, |this| this.bg(colors.element_selected))
+                        .hover(|style| style.bg(colors.element_hover))
+                        .tooltip(Tooltip::text("Open the pod: summary, events, logs and manifest"))
+                        .on_click(cx.listener(move |this, _, window, cx| this.open_pod(open.clone(), window, cx)))
+                        .when_some(owner, |this, owner| {
+                            this.child(div().w(px(180.)).flex_none().child(Label::new(owner).size(LabelSize::Small).truncate()))
+                        })
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1p5()
+                                .child(Indicator::dot().color(pod.health.as_deref().map_or(Color::Muted, health_color)))
+                                .child(Label::new(pod.name.clone()).size(LabelSize::Small).buffer_font(cx).truncate()),
+                        )
+                        .child(div().w(px(150.)).flex_none().child(Label::new(status).size(LabelSize::Small).truncate().color(
+                            if pod_has_problem(pod) { Color::Error } else { Color::Default },
+                        )))
+                        .child(div().w(px(50.)).flex_none().child(Label::new(pod.info("Containers").unwrap_or("").to_string()).size(LabelSize::Small)))
+                        .child(div().w(px(70.)).flex_none().child(Label::new(pod.info("Restart Count").unwrap_or("0").to_string()).size(LabelSize::Small)))
+                        .child(div().w(px(140.)).flex_none().child(Label::new(created).size(LabelSize::XSmall).color(Color::Muted)))
+                };
+                let header = |text: &'static str, width: Option<f32>| {
+                    let label = Label::new(text).size(LabelSize::XSmall).color(Color::Muted);
+                    match width {
+                        Some(width) => div().w(px(width)).flex_none().child(label),
+                        None => div().flex_1().min_w_0().child(label),
+                    }
+                };
+                let header_row = |with_owner: bool| {
+                    h_flex()
+                        .px_3()
+                        .py_1()
+                        .gap_3()
+                        .bg(colors.element_background)
+                        .when(with_owner, |this| this.child(header("WORKLOAD", Some(180.))))
+                        .child(header("POD", None))
+                        .child(header("STATUS", Some(150.)))
+                        .child(header("READY", Some(50.)))
+                        .child(header("RESTARTS", Some(70.)))
+                        .child(header("CREATED", Some(140.)))
+                };
+                if groups.is_empty() {
+                    body = body.child(Label::new(if self.only_problems { "No problems." } else { "No pods." }).size(LabelSize::Small).color(Color::Muted));
+                }
+                match self.pod_view {
+                    PodView::Grouped => {
+                        let mut list = v_flex().rounded_md().border_1().border_color(colors.border);
+                        for group in &groups {
+                            let key = group.resource.as_ref().map_or("—".to_string(), |resource| resource.uid.clone());
+                            let problem = workload_has_problem(group);
+                            let open = problem || self.expanded.contains(&key) || !query.is_empty();
+                            let healthy_pods = group.pods.iter().filter(|pod| !pod_has_problem(pod)).count();
+                            let images = group
+                                .resource
+                                .as_ref()
+                                .map(|resource| resource.images.clone())
+                                .filter(|images| !images.is_empty())
+                                .unwrap_or_else(|| group.pods.iter().flat_map(|pod| pod.images.clone()).collect());
+                            let title = group.resource.as_ref().map_or("Other pods".to_string(), |resource| resource.name.clone());
+                            let health = group.resource.as_ref().and_then(|resource| resource.health.clone());
+                            let toggle = key.clone();
+                            list = list.child(
+                                h_flex()
+                                    .id(SharedString::from(format!("argo-workload-{key}")))
+                                    .px_3()
+                                    .py_1()
+                                    .gap_3()
+                                    .border_t_1()
+                                    .border_color(colors.border_variant)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(colors.element_hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !this.expanded.remove(&toggle) {
+                                            this.expanded.insert(toggle.clone());
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(Indicator::dot().color(if problem {
+                                        health.as_deref().filter(|health| *health != "Healthy").map_or(Color::Error, health_color)
+                                    } else {
+                                        Color::Success
+                                    }))
+                                    .child(div().w(px(240.)).flex_none().child(Label::new(title).size(LabelSize::Small).weight(gpui::FontWeight::SEMIBOLD).truncate()))
+                                    .child(div().w(px(70.)).flex_none().child(Label::new(format!("{healthy_pods}/{}", group.pods.len())).size(LabelSize::Small).color(
+                                        if problem { Color::Error } else { Color::Muted },
+                                    )))
+                                    .child(div().flex_1().min_w_0().child(Label::new(image_tags(&images)).size(LabelSize::XSmall).buffer_font(cx).color(Color::Muted).truncate())),
+                            );
+                            if open {
+                                if group.pods.is_empty() {
+                                    list = list.child(div().pl_8().py_1().child(Label::new("No pods.").size(LabelSize::XSmall).color(Color::Muted)));
+                                }
+                                for pod in &group.pods {
+                                    list = list.child(div().pl_5().child(pod_row(None, pod, cx)));
+                                }
+                            }
+                        }
+                        body = body.child(list);
+                    }
+                    PodView::Table => {
+                        let rows = groups
+                            .iter()
+                            .flat_map(|group| {
+                                let owner = group.resource.as_ref().map_or("—".to_string(), |resource| resource.name.clone());
+                                group.pods.iter().map(move |pod| (owner.clone(), pod))
+                            })
+                            .collect::<Vec<_>>();
+                        let pages = rows.len().div_ceil(PODS_PER_PAGE).max(1);
+                        let page = detail.pod_page.min(pages - 1);
+                        let mut table = v_flex().rounded_md().border_1().border_color(colors.border).child(header_row(true));
+                        for (owner, pod) in rows.iter().skip(page * PODS_PER_PAGE).take(PODS_PER_PAGE) {
+                            table = table.child(pod_row(Some(owner.clone()), pod, cx));
+                        }
+                        body = body.child(table).child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Label::new(format!(
+                                        "{}–{} of {} pods",
+                                        (page * PODS_PER_PAGE + 1).min(rows.len()),
+                                        ((page + 1) * PODS_PER_PAGE).min(rows.len()),
+                                        rows.len()
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    IconButton::new("argo-pods-previous", IconName::ChevronLeft)
+                                        .icon_size(IconSize::Small)
+                                        .disabled(page == 0)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(detail) = &mut this.detail {
+                                                detail.pod_page = page.saturating_sub(1);
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(Label::new(format!("{} / {pages}", page + 1)).size(LabelSize::Small))
+                                .child(
+                                    IconButton::new("argo-pods-next", IconName::ChevronRight)
+                                        .icon_size(IconSize::Small)
+                                        .disabled(page + 1 >= pages)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(detail) = &mut this.detail {
+                                                detail.pod_page = (page + 1).min(pages - 1);
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
+                        );
+                    }
+                }
+                let problems = resources
+                    .iter()
+                    .filter(|resource| {
+                        !matches!(resource.kind.as_str(), "Pod" | "ReplicaSet")
+                            && !matches!(resource.health.as_deref(), Some("Healthy") | None)
+                    })
+                    .collect::<Vec<_>>();
+                if !problems.is_empty() {
+                    body = body.child(section("Other resources with problems")).children(problems.into_iter().map(|resource| {
+                        h_flex()
+                            .gap_2()
+                            .child(Indicator::dot().color(resource.health.as_deref().map_or(Color::Muted, health_color)))
+                            .child(Label::new(format!("{} {}", resource.kind, resource.name)).size(LabelSize::Small))
+                            .when_some(resource.message.clone(), |this, message| {
+                                this.child(Label::new(message).size(LabelSize::XSmall).color(Color::Muted).truncate())
+                            })
+                    }));
+                }
+                body
+            }
         };
         body = body.child(section("Events"));
         body = match &detail.events {
@@ -935,6 +1243,8 @@ impl Render for ArgoView {
             self.render_form(form, cx)
         } else if let Some(message) = &self.session_error {
             Label::new(message.clone()).color(Color::Muted).into_any_element()
+        } else if let Some(panel) = self.detail.as_ref().and_then(|detail| detail.pod.as_ref()) {
+            self.render_pod(panel, cx)
         } else if let Some(detail) = &self.detail {
             self.render_detail(detail, cx)
         } else if self.session.is_some() {
@@ -957,5 +1267,43 @@ impl Render for ArgoView {
                     .child(header)
                     .child(v_flex().flex_1().min_h_0().p_4().gap_3().child(main)),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pod(health: &str, status: &str, restarts: &str) -> Resource {
+        Resource {
+            uid: "p".into(),
+            kind: "Pod".into(),
+            name: "p".into(),
+            namespace: "ns".into(),
+            health: Some(health.into()),
+            message: None,
+            parents: Vec::new(),
+            info: vec![("Status Reason".into(), status.into()), ("Restart Count".into(), restarts.into())],
+            images: Vec::new(),
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn test_problems_ignore_restart_counts() {
+        assert!(!pod_has_problem(&pod("Healthy", "Running", "12")));
+        assert!(pod_has_problem(&pod("Degraded", "CrashLoopBackOff", "3")));
+        assert!(pod_has_problem(&pod("Progressing", "ContainerCreating", "0")));
+        assert!(!pod_has_problem(&pod("Healthy", "Completed", "0")));
+    }
+
+    #[test]
+    fn test_image_tags_show_each_version_once() {
+        let images = vec![
+            "registry/x/auth:v1".to_string(),
+            "registry/x/auth:v1".to_string(),
+            "registry/x/auth:v2".to_string(),
+        ];
+        assert_eq!(image_tags(&images), "v1, v2");
     }
 }

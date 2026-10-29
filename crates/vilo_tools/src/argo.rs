@@ -110,11 +110,76 @@ pub struct AppDetail {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resource {
+    pub uid: String,
     pub kind: String,
     pub name: String,
     pub namespace: String,
     pub health: Option<String>,
     pub message: Option<String>,
+    pub parents: Vec<String>,
+    /// Argo's summary lines, e.g. "Status Reason" = "Running", "Containers" = "1/1".
+    pub info: Vec<(String, String)>,
+    pub images: Vec<String>,
+    pub created_at: Option<String>,
+}
+
+impl Resource {
+    pub fn info(&self, name: &str) -> Option<&str> {
+        self.info.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+    }
+}
+
+/// A workload (Deployment, StatefulSet, …) and the pods it runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Workload {
+    pub resource: Option<Resource>,
+    pub pods: Vec<Resource>,
+}
+
+/// Groups pods under the workload they belong to, following parent links
+/// (Pod → ReplicaSet → Deployment). Pods without one are grouped last.
+pub fn workloads(resources: &[Resource]) -> Vec<Workload> {
+    let by_uid = resources.iter().map(|resource| (resource.uid.as_str(), resource)).collect::<collections::HashMap<_, _>>();
+    let owner = |pod: &Resource| {
+        let mut current = pod;
+        // Climb at most a few levels; trees are shallow and this guards against cycles.
+        for _ in 0..4 {
+            let parent = current.parents.iter().find_map(|uid| by_uid.get(uid.as_str()).copied())?;
+            if matches!(parent.kind.as_str(), "Deployment" | "StatefulSet" | "DaemonSet" | "Job" | "CronJob" | "Rollout") {
+                return Some(parent.uid.clone());
+            }
+            current = parent;
+        }
+        None
+    };
+    let mut groups: Vec<Workload> = resources
+        .iter()
+        .filter(|resource| matches!(resource.kind.as_str(), "Deployment" | "StatefulSet" | "DaemonSet" | "Rollout"))
+        .map(|resource| Workload { resource: Some(resource.clone()), pods: Vec::new() })
+        .collect();
+    let mut loose = Vec::new();
+    for pod in resources.iter().filter(|resource| resource.kind == "Pod") {
+        let group = owner(pod).and_then(|uid| {
+            groups.iter_mut().find(|group| group.resource.as_ref().is_some_and(|resource| resource.uid == uid))
+        });
+        match group {
+            Some(group) => group.pods.push(pod.clone()),
+            None => loose.push(pod.clone()),
+        }
+    }
+    for group in &mut groups {
+        group.pods.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    // Workloads with problems first.
+    groups.sort_by_key(|group| {
+        let healthy = group.resource.as_ref().is_some_and(|resource| resource.health.as_deref() == Some("Healthy"))
+            && group.pods.iter().all(|pod| pod.health.as_deref() == Some("Healthy"));
+        (healthy, group.resource.as_ref().map(|resource| resource.name.clone()))
+    });
+    if !loose.is_empty() {
+        groups.push(Workload { resource: None, pods: loose });
+    }
+    groups
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +187,8 @@ pub struct Event {
     pub kind: String,
     pub reason: String,
     pub message: String,
+    pub count: u64,
+    pub first_seen: String,
     pub last_seen: String,
 }
 
@@ -208,11 +275,24 @@ impl ArgoClient {
                 nodes
                     .iter()
                     .map(|node| Resource {
+                        uid: text(node, "/uid"),
                         kind: text(node, "/kind"),
                         name: text(node, "/name"),
                         namespace: text(node, "/namespace"),
                         health: node.pointer("/health/status").and_then(|status| status.as_str()).map(str::to_string),
                         message: node.pointer("/health/message").and_then(|message| message.as_str()).map(str::to_string),
+                        parents: node
+                            .get("parentRefs")
+                            .and_then(|parents| parents.as_array())
+                            .map(|parents| parents.iter().map(|parent| text(parent, "/uid")).collect())
+                            .unwrap_or_default(),
+                        info: node
+                            .get("info")
+                            .and_then(|info| info.as_array())
+                            .map(|info| info.iter().map(|item| (text(item, "/name"), text(item, "/value"))).collect())
+                            .unwrap_or_default(),
+                        images: strings(node.get("images")),
+                        created_at: node.get("createdAt").and_then(|time| time.as_str()).map(str::to_string),
                     })
                     .collect::<Vec<_>>()
             })
@@ -229,7 +309,35 @@ impl ArgoClient {
     }
 
     pub async fn events(&self, namespace: &str, name: &str) -> Result<Vec<Event>, ArgoError> {
-        let body = self.get(&app_path(namespace, name, "/events")).await?;
+        self.events_at(&app_path(namespace, name, "/events")).await
+    }
+
+    /// Events about one resource of the application, e.g. a pod.
+    pub async fn resource_events(&self, namespace: &str, name: &str, resource: &Resource) -> Result<Vec<Event>, ArgoError> {
+        let suffix = format!(
+            "/events?resourceNamespace={}&resourceName={}&resourceUID={}",
+            segment(&resource.namespace),
+            segment(&resource.name),
+            segment(&resource.uid)
+        );
+        self.events_at(&app_path(namespace, name, &suffix)).await
+    }
+
+    /// The live object as the cluster has it, through Argo.
+    pub async fn pod_manifest(&self, namespace: &str, name: &str, pod: &Resource) -> Result<serde_json::Value, ArgoError> {
+        let suffix = format!(
+            "/resource?namespace={}&resourceName={}&version=v1&kind=Pod&group=",
+            segment(&pod.namespace),
+            segment(&pod.name)
+        );
+        let body = self.get(&app_path(namespace, name, &suffix)).await?;
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|_| ArgoError::Unexpected)?;
+        let manifest = value.get("manifest").and_then(|manifest| manifest.as_str()).ok_or(ArgoError::Unexpected)?;
+        serde_json::from_str(manifest).map_err(|_| ArgoError::Unexpected)
+    }
+
+    async fn events_at(&self, path: &str) -> Result<Vec<Event>, ArgoError> {
+        let body = self.get(path).await?;
         let value: serde_json::Value = serde_json::from_str(&body).map_err(|_| ArgoError::Unexpected)?;
         let mut events = value
             .get("items")
@@ -241,6 +349,13 @@ impl ArgoClient {
                         kind: text(event, "/type"),
                         reason: text(event, "/reason"),
                         message: text(event, "/message"),
+                        count: event.get("count").and_then(|count| count.as_u64()).unwrap_or(1),
+                        first_seen: event
+                            .get("firstTimestamp")
+                            .or_else(|| event.get("eventTime"))
+                            .and_then(|time| time.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                         last_seen: event
                             .get("lastTimestamp")
                             .or_else(|| event.get("eventTime"))
@@ -253,6 +368,27 @@ impl ArgoClient {
             .unwrap_or_default();
         events.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         Ok(events)
+    }
+
+    /// The last lines a pod's container wrote, through Argo (no cluster access needed).
+    pub async fn pod_logs(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: &Resource,
+        container: Option<&str>,
+        tail_lines: u32,
+    ) -> Result<Vec<String>, ArgoError> {
+        let mut suffix = format!(
+            "/logs?namespace={}&podName={}&tailLines={tail_lines}&follow=false",
+            segment(&pod.namespace),
+            segment(&pod.name)
+        );
+        if let Some(container) = container {
+            suffix.push_str(&format!("&container={}", segment(container)));
+        }
+        let body = self.get(&app_path(namespace, name, &suffix)).await?;
+        Ok(parse_log_lines(&body))
     }
 
     /// Asks Argo to compare the app with Git again. Argo may still be working
@@ -367,6 +503,68 @@ impl ArgoClient {
         }
         Ok((status.as_u16(), String::from_utf8_lossy(&bytes).into_owned()))
     }
+}
+
+/// A container's state, from a pod manifest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContainerState {
+    pub name: String,
+    pub image: String,
+    pub ready: bool,
+    pub restarts: u64,
+    /// "running", "waiting: CrashLoopBackOff", "terminated: Error (exit 1)" …
+    pub state: String,
+    pub message: Option<String>,
+}
+
+pub fn container_states(manifest: &serde_json::Value) -> Vec<ContainerState> {
+    let statuses = manifest.pointer("/status/containerStatuses").and_then(|statuses| statuses.as_array());
+    manifest
+        .pointer("/spec/containers")
+        .and_then(|containers| containers.as_array())
+        .map(|containers| {
+            containers
+                .iter()
+                .map(|container| {
+                    let name = text(container, "/name");
+                    let status = statuses.and_then(|statuses| statuses.iter().find(|status| text(status, "/name") == name));
+                    let (state, message) = match status.and_then(|status| status.get("state")) {
+                        Some(state) if state.get("running").is_some() => ("running".to_string(), None),
+                        Some(state) if state.get("waiting").is_some() => (
+                            format!("waiting: {}", text(state, "/waiting/reason")),
+                            state.pointer("/waiting/message").and_then(|message| message.as_str()).map(str::to_string),
+                        ),
+                        Some(state) if state.get("terminated").is_some() => (
+                            format!(
+                                "terminated: {} (exit {})",
+                                text(state, "/terminated/reason"),
+                                state.pointer("/terminated/exitCode").and_then(|code| code.as_i64()).unwrap_or(0)
+                            ),
+                            state.pointer("/terminated/message").and_then(|message| message.as_str()).map(str::to_string),
+                        ),
+                        _ => ("unknown".to_string(), None),
+                    };
+                    ContainerState {
+                        image: text(container, "/image"),
+                        ready: status.and_then(|status| status.get("ready")).and_then(|ready| ready.as_bool()).unwrap_or(false),
+                        restarts: status.and_then(|status| status.get("restartCount")).and_then(|count| count.as_u64()).unwrap_or(0),
+                        state,
+                        message,
+                        name,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Argo streams logs as one JSON object per line: `{"result":{"content":…}}`.
+fn parse_log_lines(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry.pointer("/result/last").and_then(|last| last.as_bool()) != Some(true))
+        .filter_map(|entry| entry.pointer("/result/content").and_then(|content| content.as_str()).map(str::to_string))
+        .collect()
 }
 
 fn text(value: &serde_json::Value, pointer: &str) -> String {
@@ -499,6 +697,59 @@ mod tests {
             "api/v1/applications/web?refresh=hard&appNamespace=argocd"
         );
         assert_eq!(app_path("", "a/b", ""), "api/v1/applications/a%2Fb");
+    }
+
+    #[test]
+    fn test_pods_group_under_their_workload() {
+        let node = |uid: &str, kind: &str, name: &str, parent: Option<&str>, health: &str| Resource {
+            uid: uid.into(),
+            kind: kind.into(),
+            name: name.into(),
+            namespace: "ns".into(),
+            health: Some(health.into()),
+            message: None,
+            parents: parent.map(|parent| vec![parent.to_string()]).unwrap_or_default(),
+            info: Vec::new(),
+            images: Vec::new(),
+            created_at: None,
+        };
+        let resources = vec![
+            node("d1", "Deployment", "auth", None, "Healthy"),
+            node("r1", "ReplicaSet", "auth-1", Some("d1"), "Healthy"),
+            node("p1", "Pod", "auth-1-a", Some("r1"), "Healthy"),
+            node("d2", "Deployment", "web", None, "Degraded"),
+            node("r2", "ReplicaSet", "web-1", Some("d2"), "Degraded"),
+            node("p2", "Pod", "web-1-a", Some("r2"), "Degraded"),
+            node("p3", "Pod", "lonely", None, "Healthy"),
+        ];
+        let groups = workloads(&resources);
+        // The unhealthy workload comes first; loose pods last.
+        assert_eq!(groups[0].resource.as_ref().unwrap().name, "web");
+        assert_eq!(groups[0].pods[0].name, "web-1-a");
+        assert_eq!(groups[1].pods[0].name, "auth-1-a");
+        assert!(groups[2].resource.is_none());
+        assert_eq!(groups[2].pods[0].name, "lonely");
+    }
+
+    #[test]
+    fn test_container_states() {
+        let manifest = json!({
+            "spec": {"containers": [{"name": "app", "image": "r/app:v1"}, {"name": "side", "image": "r/side:v2"}]},
+            "status": {"containerStatuses": [
+                {"name": "app", "ready": true, "restartCount": 0, "state": {"running": {"startedAt": "t"}}},
+                {"name": "side", "ready": false, "restartCount": 4, "state": {"waiting": {"reason": "CrashLoopBackOff", "message": "back-off"}}}
+            ]}
+        });
+        let states = container_states(&manifest);
+        assert_eq!((states[0].state.as_str(), states[0].ready), ("running", true));
+        assert_eq!(states[1].state, "waiting: CrashLoopBackOff");
+        assert_eq!((states[1].restarts, states[1].message.as_deref()), (4, Some("back-off")));
+    }
+
+    #[test]
+    fn test_parse_log_lines() {
+        let body = "{\"result\":{\"content\":\"started\",\"timeStamp\":\"t\"}}\n{\"result\":{\"content\":\"ok\"}}\n{\"result\":{\"content\":\"\",\"last\":true}}\n";
+        assert_eq!(parse_log_lines(body), vec!["started".to_string(), "ok".to_string()]);
     }
 
     #[test]
