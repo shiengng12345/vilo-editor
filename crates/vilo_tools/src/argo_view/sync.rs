@@ -1,8 +1,11 @@
 use editor::Editor;
-use gpui::{Entity, Task, Window, prelude::*};
+use gpui::{Entity, Window, prelude::*};
 use ui::{Button, ButtonStyle, Checkbox, ToggleState, prelude::*};
 
-use super::{ArgoView, Fetch, editor, restart::append_audit};
+use super::{
+    ArgoView, Fetch, editor,
+    restart::{IN_FLIGHT, append_audit, write_key},
+};
 use crate::argo::{AppDetail, WriteError};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -24,7 +27,6 @@ pub(super) struct AppActionPanel {
     step: Step,
     /// Asked for on production connections: the application's name, typed.
     typed: Option<Entity<Editor>>,
-    _task: Option<Task<()>>,
 }
 
 impl ArgoView {
@@ -39,7 +41,7 @@ impl ArgoView {
         if detail.app_action.as_ref().is_some_and(|panel| matches!(panel.step, Step::Running)) {
             return;
         }
-        detail.app_action = Some(AppActionPanel { action, step: Step::Ready(None), typed, _task: None });
+        detail.app_action = Some(AppActionPanel { action, step: Step::Ready(None), typed });
         cx.notify();
     }
 
@@ -76,14 +78,23 @@ impl ArgoView {
             cx.notify();
             return;
         }
+        // One application-level write at a time: a sync and an auto-sync change share the key.
+        let key = write_key(&self.session, &namespace, &name, "");
+        if self.writes_in_flight.contains(&key) {
+            panel.step = Step::Ready(Some(IN_FLIGHT.into()));
+            cx.notify();
+            return;
+        }
         panel.step = Step::Running;
         let action = panel.action;
-        panel._task = Some(cx.spawn(async move |this, cx| {
+        self.writes_in_flight.insert(key.clone());
+        self.tasks.push(cx.spawn(async move |this, cx| {
             let result = match action {
                 AppAction::Sync { prune } => client.sync(&namespace, &name, &project, prune).await,
                 AppAction::AutoSync(enabled) => client.set_auto_sync(&namespace, &name, &project, enabled).await,
             };
             this.update(cx, |this, cx| {
+                this.writes_in_flight.remove(&key);
                 let (connection, address, user) = connection.unwrap_or_default();
                 append_audit(
                     serde_json::json!({

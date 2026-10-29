@@ -526,8 +526,8 @@ impl ArgoClient {
                     Err(WriteError::Rejected(ArgoError::Unauthorized.to_string()))
                 }
             }
-            // Gateways answer these when the request may still have reached Argo.
-            502..=504 => Err(WriteError::Unknown(format!("status {status}"))),
+            // Argo may have applied part of it before failing, and gateways answer these when it may still run.
+            500 | 502..=504 => Err(WriteError::Unknown(format!("status {status}"))),
             status => Err(WriteError::Rejected(error_message(&body).unwrap_or_else(|| format!("status {status}")))),
         }
     }

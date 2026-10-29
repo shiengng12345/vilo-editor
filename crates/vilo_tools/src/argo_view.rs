@@ -156,6 +156,8 @@ pub struct ArgoView {
     /// Polling only runs while the page is in view.
     visible: bool,
     form: Option<Form>,
+    /// Writes sent but not answered, by target. Kept outside the page so leaving it neither cancels one nor allows a second.
+    writes_in_flight: collections::HashSet<String>,
     tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -269,6 +271,7 @@ impl ArgoView {
             detail: None,
             visible: true,
             form: None,
+            writes_in_flight: collections::HashSet::default(),
             tasks: Vec::new(),
             _subscriptions: subscriptions,
         };

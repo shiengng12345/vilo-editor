@@ -114,11 +114,19 @@ impl ArgoView {
             cx.notify();
             return;
         }
+        let key = write_key(&self.session, &namespace, &name, &panel.workload.uid);
+        if self.writes_in_flight.contains(&key) {
+            panel.step = Step::Ready(Some(IN_FLIGHT.into()));
+            cx.notify();
+            return;
+        }
         panel.step = Step::Running;
         let workload = panel.workload.clone();
-        panel._task = Some(cx.spawn(async move |this, cx| {
+        self.writes_in_flight.insert(key.clone());
+        self.tasks.push(cx.spawn(async move |this, cx| {
             let result = client.run_action(&namespace, &name, &workload, "restart").await;
             this.update(cx, |this, cx| {
+                this.writes_in_flight.remove(&key);
                 let (connection, address, user) = connection.unwrap_or_default();
                 append_audit(
                     serde_json::json!({
@@ -237,6 +245,14 @@ impl ArgoView {
             .child(content)
             .into_any_element()
     }
+}
+
+pub(super) const IN_FLIGHT: &str = "A request for this is still waiting for Argo CD. Check the result before sending another.";
+
+/// Identifies a write target across page changes: connection, application and resource.
+pub(super) fn write_key(session: &Option<super::Session>, namespace: &str, name: &str, target: &str) -> String {
+    let connection = session.as_ref().map_or("", |session| session.connection_id.as_str());
+    format!("{connection}\u{0}{namespace}\u{0}{name}\u{0}{target}")
 }
 
 pub(super) fn append_audit(line: serde_json::Value, cx: &mut App) {
