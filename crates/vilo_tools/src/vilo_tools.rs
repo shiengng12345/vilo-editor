@@ -1,3 +1,5 @@
+mod argo;
+mod argo_view;
 mod jenkins;
 mod jenkins_view;
 mod vault;
@@ -10,6 +12,7 @@ use ui::{Button, ButtonStyle};
 use ui::prelude::*;
 use workspace::Workspace;
 
+use argo_view::ArgoView;
 use jenkins_view::JenkinsView;
 use vault_view::VaultView;
 
@@ -27,6 +30,7 @@ pub fn init(cx: &mut App) {
                     focus_handle: cx.focus_handle(),
                     vault: None,
                     jenkins: None,
+                    argo: None,
                     open: None,
                 });
                 let focus_handle = page.focus_handle(cx);
@@ -42,6 +46,7 @@ pub fn init(cx: &mut App) {
 enum Tool {
     Vault,
     Jenkins,
+    Argo,
 }
 
 struct ToolsPage {
@@ -49,6 +54,7 @@ struct ToolsPage {
     /// Built on first open and kept, so returning to it keeps its state.
     vault: Option<Entity<VaultView>>,
     jenkins: Option<Entity<JenkinsView>>,
+    argo: Option<Entity<ArgoView>>,
     open: Option<Tool>,
 }
 
@@ -62,6 +68,10 @@ impl ToolsPage {
             Tool::Jenkins => self
                 .jenkins
                 .get_or_insert_with(|| cx.new(|cx| JenkinsView::new(window, cx)))
+                .focus_handle(cx),
+            Tool::Argo => self
+                .argo
+                .get_or_insert_with(|| cx.new(|cx| ArgoView::new(window, cx)))
                 .focus_handle(cx),
         };
         self.open = Some(tool);
@@ -96,7 +106,8 @@ impl ToolsPage {
                     .gap_4()
                     .flex_wrap()
                     .child(card("tool-vault", Tool::Vault, IconName::Lock, "Vault", "Browse, compare and edit HashiCorp Vault secrets.", cx))
-                    .child(card("tool-jenkins", Tool::Jenkins, IconName::Server, "Jenkins", "Jobs, builds, stages and console logs, read-only.", cx)),
+                    .child(card("tool-jenkins", Tool::Jenkins, IconName::Server, "Jenkins", "Jobs, builds and logs; build, rebuild and stop.", cx))
+                    .child(card("tool-argo", Tool::Argo, IconName::Server, "Argo CD", "Applications, health, sync, history; refresh.", cx)),
             )
     }
 }
@@ -113,6 +124,7 @@ impl Render for ToolsPage {
         let page: Option<(&'static str, AnyView)> = match self.open {
             Some(Tool::Vault) => self.vault.clone().map(|view| ("Vault", view.into())),
             Some(Tool::Jenkins) => self.jenkins.clone().map(|view| ("Jenkins", view.into())),
+            Some(Tool::Argo) => self.argo.clone().map(|view| ("Argo CD", view.into())),
             None => None,
         };
         v_flex()
