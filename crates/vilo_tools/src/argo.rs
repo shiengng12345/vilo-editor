@@ -111,6 +111,8 @@ pub struct AppDetail {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resource {
     pub uid: String,
+    pub group: String,
+    pub version: String,
     pub kind: String,
     pub name: String,
     pub namespace: String,
@@ -190,6 +192,37 @@ pub struct Event {
     pub count: u64,
     pub first_seen: String,
     pub last_seen: String,
+}
+
+/// An action Argo offers for a resource, e.g. "restart" on a Deployment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResourceAction {
+    pub name: String,
+    pub disabled: bool,
+    pub has_params: bool,
+}
+
+/// Why a write did not clearly succeed. Writes are sent once and never repeated by Vilo.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WriteError {
+    /// Argo refused it; nothing was changed. Carries Argo's own reason, e.g. a sync window or RBAC.
+    Rejected(String),
+    /// The session had expired, so the request was not accepted.
+    SignInAgain,
+    /// The answer was lost; Argo may or may not have done it.
+    Unknown(String),
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::Rejected(reason) => write!(f, "Argo CD refused: {reason}"),
+            WriteError::SignInAgain => f.write_str("The session had expired, so nothing was done. Press again to retry."),
+            WriteError::Unknown(reason) => {
+                write!(f, "Argo CD did not confirm it ({reason}). It may have run; check the pods before trying again.")
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -276,6 +309,8 @@ impl ArgoClient {
                     .iter()
                     .map(|node| Resource {
                         uid: text(node, "/uid"),
+                        group: text(node, "/group"),
+                        version: text(node, "/version"),
                         kind: text(node, "/kind"),
                         name: text(node, "/name"),
                         namespace: text(node, "/namespace"),
@@ -390,6 +425,79 @@ impl ArgoClient {
         }
         let body = self.get(&app_path(namespace, name, &suffix)).await?;
         Ok(parse_log_lines(&body))
+    }
+
+    pub async fn resource_actions(&self, namespace: &str, name: &str, resource: &Resource) -> Result<Vec<ResourceAction>, ArgoError> {
+        let suffix = format!("/resource/actions?{}", resource_query(resource));
+        let body = self.get(&app_path(namespace, name, &suffix)).await?;
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|_| ArgoError::Unexpected)?;
+        Ok(parse_actions(&value))
+    }
+
+    /// Runs a resource action once. Never retried: a lost answer is reported as unknown.
+    pub async fn run_action(&self, namespace: &str, name: &str, resource: &Resource, action: &str) -> Result<(), WriteError> {
+        let body = serde_json::json!({
+            "name": name,
+            "appNamespace": namespace,
+            "namespace": resource.namespace,
+            "resourceName": resource.name,
+            "group": resource.group,
+            "version": resource.version,
+            "kind": resource.kind,
+            "action": action,
+        });
+        let path = format!("api/v1/applications/{}/resource/actions/v2", segment(name));
+        self.post_once(&path, &body).await
+    }
+
+    async fn post_once(&self, path: &str, body: &serde_json::Value) -> Result<(), WriteError> {
+        let unknown = |error: ArgoError| WriteError::Unknown(error.to_string());
+        let current = {
+            let mut bearer = self.bearer.lock().await;
+            // Signing in before the write is safe: nothing has been sent yet.
+            if bearer.is_none() && self.mode == AuthMode::Password {
+                *bearer = Some(self.login().await.map_err(|error| WriteError::Rejected(error.to_string()))?);
+            }
+            bearer.clone()
+        };
+        let url = self.url(path).map_err(|error| WriteError::Rejected(error.to_string()))?;
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(url.as_str())
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .follow_redirects(RedirectPolicy::NoFollow)
+            .timeout(REQUEST_TIMEOUT);
+        if let Some(bearer) = &current {
+            request = request.header("Authorization", format!("Bearer {bearer}"));
+        }
+        let request = request
+            .body(AsyncBody::from(body.to_string()))
+            .map_err(|_| WriteError::Rejected("could not build the request".into()))?;
+        let (status, body) = match self.send(request).await {
+            Ok(answer) => answer,
+            // A redirect is an answer: Argo did not run it.
+            Err(ArgoError::Redirected) => return Err(WriteError::Rejected(ArgoError::Redirected.to_string())),
+            Err(error) => return Err(unknown(error)),
+        };
+        match status {
+            200..=299 => Ok(()),
+            401 => {
+                if self.mode == AuthMode::Password {
+                    let mut bearer = self.bearer.lock().await;
+                    if *bearer == current {
+                        // The next press signs in again; this one is not repeated.
+                        *bearer = None;
+                    }
+                    Err(WriteError::SignInAgain)
+                } else {
+                    Err(WriteError::Rejected(ArgoError::Unauthorized.to_string()))
+                }
+            }
+            // Gateways answer these when the request may still have reached Argo.
+            502..=504 => Err(WriteError::Unknown(format!("status {status}"))),
+            status => Err(WriteError::Rejected(error_message(&body).unwrap_or_else(|| format!("status {status}")))),
+        }
     }
 
     /// Asks Argo to compare the app with Git again. Argo may still be working
@@ -582,6 +690,44 @@ fn parse_log_lines(body: &str) -> Vec<LogLine> {
         .collect()
 }
 
+fn resource_query(resource: &Resource) -> String {
+    format!(
+        "namespace={}&resourceName={}&group={}&version={}&kind={}",
+        segment(&resource.namespace),
+        segment(&resource.name),
+        segment(&resource.group),
+        segment(&resource.version),
+        segment(&resource.kind)
+    )
+}
+
+fn parse_actions(value: &serde_json::Value) -> Vec<ResourceAction> {
+    value
+        .get("actions")
+        .and_then(|actions| actions.as_array())
+        .map(|actions| {
+            actions
+                .iter()
+                .map(|action| ResourceAction {
+                    name: text(action, "/name"),
+                    disabled: action.get("disabled").and_then(|disabled| disabled.as_bool()).unwrap_or(false),
+                    has_params: action.get("params").and_then(|params| params.as_array()).is_some_and(|params| !params.is_empty()),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Argo explains refusals as `{"error": …, "message": …}`.
+fn error_message(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    ["/message", "/error"]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(|message| message.as_str()))
+        .filter(|message| !message.is_empty())
+        .map(|message| message.chars().take(300).collect())
+}
+
 fn text(value: &serde_json::Value, pointer: &str) -> String {
     value.pointer(pointer).and_then(|text| text.as_str()).unwrap_or_default().to_string()
 }
@@ -718,6 +864,8 @@ mod tests {
     fn test_pods_group_under_their_workload() {
         let node = |uid: &str, kind: &str, name: &str, parent: Option<&str>, health: &str| Resource {
             uid: uid.into(),
+            group: String::new(),
+            version: "v1".into(),
             kind: kind.into(),
             name: name.into(),
             namespace: "ns".into(),
@@ -759,6 +907,21 @@ mod tests {
         assert_eq!((states[0].state.as_str(), states[0].ready), ("running", true));
         assert_eq!(states[1].state, "waiting: CrashLoopBackOff");
         assert_eq!((states[1].restarts, states[1].message.as_deref()), (4, Some("back-off")));
+    }
+
+    #[test]
+    fn test_parse_actions_and_errors() {
+        let value = serde_json::json!({"actions": [
+            {"name": "restart"},
+            {"name": "pause", "disabled": true},
+            {"name": "scale", "params": [{"name": "replicas"}]}
+        ]});
+        let actions = parse_actions(&value);
+        assert_eq!((actions[0].name.as_str(), actions[0].disabled, actions[0].has_params), ("restart", false, false));
+        assert!(actions[1].disabled);
+        assert!(actions[2].has_params);
+        assert_eq!(error_message(r#"{"error":"x","message":"blocked by sync window"}"#).as_deref(), Some("blocked by sync window"));
+        assert_eq!(error_message("<html>"), None);
     }
 
     #[test]

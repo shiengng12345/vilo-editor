@@ -1,4 +1,5 @@
 mod pod;
+mod restart;
 
 use std::{path::PathBuf, time::Duration};
 
@@ -112,6 +113,7 @@ struct Detail {
     confirm_hard: bool,
     /// The pod opened from this application, shown instead of the application.
     pod: Option<pod::PodPanel>,
+    restart: Option<restart::RestartPanel>,
     pod_page: usize,
     _poll: Task<()>,
 }
@@ -419,10 +421,16 @@ impl ArgoView {
             refresh: RefreshState::Idle,
             confirm_hard: false,
             pod: None,
+            restart: None,
             pod_page: 0,
             _poll: poll,
         });
         cx.notify();
+    }
+
+    fn current_connection(&self) -> Option<&Connection> {
+        let session = self.session.as_ref()?;
+        self.connections.iter().find(|connection| connection.id == session.connection_id)
     }
 
     fn refresh_app(&mut self, hard: bool, cx: &mut Context<Self>) {
@@ -1014,6 +1022,7 @@ impl ArgoView {
                             let title = group.resource.as_ref().map_or("Other pods".to_string(), |resource| resource.name.clone());
                             let health = group.resource.as_ref().and_then(|resource| resource.health.clone());
                             let toggle = key.clone();
+                            let restartable = group.resource.clone().filter(restart::can_restart);
                             list = list.child(
                                 h_flex()
                                     .id(SharedString::from(format!("argo-workload-{key}")))
@@ -1044,8 +1053,23 @@ impl ArgoView {
                                     .child(div().w(px(70.)).flex_none().child(Label::new(format!("{healthy_pods}/{}", group.pods.len())).size(LabelSize::Small).color(
                                         if problem { Color::Error } else { Color::Muted },
                                     )))
-                                    .child(div().flex_1().min_w_0().child(Label::new(image_tags(&images)).size(LabelSize::XSmall).buffer_font(cx).color(Color::Muted).truncate())),
+                                    .child(div().flex_1().min_w_0().child(Label::new(image_tags(&images)).size(LabelSize::XSmall).buffer_font(cx).color(Color::Muted).truncate()))
+                                    .when_some(restartable.clone(), |this, workload| {
+                                        this.child(
+                                            Button::new(SharedString::from(format!("argo-restart-{key}")), "Restart…")
+                                                .label_size(LabelSize::Small)
+                                                .tooltip(Tooltip::text("Replace this workload's pods, after confirming"))
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    // The row itself toggles; the button must not.
+                                                    cx.stop_propagation();
+                                                    this.start_restart(workload.clone(), window, cx);
+                                                })),
+                                        )
+                                    }),
                             );
+                            if let Some(panel) = detail.restart.as_ref().filter(|panel| restartable.as_ref().is_some_and(|workload| panel.is_for(workload))) {
+                                list = list.child(self.render_restart(panel, cx));
+                            }
                             if open {
                                 if group.pods.is_empty() {
                                     list = list.child(div().pl_8().py_1().child(Label::new("No pods.").size(LabelSize::XSmall).color(Color::Muted)));
@@ -1277,6 +1301,8 @@ mod tests {
     fn pod(health: &str, status: &str, restarts: &str) -> Resource {
         Resource {
             uid: "p".into(),
+            group: String::new(),
+            version: "v1".into(),
             kind: "Pod".into(),
             name: "p".into(),
             namespace: "ns".into(),
