@@ -966,6 +966,76 @@ mod tests {
         assert_eq!((states[1].restarts, states[1].message.as_deref()), (4, Some("back-off")));
     }
 
+    /// A fake Argo that answers the login and gives each write the next scripted status.
+    fn fake_argo(write_statuses: Vec<(u16, &'static str)>) -> (ArgoClient, Arc<std::sync::Mutex<Vec<(String, String, String)>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let statuses = Arc::new(std::sync::Mutex::new(write_statuses.into_iter()));
+        let http: Arc<dyn HttpClient> = http_client::FakeHttpClient::create({
+            let seen = seen.clone();
+            move |mut request| {
+                let seen = seen.clone();
+                let statuses = statuses.clone();
+                async move {
+                    let mut body = String::new();
+                    request.body_mut().read_to_string(&mut body).await?;
+                    let path = request.uri().path().to_string();
+                    seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.push((request.method().to_string(), path.clone(), body));
+                    let (status, answer) = if path == "/api/v1/session" {
+                        (200, r#"{"token":"session"}"#)
+                    } else {
+                        statuses.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.next().unwrap_or((200, "{}"))
+                    };
+                    Ok(http_client::Response::builder().status(status).body(AsyncBody::from(answer.to_string()))?)
+                }
+            }
+        });
+        let client = ArgoClient::new(http, Url::parse("https://argo.example/").unwrap(), "me", AuthMode::Password, "secret");
+        (client, seen)
+    }
+
+    fn writes(seen: &std::sync::Mutex<Vec<(String, String, String)>>) -> Vec<(String, String, String)> {
+        seen.lock().unwrap().iter().filter(|(_, path, _)| path != "/api/v1/session").cloned().collect()
+    }
+
+    #[test]
+    fn test_writes_are_sent_once() {
+        // An expired session is never answered by resending the write.
+        let (client, seen) = fake_argo(vec![(401, "")]);
+        let result = futures::executor::block_on(client.sync("argocd", "web", "p", false));
+        assert_eq!(result, Err(WriteError::SignInAgain));
+        assert_eq!(writes(&seen).len(), 1);
+
+        // Ambiguous failures are unknown, not refused.
+        for status in [500, 502, 504] {
+            let (client, seen) = fake_argo(vec![(status, "")]);
+            let result = futures::executor::block_on(client.sync("argocd", "web", "p", false));
+            assert!(matches!(result, Err(WriteError::Unknown(_))), "{status}");
+            assert_eq!(writes(&seen).len(), 1);
+        }
+
+        // Argo's own reason is kept, e.g. a sync window.
+        let (client, _) = fake_argo(vec![(403, r#"{"message":"blocked by sync window"}"#)]);
+        let result = futures::executor::block_on(client.sync("argocd", "web", "p", false));
+        assert_eq!(result, Err(WriteError::Rejected("blocked by sync window".into())));
+    }
+
+    #[test]
+    fn test_write_bodies() {
+        let (client, seen) = fake_argo(Vec::new());
+        futures::executor::block_on(client.sync("team", "web", "p", true)).unwrap();
+        futures::executor::block_on(client.set_auto_sync("team", "web", "p", false)).unwrap();
+        let sent = writes(&seen);
+        assert_eq!((sent[0].0.as_str(), sent[0].1.as_str()), ("POST", "/api/v1/applications/web/sync"));
+        let sync: serde_json::Value = serde_json::from_str(&sent[0].2).unwrap();
+        // No revision: Argo then uses each source's own target revision.
+        assert_eq!(sync, json!({"name": "web", "appNamespace": "team", "project": "p", "prune": true}));
+        assert_eq!((sent[1].0.as_str(), sent[1].1.as_str()), ("PATCH", "/api/v1/applications/web"));
+        let patch: serde_json::Value = serde_json::from_str(&sent[1].2).unwrap();
+        assert_eq!(patch["patchType"], "merge");
+        let inner: serde_json::Value = serde_json::from_str(patch["patch"].as_str().unwrap()).unwrap();
+        assert_eq!(inner, json!({"spec": {"syncPolicy": {"automated": {"enabled": false}}}}));
+    }
+
     #[test]
     fn test_parse_actions_and_errors() {
         let value = serde_json::json!({"actions": [
