@@ -18,7 +18,7 @@ struct Connection {
     name: String,
     region: String,
     access_key_id: String,
-    /// The only projects Vilo will query with this key.
+    /// The only projects Vilo will query with this key; empty means all it can reach.
     projects: Vec<String>,
 }
 
@@ -31,6 +31,10 @@ impl Connection {
     fn credential_owner(&self) -> String {
         format!("{}|{}", self.region, self.access_key_id)
     }
+}
+
+fn projects_label(projects: &[String]) -> String {
+    if projects.is_empty() { "all the key can reach".to_string() } else { projects.join(", ") }
 }
 
 fn is_production(project: &str) -> bool {
@@ -182,7 +186,7 @@ impl SlsView {
                 cx,
             ),
             projects: editor(
-                "Projects Vilo may query, comma separated, e.g. platform-qat-aliyun-logs",
+                "Leave empty for every project the key can reach, or list some, comma separated",
                 &value(|c| c.projects.join(", ")),
                 false,
                 window,
@@ -208,8 +212,8 @@ impl SlsView {
             .map(|project| project.trim().to_string())
             .filter(|project| !project.is_empty())
             .collect::<Vec<_>>();
-        if name.is_empty() || access_key_id.is_empty() || projects.is_empty() {
-            form.message = Some("Fill in a name, the AccessKey ID and at least one project.".into());
+        if name.is_empty() || access_key_id.is_empty() {
+            form.message = Some("Fill in a name and the AccessKey ID.".into());
             cx.notify();
             return;
         }
@@ -240,8 +244,12 @@ impl SlsView {
                         connection.projects.clone(),
                     )?;
                     // A signed request proves the key; a missing list permission is fine, a rejected key is not.
-                    match client.list_logstores(&connection.projects[0]).await {
-                        Ok(_) | Err(SlsError::Forbidden(_)) => {}
+                    let probe = match connection.projects.first() {
+                        Some(project) => client.list_logstores(project).await.map(|_| ()),
+                        None => client.list_projects().await.map(|_| ()),
+                    };
+                    match probe {
+                        Ok(()) | Err(SlsError::Forbidden(_)) => {}
                         Err(error) => return Err(anyhow!(error)),
                     }
                     let url = connection.credential_url();
@@ -347,7 +355,21 @@ impl SlsView {
             }
             let to = time::OffsetDateTime::now_utc().unix_timestamp();
             let from = to - CHECK_WINDOW_SECONDS;
-            for project in &connection.projects {
+            // With every project allowed, checking all of them costs too much; one QAT and one PROD project show the key's reach.
+            let targets = if connection.projects.is_empty() {
+                let visible = projects.as_ref().map(|projects| projects.as_slice()).unwrap_or_default();
+                let pick = |environment: &str| {
+                    visible
+                        .iter()
+                        .find(|project| project.starts_with("platform-") && project.contains(environment))
+                        .or_else(|| visible.iter().find(|project| project.contains(environment)))
+                        .cloned()
+                };
+                pick("qat").into_iter().chain(pick("prod")).collect::<Vec<_>>()
+            } else {
+                connection.projects.clone()
+            };
+            for project in &targets {
                 let logstores = client.list_logstores(project).await;
                 let logstore = logstores.as_ref().ok().and_then(|logstores| {
                     logstores.iter().find(|name| name.contains("fpms")).or_else(|| logstores.first()).cloned()
@@ -433,7 +455,7 @@ impl SlsView {
                     .cursor_pointer()
                     .when(self.active.as_ref() == Some(&connection.id), |this| this.bg(colors.element_selected))
                     .hover(|style| style.bg(colors.element_hover))
-                    .tooltip(Tooltip::text(format!("{} · {}", connection.region, connection.projects.join(", "))))
+                    .tooltip(Tooltip::text(format!("{} · {}", connection.region, projects_label(&connection.projects))))
                     .on_click(cx.listener(move |this, _, _, cx| this.select(id.clone(), cx)))
                     .child(Icon::new(IconName::Server).size(IconSize::Small).color(Color::Muted))
                     .child(Label::new(connection.name.clone()).truncate()),
@@ -486,8 +508,9 @@ impl SlsView {
             .child(
                 Label::new(
                     "The secret stays in the macOS keychain and is only used to sign requests to SLS in this region. \
-                     Vilo only reads, and only from the projects listed here. A read-only RAM key \
-                     (AliyunLogReadOnlyAccess) is safest; Vilo cannot narrow what the key itself allows.",
+                     Vilo only reads. Listing projects limits Vilo to them; leaving it empty allows every project the key \
+                     can reach, production included. A read-only RAM key (AliyunLogReadOnlyAccess) is safest; Vilo cannot \
+                     narrow what the key itself allows.",
                 )
                 .size(LabelSize::Small)
                 .color(Color::Muted),
@@ -580,11 +603,11 @@ impl SlsView {
                     .child(Button::new("sls-edit", "Edit").on_click(cx.listener(move |this, _, window, cx| this.open_form(Some(id.clone()), window, cx)))),
             )
             .child(
-                Label::new(format!("Allowed projects: {}", connection.projects.join(", ")))
+                Label::new(format!("Allowed projects: {}", projects_label(&connection.projects)))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
-            .when(connection.projects.iter().any(|project| is_production(project)), |this| {
+            .when(connection.projects.is_empty() || connection.projects.iter().any(|project| is_production(project)), |this| {
                 this.child(
                     Label::new("Includes production. The check reads counts from a 5-minute window and shows no log contents.")
                         .size(LabelSize::Small)

@@ -101,7 +101,7 @@ pub struct SlsClient {
     region: String,
     access_key_id: String,
     secret: String,
-    /// The only projects Vilo will send a request about.
+    /// The only projects Vilo will send a request about; empty means every project the key can reach.
     allowed_projects: Vec<String>,
 }
 
@@ -300,7 +300,7 @@ impl SlsClient {
         let host = match project {
             Some(project) => {
                 check_name(project)?;
-                if !self.allowed_projects.iter().any(|allowed| allowed == project) {
+                if !self.allowed_projects.is_empty() && !self.allowed_projects.iter().any(|allowed| allowed == project) {
                     return Err(SlsError::NotAllowed(project.to_string()));
                 }
                 format!("{project}.{}.log.aliyuncs.com", self.region)
@@ -566,6 +566,12 @@ mod tests {
         let result = futures::executor::block_on(client.list_logstores("x.evil"));
         assert!(matches!(result, Err(SlsError::InvalidName(_))));
         assert!(seen.lock().unwrap().is_empty());
+
+        // An empty list allows every project the key can reach.
+        let (client, seen) = fake(200, br#"{"logstores":["b","a"]}"#.to_vec(), false);
+        let client = SlsClient { allowed_projects: Vec::new(), ..client };
+        assert_eq!(futures::executor::block_on(client.list_logstores("platform-prod-aliyun-logs")), Ok(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[test]
