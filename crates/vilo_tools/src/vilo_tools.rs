@@ -2,6 +2,7 @@ mod argo;
 mod argo_view;
 mod jenkins;
 mod jenkins_view;
+mod sls;
 mod vault;
 mod vault_compare;
 mod vault_import;
