@@ -378,9 +378,10 @@ impl ArgoClient {
         pod: &Resource,
         container: Option<&str>,
         tail_lines: u32,
-    ) -> Result<Vec<String>, ArgoError> {
+        previous: bool,
+    ) -> Result<Vec<LogLine>, ArgoError> {
         let mut suffix = format!(
-            "/logs?namespace={}&podName={}&tailLines={tail_lines}&follow=false",
+            "/logs?namespace={}&podName={}&tailLines={tail_lines}&follow=false&previous={previous}",
             segment(&pod.namespace),
             segment(&pod.name)
         );
@@ -558,12 +559,26 @@ pub fn container_states(manifest: &serde_json::Value) -> Vec<ContainerState> {
         .unwrap_or_default()
 }
 
-/// Argo streams logs as one JSON object per line: `{"result":{"content":…}}`.
-fn parse_log_lines(body: &str) -> Vec<String> {
+pub struct LogLine {
+    /// When the container wrote the line, as RFC 3339; empty if Argo did not say.
+    pub time: String,
+    pub content: String,
+}
+
+/// Argo streams logs as one JSON object per line: `{"result":{"content":…,"timeStampStr":…}}`.
+fn parse_log_lines(body: &str) -> Vec<LogLine> {
     body.lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|entry| entry.pointer("/result/last").and_then(|last| last.as_bool()) != Some(true))
-        .filter_map(|entry| entry.pointer("/result/content").and_then(|content| content.as_str()).map(str::to_string))
+        .filter_map(|entry| {
+            let content = entry.pointer("/result/content")?.as_str()?.to_string();
+            let time = ["/result/timeStampStr", "/result/timeStamp"]
+                .iter()
+                .find_map(|pointer| entry.pointer(pointer).and_then(|time| time.as_str()))
+                .unwrap_or_default()
+                .to_string();
+            Some(LogLine { time, content })
+        })
         .collect()
 }
 
@@ -749,7 +764,9 @@ mod tests {
     #[test]
     fn test_parse_log_lines() {
         let body = "{\"result\":{\"content\":\"started\",\"timeStamp\":\"t\"}}\n{\"result\":{\"content\":\"ok\"}}\n{\"result\":{\"content\":\"\",\"last\":true}}\n";
-        assert_eq!(parse_log_lines(body), vec!["started".to_string(), "ok".to_string()]);
+        let lines = parse_log_lines(body);
+        let lines = lines.iter().map(|line| (line.time.as_str(), line.content.as_str())).collect::<Vec<_>>();
+        assert_eq!(lines, vec![("t", "started"), ("", "ok")]);
     }
 
     #[test]

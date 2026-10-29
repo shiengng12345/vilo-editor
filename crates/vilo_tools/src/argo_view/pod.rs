@@ -1,10 +1,12 @@
 use std::time::Duration;
 
-use gpui::{ClipboardItem, ScrollStrategy, Task, UniformListScrollHandle, Window, prelude::*, uniform_list};
+use gpui::{
+    ClipboardItem, ListHorizontalSizingBehavior, ScrollStrategy, Task, UniformListScrollHandle, Window, prelude::*, uniform_list,
+};
 use ui::{Button, ButtonStyle, Checkbox, ContextMenu, IconButton, Indicator, PopoverMenu, ToggleState, Tooltip, prelude::*};
 
 use super::{ArgoView, Fetch, health_color};
-use crate::argo::{ContainerState, Event, Resource, container_states};
+use crate::argo::{ContainerState, Event, LogLine, Resource, container_states};
 
 const LOG_LINES: u32 = 1000;
 /// How often a followed log is read again.
@@ -18,6 +20,27 @@ pub(super) enum PodTab {
     Manifest,
 }
 
+/// The same log lines with and without their times, made once rather than on every frame.
+pub(super) struct LogLines {
+    plain: Vec<SharedString>,
+    timed: Vec<SharedString>,
+}
+
+impl LogLines {
+    fn new(lines: Vec<LogLine>) -> Self {
+        let mut plain = Vec::with_capacity(lines.len());
+        let mut timed = Vec::with_capacity(lines.len());
+        for line in lines {
+            let content = crate::jenkins::strip_escapes(&line.content);
+            // "2026-10-29T01:02:03.123456789Z" reads as "2026-10-29 01:02:03".
+            let time = line.time.get(..19).unwrap_or(&line.time).replace('T', " ");
+            timed.push(SharedString::from(format!("{time}  {content}")));
+            plain.push(SharedString::from(content));
+        }
+        Self { plain, timed }
+    }
+}
+
 pub(super) struct PodPanel {
     pub(super) pod: Resource,
     tab: PodTab,
@@ -26,9 +49,12 @@ pub(super) struct PodPanel {
     manifest_lines: Vec<SharedString>,
     containers: Vec<ContainerState>,
     events: Fetch<Vec<Event>>,
-    logs: Fetch<Vec<SharedString>>,
+    logs: Fetch<LogLines>,
     container: Option<String>,
     follow: bool,
+    /// Logs of the container before its last restart, where a crash usually explains itself.
+    previous: bool,
+    timestamps: bool,
     log_scroll: UniformListScrollHandle,
     manifest_scroll: UniformListScrollHandle,
     _loads: Vec<Task<()>>,
@@ -106,6 +132,8 @@ impl ArgoView {
             logs: Fetch::Loading,
             container: None,
             follow: false,
+            previous: false,
+            timestamps: false,
             log_scroll: UniformListScrollHandle::new(),
             manifest_scroll: UniformListScrollHandle::new(),
             _loads: vec![manifest_task, events_task],
@@ -126,26 +154,27 @@ impl ArgoView {
         let Some(panel) = &mut detail.pod else {
             return;
         };
-        let (pod, container) = (panel.pod.clone(), panel.container.clone());
+        let (pod, container, previous) = (panel.pod.clone(), panel.container.clone(), panel.previous);
         let generation = self.generation;
         let task = cx.spawn(async move |this, cx| {
-            let result = client.pod_logs(&namespace, &name, &pod, container.as_deref(), LOG_LINES).await;
+            let result = client.pod_logs(&namespace, &name, &pod, container.as_deref(), LOG_LINES, previous).await;
             this.update(cx, |this, cx| {
                 if this.generation != generation {
                     return;
                 }
-                let Some(panel) = this.detail.as_mut().and_then(|detail| detail.pod.as_mut()).filter(|panel| panel.pod.uid == pod.uid && panel.container == container) else {
+                let Some(panel) = this.detail.as_mut().and_then(|detail| detail.pod.as_mut()).filter(|panel| panel.pod.uid == pod.uid && panel.container == container && panel.previous == previous)
+                else {
                     return;
                 };
                 panel.logs = match result {
-                    Ok(lines) => Fetch::Loaded(lines.iter().map(|line| SharedString::from(crate::jenkins::strip_escapes(line))).collect()),
+                    Ok(lines) => Fetch::Loaded(LogLines::new(lines)),
                     Err(error) => Fetch::Failed(error.to_string().into()),
                 };
                 if panel.follow
                     && let Fetch::Loaded(lines) = &panel.logs
-                    && !lines.is_empty()
+                    && !lines.plain.is_empty()
                 {
-                    panel.log_scroll.scroll_to_item(lines.len() - 1, ScrollStrategy::Bottom);
+                    panel.log_scroll.scroll_to_item(lines.plain.len() - 1, ScrollStrategy::Bottom);
                 }
                 cx.notify();
             })
@@ -187,6 +216,39 @@ impl ArgoView {
             self.load_logs(cx);
         }
         cx.notify();
+    }
+
+    fn set_previous(&mut self, previous: bool, cx: &mut Context<Self>) {
+        let Some(panel) = self.detail.as_mut().and_then(|detail| detail.pod.as_mut()) else {
+            return;
+        };
+        panel.previous = previous;
+        panel.logs = Fetch::Loading;
+        // A finished container writes nothing more, so following it only repeats requests.
+        if previous && panel.follow {
+            self.set_follow(false, cx);
+        }
+        self.load_logs(cx);
+        cx.notify();
+    }
+
+    fn save_logs(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(panel) = self.detail.as_ref().and_then(|detail| detail.pod.as_ref()) else {
+            return;
+        };
+        let name = match &panel.container {
+            Some(container) => format!("{}-{container}.log", panel.pod.name),
+            None => format!("{}.log", panel.pod.name),
+        };
+        let chosen = cx.prompt_for_new_path(&paths::home_dir().join("Downloads"), Some(&name));
+        cx.spawn(async move |_, cx| {
+            let Some(path) = chosen.await?? else {
+                return anyhow::Ok(());
+            };
+            cx.background_spawn(async move { std::fs::write(&path, text) }).await?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     pub(super) fn render_pod(&self, panel: &PodPanel, cx: &mut Context<Self>) -> AnyElement {
@@ -317,8 +379,16 @@ impl ArgoView {
         let colors = cx.theme().colors().clone();
         let query = self.log_filter.read(cx).text(cx);
         let (lines, total) = match &panel.logs {
-            Fetch::Loaded(lines) if query.is_empty() => (lines.clone(), lines.len()),
-            Fetch::Loaded(lines) => (lines.iter().filter(|line| line.contains(query.as_str())).cloned().collect(), lines.len()),
+            Fetch::Loaded(logs) => {
+                let shown = if panel.timestamps { &logs.timed } else { &logs.plain };
+                let lines = if query.is_empty() {
+                    shown.clone()
+                } else {
+                    // Match on the text alone, so a search never hits the time prefix.
+                    logs.plain.iter().zip(shown).filter(|(plain, _)| plain.contains(query.as_str())).map(|(_, line)| line.clone()).collect()
+                };
+                (lines, logs.plain.len())
+            }
             _ => (Vec::new(), 0),
         };
         let names = panel.containers.iter().map(|container| container.name.clone()).collect::<Vec<_>>();
@@ -373,7 +443,30 @@ impl ArgoView {
                 Checkbox::new("argo-log-follow", ToggleState::from(panel.follow))
                     .label("Follow")
                     .label_size(LabelSize::Small)
+                    .disabled(panel.previous)
                     .on_click(cx.listener(|this, state: &ToggleState, _, cx| this.set_follow(state.selected(), cx))),
+            )
+            .child(
+                Checkbox::new("argo-log-timestamps", ToggleState::from(panel.timestamps))
+                    .label("Timestamps")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, state: &ToggleState, _, cx| {
+                        if let Some(panel) = this.detail.as_mut().and_then(|detail| detail.pod.as_mut()) {
+                            panel.timestamps = state.selected();
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("argo-log-previous-wrap")
+                    .tooltip(Tooltip::text("Logs from before the container last restarted"))
+                    .child(
+                        Checkbox::new("argo-log-previous", ToggleState::from(panel.previous))
+                            .label("Previous container")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, state: &ToggleState, _, cx| this.set_previous(state.selected(), cx))),
+                    ),
             )
             .child(div().flex_1())
             .child(
@@ -395,12 +488,25 @@ impl ArgoView {
                 IconButton::new("argo-log-copy", IconName::Copy)
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("Copy the lines shown"))
-                    .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))),
+                    .on_click({
+                        let copy = copy.clone();
+                        move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
+                    }),
+            )
+            .child(
+                IconButton::new("argo-log-save", IconName::Download)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Save the lines shown to a file"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.save_logs(copy.clone(), cx))),
             );
         let body = match &panel.logs {
             Fetch::Loading => Label::new("Loading…").size(LabelSize::Small).color(Color::Muted).into_any_element(),
             Fetch::Failed(message) => Label::new(message.clone()).size(LabelSize::Small).color(Color::Warning).into_any_element(),
-            Fetch::Loaded(_) if lines.is_empty() => Label::new(if query.is_empty() { "No log lines." } else { "No lines match." })
+            Fetch::Loaded(_) if lines.is_empty() => Label::new(match (query.is_empty(), panel.previous) {
+                (false, _) => "No lines match.",
+                (true, true) => "No log lines. The container may not have restarted.",
+                (true, false) => "No log lines.",
+            })
                 .size(LabelSize::Small)
                 .color(Color::Muted)
                 .into_any_element(),
@@ -463,12 +569,16 @@ fn render_pod_events(panel: &PodPanel, cx: &App) -> AnyElement {
 fn render_lines(id: &'static str, lines: Vec<SharedString>, scroll: &UniformListScrollHandle, cx: &mut Context<ArgoView>) -> AnyElement {
     let colors = cx.theme().colors().clone();
     let count = lines.len();
+    // Long lines scroll sideways instead of wrapping, so every row keeps one height and the list stays virtual.
+    let widest = lines.iter().enumerate().max_by_key(|(_, line)| line.len()).map(|(index, _)| index);
     let list = uniform_list(id, count, move |range, _, cx| {
         range
             .filter_map(|index| lines.get(index).cloned())
-            .map(|line| div().px_2().child(Label::new(line).size(LabelSize::XSmall).buffer_font(cx).truncate()).into_any_element())
+            .map(|line| div().px_2().whitespace_nowrap().child(Label::new(line).size(LabelSize::XSmall).buffer_font(cx)).into_any_element())
             .collect::<Vec<_>>()
     })
+    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+    .with_width_from_item(widest)
     .track_scroll(scroll)
     .flex_1();
     v_flex()
