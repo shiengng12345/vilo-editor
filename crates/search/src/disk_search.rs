@@ -15,7 +15,14 @@ use util::paths::{PathMatcher, PathStyle};
 use util::rel_path::RelPath;
 
 /// Directories skipped like VS Code's default search.exclude (see also worktree's ignore rules).
-const SKIPPED_DIRS: &[&str] = &[".git", "node_modules", "bower_components"];
+/// `.codex` and `.worktrees` hold agent checkouts of the same repos, so they only add duplicate hits.
+const SKIPPED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "bower_components",
+    ".codex",
+    ".worktrees",
+];
 /// Large enough for generated sources; bigger files are almost always data or bundles.
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
