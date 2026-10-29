@@ -1,5 +1,6 @@
 mod pod;
 mod restart;
+mod sync;
 
 use std::{path::PathBuf, time::Duration};
 
@@ -114,6 +115,7 @@ struct Detail {
     /// The pod opened from this application, shown instead of the application.
     pod: Option<pod::PodPanel>,
     restart: Option<restart::RestartPanel>,
+    app_action: Option<sync::AppActionPanel>,
     pod_page: usize,
     _poll: Task<()>,
 }
@@ -422,6 +424,7 @@ impl ArgoView {
             confirm_hard: false,
             pod: None,
             restart: None,
+            app_action: None,
             pod_page: 0,
             _poll: poll,
         });
@@ -840,6 +843,18 @@ impl ArgoView {
                         .flex_wrap()
                         .child(h_flex().gap_1().child(Indicator::dot().color(health_color(&summary.health))).child(Label::new(summary.health.clone())))
                         .child(h_flex().gap_1().child(Indicator::dot().color(sync_color(&summary.sync))).child(Label::new(summary.sync.clone())))
+                        .child(
+                            Label::new(match app.auto_sync {
+                                None => "Auto-sync off".to_string(),
+                                Some(auto) => format!(
+                                    "Auto-sync on{}{}",
+                                    if auto.prune { " · prune" } else { "" },
+                                    if auto.self_heal { " · self-heal" } else { "" }
+                                ),
+                            })
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
                         .when_some(summary.operation.clone(), |this, operation| {
                             this.child(Label::new(format!("Last operation: {operation}")).size(LabelSize::Small).color(Color::Muted))
                         })
@@ -1171,6 +1186,13 @@ impl ArgoView {
 
         let pending = matches!(detail.refresh, RefreshState::Pending);
         let link = base.map(|base| format!("{base}applications/{}/{}", detail.namespace, detail.name));
+        let loaded = match &detail.app {
+            Fetch::Loaded(app) => Some(app),
+            _ => None,
+        };
+        let running = loaded.is_some_and(|app| app.summary.operation.as_deref() == Some("Running"));
+        let auto_sync = loaded.map(|app| app.auto_sync.is_some());
+        let action_panel = loaded.zip(detail.app_action.as_ref()).map(|(app, panel)| self.render_app_action(panel, app, cx));
         v_flex()
             .id("argo-detail")
             .flex_1()
@@ -1182,6 +1204,28 @@ impl ArgoView {
                     .child(Headline::new(detail.name.clone()).size(HeadlineSize::Small))
                     .child(Label::new(detail.namespace.clone()).size(LabelSize::Small).color(Color::Muted))
                     .child(div().flex_1())
+                    .when_some(auto_sync, |this, on| {
+                        this.child(
+                            Button::new("argo-sync", "Sync…")
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Filled)
+                                .disabled(running)
+                                .tooltip(Tooltip::text(if running {
+                                    "An operation is running; wait for it to finish."
+                                } else {
+                                    "Deploy what Git has now, after confirming"
+                                }))
+                                .on_click(cx.listener(|this, _, window, cx| this.start_app_action(sync::AppAction::Sync { prune: false }, window, cx))),
+                        )
+                        .child(
+                            Button::new("argo-auto-sync", if on { "Turn off auto-sync…" } else { "Turn on auto-sync…" })
+                                .label_size(LabelSize::Small)
+                                .tooltip(Tooltip::text("Argo's own automated sync, run by the server"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.start_app_action(sync::AppAction::AutoSync(!on), window, cx)
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("argo-refresh", if pending { "Refreshing…" } else { "Refresh" })
                             .label_size(LabelSize::Small)
@@ -1214,6 +1258,7 @@ impl ArgoView {
                 },
                 |this, message| this.child(Label::new(message).size(LabelSize::Small).color(Color::Muted)),
             )
+            .children(action_panel)
             .child(body)
             .into_any_element()
     }

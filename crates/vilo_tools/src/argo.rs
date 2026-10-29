@@ -106,6 +106,17 @@ pub struct AppDetail {
     pub conditions: Vec<(String, String)>,
     pub operation_message: Option<String>,
     pub reconciled_at: Option<String>,
+    /// Argo's own automated sync; `None` when it is off.
+    pub auto_sync: Option<AutoSync>,
+    pub out_of_sync: usize,
+    /// Another application that keeps this one's definition in Git, so Argo may undo edits to it.
+    pub managed_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoSync {
+    pub prune: bool,
+    pub self_heal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -447,10 +458,31 @@ impl ArgoClient {
             "action": action,
         });
         let path = format!("api/v1/applications/{}/resource/actions/v2", segment(name));
-        self.post_once(&path, &body).await
+        self.write_once(Method::POST, &path, &body).await
     }
 
-    async fn post_once(&self, path: &str, body: &serde_json::Value) -> Result<(), WriteError> {
+    /// Syncs to the app's own target revisions (each source's, for multi-source apps) with its own sync options.
+    pub async fn sync(&self, namespace: &str, name: &str, project: &str, prune: bool) -> Result<(), WriteError> {
+        let body = serde_json::json!({ "name": name, "appNamespace": namespace, "project": project, "prune": prune });
+        let path = format!("api/v1/applications/{}/sync", segment(name));
+        self.write_once(Method::POST, &path, &body).await
+    }
+
+    /// Switches Argo's automated sync. Prune and self-heal keep whatever the app has set.
+    pub async fn set_auto_sync(&self, namespace: &str, name: &str, project: &str, enabled: bool) -> Result<(), WriteError> {
+        let patch = serde_json::json!({ "spec": { "syncPolicy": { "automated": { "enabled": enabled } } } });
+        let body = serde_json::json!({
+            "name": name,
+            "appNamespace": namespace,
+            "project": project,
+            "patchType": "merge",
+            "patch": patch.to_string(),
+        });
+        let path = format!("api/v1/applications/{}", segment(name));
+        self.write_once(Method::PATCH, &path, &body).await
+    }
+
+    async fn write_once(&self, method: Method, path: &str, body: &serde_json::Value) -> Result<(), WriteError> {
         let unknown = |error: ArgoError| WriteError::Unknown(error.to_string());
         let current = {
             let mut bearer = self.bearer.lock().await;
@@ -462,7 +494,7 @@ impl ArgoClient {
         };
         let url = self.url(path).map_err(|error| WriteError::Rejected(error.to_string()))?;
         let mut request = Request::builder()
-            .method(Method::POST)
+            .method(method)
             .uri(url.as_str())
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
@@ -832,7 +864,32 @@ fn parse_detail(app: &serde_json::Value) -> Option<AppDetail> {
             .unwrap_or_default(),
         operation_message: app.pointer("/status/operationState/message").and_then(|message| message.as_str()).map(str::to_string),
         reconciled_at: app.pointer("/status/reconciledAt").and_then(|time| time.as_str()).map(str::to_string),
+        auto_sync: app
+            .pointer("/spec/syncPolicy/automated")
+            .filter(|automated| automated.is_object())
+            // Argo 3 can keep the settings while `enabled: false` switches it off.
+            .filter(|automated| automated.get("enabled").and_then(|enabled| enabled.as_bool()) != Some(false))
+            .map(|automated| AutoSync {
+                prune: automated.get("prune").and_then(|prune| prune.as_bool()).unwrap_or(false),
+                self_heal: automated.get("selfHeal").and_then(|heal| heal.as_bool()).unwrap_or(false),
+            }),
+        out_of_sync: app
+            .pointer("/status/resources")
+            .and_then(|resources| resources.as_array())
+            .map_or(0, |resources| resources.iter().filter(|resource| text(resource, "/status") == "OutOfSync").count()),
+        managed_by: managed_by(app),
     })
+}
+
+/// The parent app from Argo's tracking annotation ("parent:group/Kind:ns/name") or instance label.
+fn managed_by(app: &serde_json::Value) -> Option<String> {
+    let own = text(app, "/metadata/name");
+    let tracking = app
+        .pointer("/metadata/annotations/argocd.argoproj.io~1tracking-id")
+        .and_then(|id| id.as_str())
+        .and_then(|id| id.split(':').next());
+    let label = app.pointer("/metadata/labels/app.kubernetes.io~1instance").and_then(|label| label.as_str());
+    tracking.or(label).filter(|parent| !parent.is_empty() && *parent != own).map(str::to_string)
 }
 
 #[cfg(test)]
@@ -960,5 +1017,18 @@ mod tests {
         assert_eq!(detail.history[0].revisions.len(), 2);
         assert!(detail.summary.deleting);
         assert_eq!(detail.summary.health, "Unknown");
+        assert_eq!(detail.auto_sync, None);
+
+        let automated = json!({
+            "metadata": {"name": "web", "annotations": {"argocd.argoproj.io/tracking-id": "apps:argoproj.io/Application:argocd/web"}},
+            "spec": {"syncPolicy": {"automated": {"selfHeal": true}}},
+            "status": {"resources": [{"status": "OutOfSync"}, {"status": "Synced"}]}
+        });
+        let detail = parse_detail(&automated).unwrap();
+        assert_eq!(detail.auto_sync, Some(AutoSync { prune: false, self_heal: true }));
+        assert_eq!(detail.out_of_sync, 1);
+        assert_eq!(detail.managed_by.as_deref(), Some("apps"));
+        let switched_off = json!({"metadata": {"name": "web"}, "spec": {"syncPolicy": {"automated": {"enabled": false}}}});
+        assert_eq!(parse_detail(&switched_off).unwrap().auto_sync, None);
     }
 }

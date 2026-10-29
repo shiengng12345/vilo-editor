@@ -36,7 +36,7 @@ impl RestartPanel {
 }
 
 impl ArgoView {
-    fn is_production(&self) -> bool {
+    pub(super) fn is_production(&self) -> bool {
         self.current_connection().is_some_and(|connection| {
             let text = format!("{} {} {}", connection.environment, connection.name, connection.address).to_lowercase();
             text.contains("prod") || text.contains("live")
@@ -239,7 +239,7 @@ impl ArgoView {
     }
 }
 
-fn append_audit(line: serde_json::Value, cx: &mut App) {
+pub(super) fn append_audit(line: serde_json::Value, cx: &mut App) {
     let line = line.to_string();
     cx.background_spawn(async move {
         let mut file = std::fs::OpenOptions::new()
