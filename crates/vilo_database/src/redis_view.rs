@@ -133,6 +133,8 @@ struct Detail {
     more_error: Option<SharedString>,
     /// The load that produced this detail, so later pages join only their own search.
     request: u64,
+    /// A "Load more" is running; auto refresh waits for it.
+    loading_more: bool,
 }
 
 /// What the right panel shows.
@@ -935,12 +937,21 @@ impl DatabaseView {
                                 return true;
                             }
                             // The open key reloads with its current search; a load still running is left alone.
+                            // Only the key still on screen reloads, and not while a page is loading.
+                            let on_screen = matches!(state.panel, RightPanel::Key);
+                            let selected = state.selected.clone();
                             let open = match &state.detail {
-                                Some(Fetch::Loaded(detail)) => Some((
-                                    detail.key.clone(),
-                                    detail.pattern.clone(),
-                                    detail.local_filter.clone(),
-                                )),
+                                Some(Fetch::Loaded(detail))
+                                    if on_screen
+                                        && !detail.loading_more
+                                        && selected.as_ref() == Some(&detail.key) =>
+                                {
+                                    Some((
+                                        detail.key.clone(),
+                                        detail.pattern.clone(),
+                                        detail.local_filter.clone(),
+                                    ))
+                                }
                                 _ => None,
                             };
                             this.scan(true, cx);
@@ -1296,6 +1307,7 @@ impl DatabaseView {
                     local_filter,
                     more_error: None,
                     request,
+                    loading_more: false,
                 })
             }
         });
@@ -1332,9 +1344,12 @@ impl DatabaseView {
         let Some(state) = self.redis_state() else {
             return;
         };
-        let Some(Fetch::Loaded(detail)) = &state.detail else {
+        let Some(Fetch::Loaded(detail)) = &mut state.detail else {
             return;
         };
+        if detail.loading_more {
+            return;
+        }
         let key = detail.key.clone();
         let request = detail.request;
         enum Next {
@@ -1375,6 +1390,7 @@ impl DatabaseView {
             },
             _ => return,
         };
+        detail.loading_more = true;
         enum More {
             Hash(Vec<(Bytes, Bytes)>, String),
             List(Vec<Bytes>, i64),
@@ -1438,6 +1454,7 @@ impl DatabaseView {
                 if detail.key != key || detail.request != request {
                     return;
                 }
+                detail.loading_more = false;
                 let more = match result {
                     Ok(more) => {
                         detail.more_error = None;
@@ -1507,7 +1524,13 @@ impl DatabaseView {
         }
         self.workbench_input
             .update(cx, |editor, cx| editor.set_text("", window, cx));
-        self.remember_command(&line, cx);
+        // Only commands the Workbench would run are kept, so Up never recalls a refused write.
+        if split_command(&line).is_ok_and(|words| {
+            vilo_database_core::redis::classify_words(&words)
+                == vilo_database_core::redis::CommandKind::Read
+        }) {
+            self.remember_command(&line, cx);
+        }
         let connection = self.generation;
         let Some(state) = self.redis_state() else {
             return;
