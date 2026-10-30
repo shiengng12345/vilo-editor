@@ -32,8 +32,9 @@ pub(crate) struct SearchState {
     /// The page's rows as shown, built once when it arrives: key, key text, missing, fields text.
     rows: Vec<(Bytes, String, bool, String)>,
     running: bool,
-    /// Bumped by every load, so an answer to an older one is dropped.
-    attempt: u64,
+    /// Bumped by every index choice and every search, so an answer to an older one is dropped.
+    info_attempt: u64,
+    search_attempt: u64,
     scroll: UniformListScrollHandle,
 }
 
@@ -50,7 +51,8 @@ impl Default for SearchState {
             page: None,
             rows: Vec::new(),
             running: false,
-            attempt: 0,
+            info_attempt: 0,
+            search_attempt: 0,
             scroll: UniformListScrollHandle::new(),
         }
     }
@@ -70,7 +72,7 @@ fn fields_text(content: &Content) -> (bool, String) {
                 }
                 text.push_str(&escape_bytes(&field.name));
                 text.push_str(": ");
-                // Every byte shows as at least one character, so a prefix is enough for the row.
+                // No character takes more than four bytes, so this prefix fills the row.
                 let shown = field.value.len().min(ROW_CHARACTERS * 4);
                 text.push_str(&escape_bytes(&field.value[..shown]));
                 if field.size > field.value.len() {
@@ -212,8 +214,9 @@ impl DatabaseView {
         search.rows.clear();
         search.shown = None;
         search.running = false;
-        search.attempt += 1;
-        let attempt = search.attempt;
+        search.info_attempt += 1;
+        search.search_attempt += 1;
+        let attempt = search.info_attempt;
         let task = run(cx, async move { session.search_index_info(&index).await });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -222,7 +225,7 @@ impl DatabaseView {
                     return;
                 }
                 if let Some(search) = this.search_state()
-                    && search.attempt == attempt
+                    && search.info_attempt == attempt
                 {
                     search.info = Some(result.map_err(|error| format!("{error:#}").into()));
                     cx.notify();
@@ -246,6 +249,8 @@ impl DatabaseView {
         let request = match (offset, &search.shown) {
             (Some(offset), Some(shown)) => SearchRequest {
                 offset,
+                count: search.page_size,
+                timeout_ms: search.timeout_ms,
                 ..shown.clone()
             },
             _ => {
@@ -266,8 +271,8 @@ impl DatabaseView {
             }
         };
         search.running = true;
-        search.attempt += 1;
-        let attempt = search.attempt;
+        search.search_attempt += 1;
+        let attempt = search.search_attempt;
         let task = run(cx, {
             let request = request.clone();
             async move { session.search(&request).await }
@@ -280,7 +285,7 @@ impl DatabaseView {
                 }
                 let Some(search) = this
                     .search_state()
-                    .filter(|search| search.attempt == attempt)
+                    .filter(|search| search.search_attempt == attempt)
                 else {
                     return;
                 };
@@ -447,7 +452,7 @@ impl DatabaseView {
         };
         let (previous, next) = match (&search.page, &search.shown) {
             (Some(Ok(page)), Some(shown)) => (
-                (shown.offset > 0).then(|| shown.offset.saturating_sub(shown.count)),
+                (shown.offset > 0).then(|| shown.offset.saturating_sub(search.page_size)),
                 (shown.offset + (page.hits.len() as u64) < page.total
                     && page.hits.len() as u64 == shown.count)
                     .then(|| shown.offset + shown.count),

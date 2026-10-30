@@ -21,11 +21,14 @@ pub const MAX_TIMEOUT_MS: u64 = 10_000;
 pub const MAX_INDEXES: usize = 1000;
 /// Field values are kept up to this many bytes for display, and say when they were cut.
 pub const MAX_VALUE_BYTES: usize = 64 * 1024;
-/// What one page's documents may weigh, by MEMORY USAGE, before their content is fetched.
+/// What one page's documents may take in memory, by MEMORY USAGE, for their content to be fetched.
 pub const PAGE_BYTES: u64 = 4 * 1024 * 1024;
 /// A document heavier than this is listed without its content.
 pub const DOCUMENT_BYTES: u64 = 1024 * 1024;
-/// MEMORY USAGE samples large hashes, so it can be off; content past this is not kept either.
+/// Hashes with more fields are listed without content: measuring them exactly walks every field.
+pub const MAX_FIELDS: u64 = 1000;
+/// Content kept per page. A document may grow between being measured and fetched; past this
+/// the rest of the page is not kept.
 const KEPT_BYTES: usize = 2 * PAGE_BYTES as usize;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -340,6 +343,95 @@ impl RedisSession {
     }
 }
 
+/// Each key's memory, or why its content will not be fetched. Hashes are measured exactly
+/// (SAMPLES 0), which is why only those with at most `MAX_FIELDS` fields are; JSON documents are
+/// measured by the module. The reply is then at most a few times the memory: JSON escapes a
+/// control character as six bytes.
+async fn measure(client: &Client, keys: &[Bytes]) -> Result<Vec<Result<u64, String>>> {
+    let unreadable = || "Its size could not be read; open the key.".to_string();
+    let pipeline = client.pipeline();
+    for key in keys {
+        for name in ["TYPE", "HLEN"] {
+            let () = pipeline
+                .custom(
+                    CustomCommand::new(name, ClusterHash::FirstKey, false),
+                    vec![bytes_arg(key)],
+                )
+                .await?;
+        }
+    }
+    let kinds = pipeline.try_all::<Value>().await;
+    let pipeline = client.pipeline();
+    let mut sizes = Vec::with_capacity(keys.len());
+    let mut asked = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        let read = |offset: usize| {
+            kinds
+                .get(index * 2 + offset)
+                .and_then(|reply| reply.as_ref().ok())
+        };
+        let kind = read(0).map(text);
+        let args = match kind.as_deref() {
+            Some("hash") => match read(1).and_then(Value::as_u64) {
+                Some(fields) if fields <= MAX_FIELDS => {
+                    vec!["USAGE".into(), bytes_arg(key), "SAMPLES".into(), "0".into()]
+                }
+                Some(fields) => {
+                    sizes.push(Err(format!(
+                        "It has {fields} fields, more than {MAX_FIELDS}; open the key."
+                    )));
+                    continue;
+                }
+                None => {
+                    sizes.push(Err(unreadable()));
+                    continue;
+                }
+            },
+            Some("ReJSON-RL") => vec!["USAGE".into(), bytes_arg(key)],
+            Some("none") => {
+                sizes.push(Err("The key no longer exists.".to_string()));
+                continue;
+            }
+            Some(other) => {
+                sizes.push(Err(format!(
+                    "It is a {other}, not a hash or JSON document; open the key."
+                )));
+                continue;
+            }
+            None => {
+                sizes.push(Err(unreadable()));
+                continue;
+            }
+        };
+        let () = pipeline
+            .custom(
+                CustomCommand::new("MEMORY", ClusterHash::FirstKey, false),
+                args,
+            )
+            .await?;
+        asked.push(index);
+        sizes.push(Err(unreadable()));
+    }
+    if asked.is_empty() {
+        return Ok(sizes);
+    }
+    let measured = pipeline.try_all::<Value>().await;
+    for (reply, index) in measured.into_iter().zip(asked) {
+        let size = match reply {
+            Ok(Value::Null) => Err("The key no longer exists.".to_string()),
+            Ok(size) => size.as_u64().ok_or_else(unreadable),
+            Err(error) => Err(format!(
+                "Its size could not be read ({}); open the key.",
+                error.details()
+            )),
+        };
+        if let Some(slot) = sizes.get_mut(index) {
+            *slot = size;
+        }
+    }
+    Ok(sizes)
+}
+
 async fn search_on(client: &Client, request: &SearchRequest) -> Result<SearchPage> {
     let base = || {
         vec![
@@ -374,42 +466,25 @@ async fn search_on(client: &Client, request: &SearchRequest) -> Result<SearchPag
         });
     }
 
-    let pipeline = client.pipeline();
-    for key in &keys {
-        let () = pipeline
-            .custom(
-                CustomCommand::new("MEMORY", ClusterHash::FirstKey, false),
-                vec!["USAGE".into(), bytes_arg(key)],
-            )
-            .await?;
-    }
-    let sizes = pipeline.try_all::<Value>().await;
+    let sizes = measure(client, &keys).await?;
     let mut budget = PAGE_BYTES;
     let mut missing = HashMap::new();
     let mut fetch = Vec::new();
-    for (index, key) in keys.iter().enumerate() {
-        let reason = match sizes.get(index) {
-            Some(Ok(Value::Null)) => Some("The key no longer exists.".to_string()),
-            Some(Ok(size)) => match size.as_u64() {
-                Some(size) if size > DOCUMENT_BYTES => Some(format!(
-                    "Too large to show here (about {size} bytes); open the key."
-                )),
-                Some(size) if size > budget => Some(
-                    "Not shown: this page reached its size limit. Open the key, or show fewer per page."
-                        .to_string(),
-                ),
-                Some(size) => {
-                    budget -= size;
-                    fetch.push(key.clone());
-                    None
-                }
-                None => Some(format!("Its size could not be read ({size:?}); open the key.")),
-            },
-            Some(Err(error)) => Some(format!(
-                "Its size could not be read ({}); open the key.",
-                error.details()
+    for (key, size) in keys.iter().zip(sizes) {
+        let reason = match size {
+            Ok(size) if size > DOCUMENT_BYTES => Some(format!(
+                "Too large to show here (about {size} bytes); open the key."
             )),
-            None => Some("Its size could not be read; open the key.".to_string()),
+            Ok(size) if size > budget => Some(
+                "Not shown: this page reached its size limit. Open the key, or show fewer per page."
+                    .to_string(),
+            ),
+            Ok(size) => {
+                budget -= size;
+                fetch.push(key.clone());
+                None
+            }
+            Err(reason) => Some(reason),
         };
         if let Some(reason) = reason {
             missing.insert(key.clone(), reason);
@@ -598,6 +673,17 @@ mod tests {
             )
             .await
             .unwrap();
+        // Too many fields to measure exactly, so also listed without content.
+        let mut wide = vec![
+            Value::from(format!("{prefix}wide")),
+            Value::from("title"),
+            Value::from("wide apple"),
+        ];
+        for field in 0..MAX_FIELDS {
+            wide.push(Value::from(format!("f{field}")));
+            wide.push(Value::from("1"));
+        }
+        session.call("HSET", wide).await.unwrap();
         session
             .call(
                 "FT.CREATE",
@@ -617,7 +703,7 @@ mod tests {
             .unwrap();
         for _ in 0..50 {
             let info = session.search_index_info(index.as_bytes()).await.unwrap();
-            if info.percent_indexed == Some(1.0) && info.documents == Some(4) {
+            if info.percent_indexed == Some(1.0) && info.documents == Some(5) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -637,10 +723,10 @@ mod tests {
                 kind: "TEXT".into()
             }]
         );
-        assert_eq!(info.documents, Some(4));
+        assert_eq!(info.documents, Some(5));
 
         let page = session.search(&request(index, "apple")).await.unwrap();
-        assert_eq!(page.total, 3);
+        assert_eq!(page.total, 4);
         assert_eq!(page.partial, None);
         let mut shown = page
             .hits
@@ -666,11 +752,15 @@ mod tests {
             shown[2].0 == format!("{prefix}huge") && shown[2].1.starts_with("missing: Too large"),
             "{shown:?}"
         );
+        assert!(
+            shown[3].0 == format!("{prefix}wide") && shown[3].1.contains("more than 1000"),
+            "{shown:?}"
+        );
 
         let mut second = request(index, "apple");
         second.offset = 2;
         second.count = 2;
-        assert_eq!(session.search(&second).await.unwrap().hits.len(), 1);
+        assert_eq!(session.search(&second).await.unwrap().hits.len(), 2);
         let mut empty = request(index, "apple");
         empty.offset = 10;
         assert!(session.search(&empty).await.unwrap().hits.is_empty());
