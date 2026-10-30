@@ -104,6 +104,12 @@ impl DatabaseView {
         let Some(session) = self.redis() else {
             return;
         };
+        if !self
+            .active_connection()
+            .is_some_and(|connection| self.writes_allowed(connection))
+        {
+            return;
+        }
         let generation = self.generation;
         let Some(form) = &mut self.bulk_delete else {
             return;
@@ -270,11 +276,14 @@ impl DatabaseView {
                     "environment": connection.environment,
                     "db": database,
                     "key": batch.keys.first().map(|key| quote_bytes(key)),
+                    // Every key, so an unknown outcome can be checked key by key, even after a restart.
+                    "keys": batch.keys.iter().map(|key| quote_bytes(key)).collect::<Vec<_>>(),
                     "target": format!(
-                        "batch {} of {total}: {} keys matching {pattern}{}",
+                        "db{database} batch {} of {total}: {} keys matching {pattern}{}, the first {}; every key is listed under operation {operation} in database_audit.log",
                         index + 1,
                         batch.keys.len(),
-                        batch.slot.map(|slot| format!(" in slot {slot}")).unwrap_or_default()
+                        batch.slot.map(|slot| format!(" in slot {slot}")).unwrap_or_default(),
+                        batch.keys.first().map(|key| quote_bytes(key)).unwrap_or_default(),
                     ),
                     "kind": "bulk-delete",
                     // Restores the bulk lock after a restart until the outcome is settled.
@@ -308,8 +317,23 @@ impl DatabaseView {
                     // The task itself failed, possibly after sending.
                     Err(error) => Ok((Err(WriteError::Unknown(format!("{error:#}"))), None)),
                 };
-                if let Ok((Err(WriteError::Unknown(message)), _)) = &result {
-                    unknown = Some((operation.clone(), summary.clone(), message.clone()));
+                match &result {
+                    Ok((Err(WriteError::Unknown(message)), _)) => {
+                        unknown = Some((
+                            operation.clone(),
+                            summary.clone(),
+                            format!("its outcome is unknown ({message})"),
+                        ));
+                    }
+                    // The log still shows this batch as unsettled, so it stays locked until checked.
+                    Ok((Ok(_), Some(error))) => {
+                        unknown = Some((
+                            operation.clone(),
+                            summary.clone(),
+                            format!("it was deleted, but its result could not be logged: {error}"),
+                        ));
+                    }
+                    _ => {}
                 }
                 let alive = this
                     .update(cx, |this, cx| {
@@ -332,7 +356,7 @@ impl DatabaseView {
                     Ok((Ok(_), None)) => {}
                     Ok((Ok(_), Some(error))) => {
                         ended = Some((
-                            format!("Batch {} was deleted but its result could not be logged ({error}); the rest were not sent.", index + 1),
+                            format!("Batch {} was deleted but its result could not be logged ({error}); the rest were not sent. Once the write log works, press I checked it.", index + 1),
                             Color::Error,
                         ));
                         break;
@@ -373,7 +397,7 @@ impl DatabaseView {
             this.update(cx, |this, cx| {
                 if let Some((_, summary, message)) = &unknown {
                     this.write_notice = Some(
-                        format!("The outcome of {summary} is unknown ({message}). Check its keys, then press I checked it in the bulk delete dialog.")
+                        format!("{summary} needs checking: {message}. Check its keys, then press I checked it in the bulk delete dialog.")
                             .into(),
                     );
                 }
