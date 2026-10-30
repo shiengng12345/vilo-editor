@@ -215,6 +215,71 @@ fn check_name(name: &str, others: &[String]) -> Result<(), &'static str> {
     Ok(())
 }
 
+struct RedisFields {
+    host: Entity<Editor>,
+    port: Entity<Editor>,
+    username: Entity<Editor>,
+    password: Entity<Editor>,
+    database: Entity<Editor>,
+    tls: bool,
+}
+
+/// The parts of a Redis connection, as the form shows them.
+#[derive(Debug, Default, PartialEq)]
+struct RedisParts {
+    host: String,
+    port: String,
+    username: String,
+    password: String,
+    database: String,
+    tls: bool,
+}
+
+impl RedisParts {
+    fn to_uri(&self) -> Result<String> {
+        let scheme = if self.tls { "rediss" } else { "redis" };
+        let port = if self.port.is_empty() {
+            "6379"
+        } else {
+            &self.port
+        };
+        port.parse::<u16>().context("Port must be a number")?;
+        let mut url = url::Url::parse(&format!("{scheme}://{}:{port}", self.host))
+            .context("Host is not valid")?;
+        // The url crate percent-encodes, so passwords with @ or / survive.
+        url.set_username(&self.username)
+            .map_err(|_| anyhow!("Username is not valid"))?;
+        if !self.password.is_empty() {
+            url.set_password(Some(&self.password))
+                .map_err(|_| anyhow!("Password is not valid"))?;
+        }
+        if !self.database.is_empty() {
+            self.database
+                .parse::<u8>()
+                .context("Database must be a number from 0")?;
+            url.set_path(&format!("/{}", self.database));
+        }
+        Ok(url.to_string())
+    }
+
+    fn from_uri(uri: &str) -> Option<Self> {
+        let url = url::Url::parse(uri).ok()?;
+        let decode = |text: &str| {
+            urlencoding::decode(text)
+                .map(|text| text.into_owned())
+                .unwrap_or_else(|_| text.to_string())
+        };
+        Some(Self {
+            host: url.host_str()?.to_string(),
+            port: url.port().map(|port| port.to_string()).unwrap_or_default(),
+            username: decode(url.username()),
+            password: url.password().map(decode).unwrap_or_default(),
+            database: url.path().trim_start_matches('/').to_string(),
+            tls: url.scheme() == "rediss",
+        })
+    }
+}
+
 struct Form {
     editing: Option<String>,
     kind: Kind,
@@ -223,6 +288,8 @@ struct Form {
     name: Entity<Editor>,
     environment: String,
     uri: Entity<Editor>,
+    /// Redis is entered as host, port and so on, like RedisInsight, and saved as a redis:// URL.
+    redis: Option<RedisFields>,
     message: Option<SharedString>,
     checking: bool,
     _task: Option<Task<()>>,
@@ -782,12 +849,32 @@ impl DatabaseView {
                 if existing.is_some() {
                     "Leave empty to keep the saved one"
                 } else {
-                    "mongodb://… or redis://…"
+                    "mongodb://… or mongodb+srv://…"
                 },
                 "",
                 false,
                 window,
                 cx,
+            ),
+            redis: (existing.as_ref().map_or(self.kind_view, |c| c.kind) == Kind::Redis).then(
+                || RedisFields {
+                    host: editor("e.g. 127.0.0.1", "", false, window, cx),
+                    port: editor("6379", "", false, window, cx),
+                    username: editor("default", "", false, window, cx),
+                    password: editor(
+                        if existing.is_some() {
+                            "Leave empty to keep the saved one"
+                        } else {
+                            ""
+                        },
+                        "",
+                        true,
+                        window,
+                        cx,
+                    ),
+                    database: editor("0", "", false, window, cx),
+                    tls: false,
+                },
             ),
             editing,
             message: None,
@@ -800,11 +887,32 @@ impl DatabaseView {
         {
             let uri = form.uri.clone();
             let read = cx.read_credentials(&connection.credential_url());
-            form._task = Some(cx.spawn_in(window, async move |_, cx| match read.await {
+            form._task = Some(cx.spawn_in(window, async move |this, cx| match read.await {
                 Ok(Some((_, saved))) => {
                     let saved = String::from_utf8_lossy(&saved).to_string();
-                    uri.update_in(cx, |uri, window, cx| uri.set_text(saved, window, cx))
-                        .log_err();
+                    this.update_in(cx, |this, window, cx| {
+                        let Some(form) = &mut this.form else {
+                            return;
+                        };
+                        match (&mut form.redis, RedisParts::from_uri(&saved)) {
+                            (Some(redis), Some(parts)) => {
+                                for (editor, text) in [
+                                    (&redis.host, parts.host),
+                                    (&redis.port, parts.port),
+                                    (&redis.username, parts.username),
+                                    (&redis.password, parts.password),
+                                    (&redis.database, parts.database),
+                                ] {
+                                    editor
+                                        .update(cx, |editor, cx| editor.set_text(text, window, cx));
+                                }
+                                redis.tls = parts.tls;
+                            }
+                            _ => uri.update(cx, |uri, cx| uri.set_text(saved, window, cx)),
+                        }
+                        cx.notify();
+                    })
+                    .log_err();
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -820,12 +928,35 @@ impl DatabaseView {
             return;
         };
         let text = |editor: &Entity<Editor>, cx: &App| editor.read(cx).text(cx).trim().to_string();
-        let (site, name, environment, uri) = (
+        let (site, name, environment, mut uri) = (
             form.site.clone(),
             text(&form.name, cx),
             form.environment.clone(),
             text(&form.uri, cx),
         );
+        if let Some(redis) = &form.redis {
+            let parts = RedisParts {
+                host: text(&redis.host, cx),
+                port: text(&redis.port, cx),
+                username: text(&redis.username, cx),
+                password: text(&redis.password, cx),
+                database: text(&redis.database, cx),
+                tls: redis.tls,
+            };
+            // An edited connection whose fields never loaded keeps its saved string.
+            uri = if parts.host.is_empty() {
+                String::new()
+            } else {
+                match parts.to_uri() {
+                    Ok(uri) => uri,
+                    Err(error) => {
+                        form.message = Some(format!("{error:#}").into());
+                        cx.notify();
+                        return;
+                    }
+                }
+            };
+        }
         if site.is_empty() || environment.is_empty() {
             form.message = Some("Add a site and an environment on the left first.".into());
             cx.notify();
@@ -846,7 +977,11 @@ impl DatabaseView {
                 .as_ref()
                 .is_none_or(|existing| existing.kind != form.kind)
         {
-            form.message = Some("Enter the connection string.".into());
+            form.message = Some(if form.redis.is_some() {
+                "Fill in the host.".into()
+            } else {
+                "Enter the connection string.".into()
+            });
             cx.notify();
             return;
         }
@@ -1586,10 +1721,43 @@ impl DatabaseView {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
-            .child(input("Connection string", &form.uri, cx))
+            .map(|this| match &form.redis {
+                None => this.child(input("Connection string", &form.uri, cx)),
+                Some(redis) => this
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(div().flex_1().child(input("Host", &redis.host, cx)))
+                            .child(div().w(px(140.)).child(input("Port", &redis.port, cx))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(div().flex_1().child(input("Username", &redis.username, cx)))
+                            .child(div().flex_1().child(input("Password", &redis.password, cx))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_end()
+                            .child(div().w(px(140.)).child(input("Database", &redis.database, cx)))
+                            .child(
+                                Button::new("database-redis-tls", "Use TLS")
+                                    .style(if redis.tls { ButtonStyle::Filled } else { ButtonStyle::Outlined })
+                                    .start_icon(Icon::new(if redis.tls { IconName::Check } else { IconName::Circle }).size(IconSize::XSmall))
+                                    .toggle_state(redis.tls)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(redis) = this.form.as_mut().and_then(|form| form.redis.as_mut()) {
+                                            redis.tls = !redis.tls;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            })
             .child(
                 Label::new(
-                    "The connection string, password included, is kept in the macOS keychain and only used to connect. \
+                    "The connection details, password included, are kept in the macOS keychain and only used to connect. \
                      This version only reads. Environments named prod or live are marked on every page.",
                 )
                 .size(LabelSize::Small)
@@ -1813,6 +1981,30 @@ impl Render for DatabaseView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_redis_parts_round_trip() {
+        let parts = RedisParts {
+            host: "10.0.0.5".into(),
+            port: "6380".into(),
+            username: "default".into(),
+            password: "p@ss/w+o=r&d%".into(),
+            database: "2".into(),
+            tls: true,
+        };
+        let uri = parts.to_uri().unwrap();
+        assert!(uri.starts_with("rediss://default:"));
+        assert_eq!(RedisParts::from_uri(&uri), Some(parts));
+        assert!(
+            RedisParts {
+                host: "h".into(),
+                port: "x".into(),
+                ..Default::default()
+            }
+            .to_uri()
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_site_names_are_checked() {
