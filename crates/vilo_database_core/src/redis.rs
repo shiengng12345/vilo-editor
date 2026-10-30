@@ -809,6 +809,353 @@ impl RedisSession {
     }
 }
 
+/// One single-key write, as the confirm step shows it and as it is sent. Edits that replace a
+/// value carry the value they expect to replace; the server checks it atomically.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RedisWrite {
+    SetString {
+        key: Bytes,
+        expected: Bytes,
+        value: Bytes,
+    },
+    HashSet {
+        key: Bytes,
+        field: Bytes,
+        expected: Option<Bytes>,
+        value: Bytes,
+    },
+    HashDelete {
+        key: Bytes,
+        field: Bytes,
+        expected: Bytes,
+    },
+    SetAdd {
+        key: Bytes,
+        member: Bytes,
+    },
+    SetRemove {
+        key: Bytes,
+        member: Bytes,
+    },
+    ZSetScore {
+        key: Bytes,
+        member: Bytes,
+        expected: Option<String>,
+        score: f64,
+    },
+    ZSetRemove {
+        key: Bytes,
+        member: Bytes,
+    },
+    ListPush {
+        key: Bytes,
+        head: bool,
+        value: Bytes,
+    },
+    ListRemoveFirst {
+        key: Bytes,
+        value: Bytes,
+    },
+    Delete {
+        key: Bytes,
+    },
+    Rename {
+        key: Bytes,
+        to: Bytes,
+    },
+    Expire {
+        key: Bytes,
+        seconds: u64,
+    },
+    Persist {
+        key: Bytes,
+    },
+}
+
+/// Replaces the value only if it is still `ARGV[1]`; XX and KEEPTTL keep an expired key gone
+/// and its expiry unchanged (Redis 6 and later).
+const SET_STRING_GUARDED: &str = "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end \
+     redis.call('SET', KEYS[1], ARGV[2], 'XX', 'KEEPTTL') return 1";
+/// ARGV: field, expected, has-expected ('1' or '0'), value. Never creates a missing key.
+const HASH_SET_GUARDED: &str = "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end \
+     local v = redis.call('HGET', KEYS[1], ARGV[1]) \
+     if ARGV[3] == '1' then if v ~= ARGV[2] then return 0 end elseif v then return 0 end \
+     redis.call('HSET', KEYS[1], ARGV[1], ARGV[4]) return 1";
+const HASH_DELETE_GUARDED: &str = "if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end \
+     return redis.call('HDEL', KEYS[1], ARGV[1])";
+/// ARGV: member, expected score, has-expected, new score. Never creates a missing key.
+const ZSET_SCORE_GUARDED: &str = "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end \
+     local s = redis.call('ZSCORE', KEYS[1], ARGV[1]) \
+     if ARGV[3] == '1' then if not s or tonumber(s) ~= tonumber(ARGV[2]) then return 0 end \
+     elseif s then return 0 end \
+     redis.call('ZADD', KEYS[1], ARGV[4], ARGV[1]) return 1";
+const SET_ADD_EXISTING: &str = "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end \
+     redis.call('SADD', KEYS[1], ARGV[1]) return 1";
+
+impl RedisWrite {
+    pub fn key(&self) -> &[u8] {
+        match self {
+            RedisWrite::SetString { key, .. }
+            | RedisWrite::HashSet { key, .. }
+            | RedisWrite::HashDelete { key, .. }
+            | RedisWrite::SetAdd { key, .. }
+            | RedisWrite::SetRemove { key, .. }
+            | RedisWrite::ZSetScore { key, .. }
+            | RedisWrite::ZSetRemove { key, .. }
+            | RedisWrite::ListPush { key, .. }
+            | RedisWrite::ListRemoveFirst { key, .. }
+            | RedisWrite::Delete { key }
+            | RedisWrite::Rename { key, .. }
+            | RedisWrite::Expire { key, .. }
+            | RedisWrite::Persist { key } => key,
+        }
+    }
+
+    /// The command name, for the write log.
+    pub fn name(&self) -> &'static str {
+        match self {
+            RedisWrite::SetString { .. } => "SET",
+            RedisWrite::HashSet { .. } => "HSET",
+            RedisWrite::HashDelete { .. } => "HDEL",
+            RedisWrite::SetAdd { .. } => "SADD",
+            RedisWrite::SetRemove { .. } => "SREM",
+            RedisWrite::ZSetScore { .. } => "ZADD",
+            RedisWrite::ZSetRemove { .. } => "ZREM",
+            RedisWrite::ListPush { head: true, .. } => "LPUSHX",
+            RedisWrite::ListPush { head: false, .. } => "RPUSHX",
+            RedisWrite::ListRemoveFirst { .. } => "LREM",
+            RedisWrite::Delete { .. } => "UNLINK",
+            RedisWrite::Rename { .. } => "RENAMENX",
+            RedisWrite::Expire { .. } => "EXPIRE",
+            RedisWrite::Persist { .. } => "PERSIST",
+        }
+    }
+
+    /// The command as the confirm step shows it; values are hidden unless asked for.
+    pub fn describe(&self, values: bool) -> String {
+        let value = |bytes: &[u8]| {
+            if values {
+                quote_bytes(bytes)
+            } else {
+                format!("<{} bytes>", bytes.len())
+            }
+        };
+        let key = quote_bytes(self.key());
+        let name = self.name();
+        match self {
+            RedisWrite::SetString { value: new, .. } => {
+                format!(
+                    "{name} {key} {} XX KEEPTTL   (only if the value is unchanged)",
+                    value(new)
+                )
+            }
+            RedisWrite::HashSet {
+                field,
+                value: new,
+                expected,
+                ..
+            } => format!(
+                "{name} {key} {} {}   ({})",
+                quote_bytes(field),
+                value(new),
+                if expected.is_some() {
+                    "only if the field is unchanged"
+                } else {
+                    "only if the field is new"
+                }
+            ),
+            RedisWrite::HashDelete { field, .. } => {
+                format!(
+                    "{name} {key} {}   (only if the field is unchanged)",
+                    quote_bytes(field)
+                )
+            }
+            RedisWrite::SetAdd { member, .. }
+            | RedisWrite::SetRemove { member, .. }
+            | RedisWrite::ZSetRemove { member, .. } => format!("{name} {key} {}", value(member)),
+            RedisWrite::ZSetScore {
+                member,
+                expected,
+                score,
+                ..
+            } => format!(
+                "{name} {key} {score} {}   ({})",
+                value(member),
+                match expected {
+                    Some(old) => format!("score {old} → {score}, only if unchanged"),
+                    None => "only if the member is new".to_string(),
+                }
+            ),
+            RedisWrite::ListPush { value: new, .. } => format!("{name} {key} {}", value(new)),
+            RedisWrite::ListRemoveFirst { value: old, .. } => {
+                format!(
+                    "{name} {key} 1 {}   (removes the first equal value)",
+                    value(old)
+                )
+            }
+            RedisWrite::Delete { .. } | RedisWrite::Persist { .. } => format!("{name} {key}"),
+            RedisWrite::Rename { to, .. } => {
+                format!(
+                    "{name} {key} {}   (refused if the new name exists)",
+                    quote_bytes(to)
+                )
+            }
+            RedisWrite::Expire { seconds, .. } => format!("{name} {key} {seconds}"),
+        }
+    }
+}
+
+fn classify_redis(error: fred::error::Error) -> crate::mongo::WriteError {
+    use fred::error::ErrorKind;
+    let message = error.details().to_string();
+    match error.kind() {
+        // The command may have reached the server without an answer coming back.
+        ErrorKind::IO | ErrorKind::Timeout | ErrorKind::Canceled | ErrorKind::Protocol => {
+            crate::mongo::WriteError::Unknown(message)
+        }
+        _ => crate::mongo::WriteError::Refused(message),
+    }
+}
+
+impl RedisSession {
+    async fn eval(
+        &self,
+        script: &str,
+        key: &[u8],
+        args: Vec<Value>,
+    ) -> Result<Value, fred::error::Error> {
+        let mut all = vec![Value::from(script), Value::from(1_i64), bytes_arg(key)];
+        all.extend(args);
+        self.client.custom(cmd!("EVAL"), all).await
+    }
+
+    /// Sends one write once. `Ok(false)` means nothing changed: a guard found a different value,
+    /// the key is gone, or (for rename) the new name is taken.
+    pub async fn write(&self, write: &RedisWrite) -> Result<bool, crate::mongo::WriteError> {
+        let flag = |present: bool| Value::from(if present { "1" } else { "0" });
+        let reply = match write {
+            RedisWrite::SetString {
+                key,
+                expected,
+                value,
+            } => {
+                self.eval(
+                    SET_STRING_GUARDED,
+                    key,
+                    vec![bytes_arg(expected), bytes_arg(value)],
+                )
+                .await
+            }
+            RedisWrite::HashSet {
+                key,
+                field,
+                expected,
+                value,
+            } => {
+                self.eval(
+                    HASH_SET_GUARDED,
+                    key,
+                    vec![
+                        bytes_arg(field),
+                        bytes_arg(expected.as_deref().unwrap_or_default()),
+                        flag(expected.is_some()),
+                        bytes_arg(value),
+                    ],
+                )
+                .await
+            }
+            RedisWrite::HashDelete {
+                key,
+                field,
+                expected,
+            } => {
+                self.eval(
+                    HASH_DELETE_GUARDED,
+                    key,
+                    vec![bytes_arg(field), bytes_arg(expected)],
+                )
+                .await
+            }
+            RedisWrite::SetAdd { key, member } => {
+                self.eval(SET_ADD_EXISTING, key, vec![bytes_arg(member)])
+                    .await
+            }
+            RedisWrite::SetRemove { key, member } => {
+                self.client
+                    .custom(cmd!("SREM"), vec![bytes_arg(key), bytes_arg(member)])
+                    .await
+            }
+            RedisWrite::ZSetScore {
+                key,
+                member,
+                expected,
+                score,
+            } => {
+                self.eval(
+                    ZSET_SCORE_GUARDED,
+                    key,
+                    vec![
+                        bytes_arg(member),
+                        Value::from(expected.clone().unwrap_or_default()),
+                        flag(expected.is_some()),
+                        Value::from(score.to_string()),
+                    ],
+                )
+                .await
+            }
+            RedisWrite::ZSetRemove { key, member } => {
+                self.client
+                    .custom(cmd!("ZREM"), vec![bytes_arg(key), bytes_arg(member)])
+                    .await
+            }
+            RedisWrite::ListPush { key, head, value } => {
+                let name = if *head { "LPUSHX" } else { "RPUSHX" };
+                self.client
+                    .custom(cmd!(name), vec![bytes_arg(key), bytes_arg(value)])
+                    .await
+            }
+            RedisWrite::ListRemoveFirst { key, value } => {
+                self.client
+                    .custom(
+                        cmd!("LREM"),
+                        vec![bytes_arg(key), Value::from(1_i64), bytes_arg(value)],
+                    )
+                    .await
+            }
+            RedisWrite::Delete { key } => {
+                self.client
+                    .custom(cmd!("UNLINK"), vec![bytes_arg(key)])
+                    .await
+            }
+            RedisWrite::Rename { key, to } => {
+                self.client
+                    .custom(cmd!("RENAMENX"), vec![bytes_arg(key), bytes_arg(to)])
+                    .await
+            }
+            RedisWrite::Expire { key, seconds } => {
+                if *seconds == 0 {
+                    return Err(crate::mongo::WriteError::Refused(
+                        "A time to live of 0 deletes the key; use Delete instead.".into(),
+                    ));
+                }
+                self.client
+                    .custom(
+                        cmd!("EXPIRE"),
+                        vec![bytes_arg(key), Value::from(*seconds as i64)],
+                    )
+                    .await
+            }
+            RedisWrite::Persist { key } => {
+                self.client
+                    .custom(cmd!("PERSIST"), vec![bytes_arg(key)])
+                    .await
+            }
+        }
+        .map_err(classify_redis)?;
+        Ok(reply.as_i64().unwrap_or(0) > 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,12 +1205,152 @@ mod tests {
     }
 
     /// Runs against a real server: `VILO_TEST_REDIS=redis://127.0.0.1:57379 cargo test -p vilo_database_core`.
+    async fn writes_are_guarded(session: &RedisSession) {
+        let key = b"vilo_test:w".to_vec();
+        session
+            .call(
+                "DEL",
+                vec![
+                    bytes_arg(&key),
+                    "vilo_test:w2".into(),
+                    "vilo_test:wh".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        session
+            .call(
+                "SET",
+                vec![
+                    bytes_arg(&key),
+                    "one".into(),
+                    "PX".into(),
+                    Value::from(60_000_i64),
+                ],
+            )
+            .await
+            .unwrap();
+        let set = |expected: &[u8], value: &[u8]| RedisWrite::SetString {
+            key: key.clone(),
+            expected: expected.to_vec(),
+            value: value.to_vec(),
+        };
+        assert!(session.write(&set(b"one", b"two")).await.unwrap());
+        assert!(
+            !session.write(&set(b"one", b"three")).await.unwrap(),
+            "stale value"
+        );
+        assert_eq!(
+            session.get_string(&key).await.unwrap(),
+            Some(b"two".to_vec())
+        );
+        let ttl = session
+            .call("PTTL", vec![bytes_arg(&key)])
+            .await
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        assert!(ttl > 0, "KEEPTTL keeps the expiry");
+        session
+            .call("HSET", vec!["vilo_test:wh".into(), "f".into(), "v".into()])
+            .await
+            .unwrap();
+        let hash = |expected: Option<&[u8]>, value: &[u8]| RedisWrite::HashSet {
+            key: b"vilo_test:wh".to_vec(),
+            field: b"f".to_vec(),
+            expected: expected.map(<[u8]>::to_vec),
+            value: value.to_vec(),
+        };
+        assert!(
+            !session.write(&hash(None, b"x")).await.unwrap(),
+            "f already exists"
+        );
+        assert!(session.write(&hash(Some(b"v"), b"w")).await.unwrap());
+        assert!(
+            !session
+                .write(&RedisWrite::HashDelete {
+                    key: b"vilo_test:wh".to_vec(),
+                    field: b"f".to_vec(),
+                    expected: b"v".to_vec(),
+                })
+                .await
+                .unwrap()
+        );
+        assert!(
+            session
+                .write(&RedisWrite::Rename {
+                    key: key.clone(),
+                    to: b"vilo_test:w2".to_vec()
+                })
+                .await
+                .unwrap()
+        );
+        assert!(
+            !session
+                .write(&RedisWrite::Rename {
+                    key: b"vilo_test:wh".to_vec(),
+                    to: b"vilo_test:w2".to_vec()
+                })
+                .await
+                .unwrap(),
+            "target exists"
+        );
+        assert!(
+            !session.write(&set(b"two", b"back")).await.unwrap(),
+            "a renamed key is not recreated"
+        );
+        assert!(
+            session
+                .write(&RedisWrite::Delete {
+                    key: b"vilo_test:w2".to_vec()
+                })
+                .await
+                .unwrap()
+        );
+        assert!(
+            !session
+                .write(&RedisWrite::SetAdd {
+                    key: b"vilo_test:gone".to_vec(),
+                    member: b"m".to_vec()
+                })
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            session
+                .write(&RedisWrite::Expire {
+                    key: b"vilo_test:wh".to_vec(),
+                    seconds: 0
+                })
+                .await,
+            Err(crate::mongo::WriteError::Refused(_))
+        ));
+        assert!(
+            matches!(
+                session
+                    .write(&RedisWrite::ListPush {
+                        key: b"vilo_test:wh".to_vec(),
+                        head: true,
+                        value: b"x".to_vec()
+                    })
+                    .await,
+                Err(crate::mongo::WriteError::Refused(_))
+            ),
+            "WRONGTYPE is a refusal, not an unknown outcome"
+        );
+        session
+            .call("DEL", vec!["vilo_test:wh".into()])
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_reading_every_type_against_a_server() {
         let Ok(url) = std::env::var("VILO_TEST_REDIS") else {
             return;
         };
         let session = RedisSession::connect(&url).await.unwrap();
+        writes_are_guarded(&session).await;
         let key = b"vilo_test:\x00\xff\xe4\xb8\xad".to_vec();
         let value = b"\x01\x02 not utf-8 \xff".to_vec();
         session
