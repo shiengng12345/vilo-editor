@@ -3322,8 +3322,15 @@ impl DatabaseView {
                     .gap_2()
                     .child(Label::new("Untitled").color(Color::Muted))
                     .child(
-                        compass_primary("database-save-pipeline", "SAVE", Some(IconName::Check), true)
-                            .tooltip(Tooltip::text("Saving pipelines comes with the next release")),
+                        compass_primary(
+                            "database-save-pipeline",
+                            "SAVE",
+                            Some(IconName::Check),
+                            true,
+                        )
+                        .tooltip(Tooltip::text(
+                            "Saving pipelines comes with the next release",
+                        )),
                     )
                     .child(
                         Label::new("Read-only: $out and $merge are refused.")
@@ -3338,11 +3345,21 @@ impl DatabaseView {
                             .border_1()
                             .border_color(colors.border)
                             .child(
-                                segment("database-pipeline-stages", "STAGES", IconName::Code, false)
-                                    .disabled(true)
-                                    .tooltip(Tooltip::text("The stage editor is not in Vilo yet")),
+                                segment(
+                                    "database-pipeline-stages",
+                                    "STAGES",
+                                    IconName::Code,
+                                    false,
+                                )
+                                .disabled(true)
+                                .tooltip(Tooltip::text("The stage editor is not in Vilo yet")),
                             )
-                            .child(segment("database-pipeline-text", "TEXT", IconName::Code, true)),
+                            .child(segment(
+                                "database-pipeline-text",
+                                "TEXT",
+                                IconName::Code,
+                                true,
+                            )),
                     ),
             )
             .map(|this| match &tab.aggregation {
@@ -3362,10 +3379,11 @@ impl DatabaseView {
                             .weight(gpui::FontWeight::SEMIBOLD),
                         )
                         .child(
-                            Label::new("Type a pipeline above, e.g. [ { $match: { status: 1 } } ], and Run it.")
+                            Label::new("Preview of documents")
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
-                        ),
+                        )
+                        .child(self.render_preview(tab, cx)),
                 ),
                 Some(_) => this
                     .child(
@@ -3376,6 +3394,68 @@ impl DatabaseView {
                     .child(self.render_results(tab, tab.aggregation.as_ref(), cx)),
             })
             .into_any_element()
+    }
+
+    /// Compass's preview strip: the first documents of the Documents page as small cards.
+    fn render_preview(&self, tab: &MongoTab, cx: &mut Context<Self>) -> AnyElement {
+        const CARDS: usize = 10;
+        const FIELDS: usize = 9;
+        let colors = cx.theme().colors().clone();
+        let Some(Fetch::Loaded(page)) = &tab.page else {
+            return Label::new("Loading documents…")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element();
+        };
+        let mut strip = h_flex()
+            .id("database-pipeline-preview")
+            .gap_3()
+            .pb_2()
+            .overflow_x_scroll();
+        for document in page.documents.iter().take(CARDS) {
+            let mut card = v_flex()
+                .w(px(380.))
+                .flex_none()
+                .p_3()
+                .gap_0p5()
+                .rounded_lg()
+                .border_1()
+                .border_color(colors.border_variant)
+                .bg(colors.editor_background);
+            for (key, value) in document.iter().take(FIELDS) {
+                let (text, color) = match show(value) {
+                    Shown::Scalar { text, kind } => (text, kind_color(kind)),
+                    Shown::Object(count) => (format!("Object ({count})"), Color::Default),
+                    Shown::Array(count) => (format!("Array ({count})"), Color::Default),
+                };
+                card = card.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Label::new(format!("{key}:"))
+                                .size(LabelSize::Small)
+                                .buffer_font(cx)
+                                .weight(gpui::FontWeight::BOLD),
+                        )
+                        .child(
+                            Label::new(text)
+                                .size(LabelSize::Small)
+                                .buffer_font(cx)
+                                .color(color)
+                                .truncate(),
+                        ),
+                );
+            }
+            if document.len() > FIELDS {
+                card = card.child(
+                    Label::new(format!("… {} more fields", document.len() - FIELDS))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                );
+            }
+            strip = strip.child(card);
+        }
+        strip.into_any_element()
     }
 
     fn render_schema(&self, tab: &MongoTab, cx: &mut Context<Self>) -> AnyElement {
