@@ -336,6 +336,66 @@ pub fn split_command(line: &str) -> Result<Vec<Bytes>> {
 }
 
 /// Text for bytes in redis-cli's quoted style: printable ASCII as is, everything else escaped.
+/// One node of a cluster as `CLUSTER NODES` reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterNode {
+    pub id: String,
+    /// host:port clients use; the bus port and hostname are dropped.
+    pub address: String,
+    pub primary: bool,
+    /// For a replica, the id of its primary.
+    pub primary_id: Option<String>,
+    /// Flags other than master/slave/myself, e.g. fail, fail?, handshake, noaddr.
+    pub problems: Vec<String>,
+    pub connected: bool,
+    /// Slot ranges as written, e.g. "0-5460" or "7000"; importing/migrating entries are skipped.
+    pub slots: Vec<String>,
+    pub slot_count: u32,
+}
+
+/// Parses `CLUSTER NODES`; malformed lines are skipped.
+pub fn parse_cluster_nodes(text: &str) -> Vec<ClusterNode> {
+    text.lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 8 {
+                return None;
+            }
+            let address = fields[1].split(['@', ',']).next()?.to_string();
+            let flags = fields[2].split(',').collect::<Vec<_>>();
+            let primary = flags.contains(&"master");
+            let slots = fields[8..]
+                .iter()
+                .filter(|slot| !slot.starts_with('['))
+                .map(|slot| slot.to_string())
+                .collect::<Vec<_>>();
+            let slot_count = slots
+                .iter()
+                .filter_map(|slot| match slot.split_once('-') {
+                    Some((start, end)) => {
+                        Some(end.parse::<u32>().ok()? + 1 - start.parse::<u32>().ok()?)
+                    }
+                    None => slot.parse::<u32>().ok().map(|_| 1),
+                })
+                .sum();
+            Some(ClusterNode {
+                id: fields[0].to_string(),
+                address,
+                primary,
+                primary_id: (fields[3] != "-").then(|| fields[3].to_string()),
+                problems: flags
+                    .iter()
+                    .filter(|flag| !matches!(**flag, "master" | "slave" | "myself" | "noflags"))
+                    .map(|flag| flag.to_string())
+                    .collect(),
+                connected: fields[7] == "connected",
+                slots,
+                slot_count,
+            })
+        })
+        .collect()
+}
+
 /// `db3:keys=12,expires=1,avg_ttl=0` lines from INFO keyspace, as (3, 12).
 pub fn parse_keyspace(info: &str) -> Vec<(u32, u64)> {
     info.lines()
@@ -506,6 +566,31 @@ impl RedisSession {
         pairs(reply)
             .into_iter()
             .find_map(|(_, value)| value.as_string()?.parse::<u32>().ok())
+    }
+
+    /// The cluster's nodes, or `None` for a single server.
+    pub async fn cluster_nodes(&self) -> Result<Option<Vec<ClusterNode>>> {
+        if !self.clustered {
+            return Ok(None);
+        }
+        let reply = self.call("CLUSTER", vec!["NODES".into()]).await?;
+        Ok(Some(parse_cluster_nodes(
+            &reply.as_string().unwrap_or_default(),
+        )))
+    }
+
+    /// `INFO replication` as key/value pairs (role, connected_slaves, slave0, master_host …).
+    pub async fn replication(&self) -> Result<Vec<(String, String)>> {
+        let reply = self.call("INFO", vec!["replication".into()]).await?;
+        Ok(reply
+            .as_string()
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.trim().split_once(':')?;
+                Some((key.to_string(), value.to_string()))
+            })
+            .collect())
     }
 
     /// Databases holding keys, from INFO keyspace, as (database, keys).
@@ -1285,6 +1370,52 @@ mod tests {
 
     /// Runs against a real server: `VILO_TEST_REDIS=redis://127.0.0.1:57379 cargo test -p vilo_database_core`.
     #[test]
+    fn test_parse_cluster_nodes() {
+        // Real output from a local 3 primary + 3 replica cluster, plus a failing node and an
+        // importing slot as Redis documents them.
+        let text = "247790d65b6faa09daea9d2242fd0d25e05174f3 127.0.0.1:47102@57102 master - 0 1793371854000 3 connected 10923-16383\n\
+7798d999ab1e64a74b816bc3046bfe9ea89fd255 127.0.0.1:47103@57103 slave d0a1d0332440fa9054fca14876d4e4abdd690162 0 1793371855547 2 connected\n\
+40a7385ee006410f5bfd54906534a2d858f3e43f 127.0.0.1:47100@57100,node-a myself,master - 0 0 1 connected 0-5460 [5461->-d0a1d0332440fa9054fca14876d4e4abdd690162]\n\
+aaaa 10.0.0.9:6379@16379 master,fail - 1 2 4 disconnected 7000\n\
+broken line";
+        let nodes = parse_cluster_nodes(text);
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(nodes[0].slot_count, 16384 - 10923);
+        assert!(nodes[0].primary && nodes[0].problems.is_empty());
+        assert_eq!(
+            nodes[1].primary_id.as_deref(),
+            Some("d0a1d0332440fa9054fca14876d4e4abdd690162")
+        );
+        assert!(!nodes[1].primary);
+        assert_eq!(nodes[2].address, "127.0.0.1:47100");
+        assert_eq!(nodes[2].slots, vec!["0-5460"]);
+        assert_eq!(nodes[2].slot_count, 5461);
+        assert_eq!(nodes[3].problems, vec!["fail"]);
+        assert!(!nodes[3].connected);
+        assert_eq!(nodes[3].slot_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cluster_against_a_server() {
+        let Ok(url) = std::env::var("VILO_TEST_REDIS_CLUSTER") else {
+            return;
+        };
+        let session = RedisSession::connect(&url).await.unwrap();
+        assert!(session.is_clustered());
+        let nodes = session.cluster_nodes().await.unwrap().unwrap();
+        assert_eq!(nodes.iter().filter(|node| node.primary).count(), 3);
+        assert_eq!(nodes.iter().filter(|node| !node.primary).count(), 3);
+        assert_eq!(nodes.iter().map(|node| node.slot_count).sum::<u32>(), 16384);
+        assert_eq!(session.scan_nodes().len(), 3, "SCAN walks every primary");
+        assert!(
+            RedisSession::connect_to_database(&url, Some(1))
+                .await
+                .is_err()
+        );
+        assert_eq!(session.database_count().await.unwrap_or(1), 1);
+    }
+
+    #[test]
     fn test_parse_keyspace() {
         let info = "# Keyspace\r\ndb0:keys=3331,expires=12,avg_ttl=0\r\ndb5:keys=7,expires=0,avg_ttl=0\r\n";
         assert_eq!(parse_keyspace(info), vec![(0, 3331), (5, 7)]);
@@ -1478,6 +1609,15 @@ mod tests {
         let session = RedisSession::connect(&url).await.unwrap();
         writes_are_guarded(&session).await;
         databases_are_separate(&url).await;
+        assert!(session.cluster_nodes().await.unwrap().is_none());
+        assert!(
+            session
+                .replication()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(key, value)| key == "role" && value == "master")
+        );
         let key = b"vilo_test:\x00\xff\xe4\xb8\xad".to_vec();
         let value = b"\x01\x02 not utf-8 \xff".to_vec();
         session

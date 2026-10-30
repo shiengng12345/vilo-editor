@@ -13,7 +13,7 @@ use collections::{HashMap, HashSet};
 use gpui::{ClipboardItem, Hsla, Task, UniformListScrollHandle, prelude::*, rgb, uniform_list};
 use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
 use vilo_database_core::redis::{
-    Bytes, KeyInfo, ScanNode, StreamEntry, format_reply, quote_bytes, split_command,
+    Bytes, ClusterNode, KeyInfo, ScanNode, StreamEntry, format_reply, quote_bytes, split_command,
 };
 
 use crate::{Connection, DatabaseView, Fetch, fetched, render_lines, run};
@@ -123,6 +123,13 @@ enum RightPanel {
     Empty,
     Key,
     Info,
+    Topology,
+}
+
+enum Topology {
+    Cluster(Vec<ClusterNode>),
+    /// INFO replication of a single server.
+    Single(Vec<(String, String)>),
 }
 
 #[derive(Clone, Default)]
@@ -170,6 +177,7 @@ pub(crate) struct RedisState {
     cli_open: bool,
     workbench: Vec<(String, Result<Vec<String>, String>)>,
     info: Option<Fetch<String>>,
+    topology: Option<Fetch<Topology>>,
     stats: Stats,
     keys_scroll: UniformListScrollHandle,
     value_scroll: UniformListScrollHandle,
@@ -214,6 +222,7 @@ impl RedisState {
             cli_open: false,
             workbench: Vec::new(),
             info: None,
+            topology: None,
             stats: Stats::default(),
             keys_scroll: UniformListScrollHandle::new(),
             value_scroll: UniformListScrollHandle::new(),
@@ -1157,6 +1166,195 @@ impl DatabaseView {
         cx.notify();
     }
 
+    fn show_topology(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.redis() else {
+            return;
+        };
+        let connection = self.generation;
+        let Some(state) = self.redis_state() else {
+            return;
+        };
+        state.panel = RightPanel::Topology;
+        state.topology = Some(Fetch::Loading);
+        let task = run(cx, async move {
+            Ok(match session.cluster_nodes().await? {
+                Some(nodes) => Topology::Cluster(nodes),
+                None => Topology::Single(session.replication().await?),
+            })
+        });
+        state.keep(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if this.generation == connection
+                    && let Some(state) = this.redis_state()
+                {
+                    state.topology = Some(fetched(result));
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn render_topology(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let cell = |text: String, width: Option<f32>, color: Color| {
+            let label = Label::new(text)
+                .size(LabelSize::Small)
+                .buffer_font(cx)
+                .color(color);
+            match width {
+                Some(width) => div().w(px(width)).flex_none().child(label),
+                None => div().flex_1().min_w_0().child(label),
+            }
+        };
+        let row = |colors: &theme::ThemeColors| {
+            h_flex()
+                .px_3()
+                .py_1()
+                .gap_3()
+                .border_t_1()
+                .border_color(colors.border_variant)
+        };
+        match &state.topology {
+            None | Some(Fetch::Loading) => Label::new("Loading…")
+                .color(Color::Muted)
+                .into_any_element(),
+            Some(Fetch::Failed(message)) => Label::new(message.clone())
+                .color(Color::Error)
+                .into_any_element(),
+            Some(Fetch::Loaded(Topology::Single(pairs))) => {
+                let mut table = v_flex().rounded_md().border_1().border_color(colors.border);
+                for (key, value) in pairs {
+                    table = table.child(
+                        row(&colors)
+                            .child(cell(key.clone(), Some(240.), Color::Muted))
+                            .child(cell(value.clone(), None, Color::Default)),
+                    );
+                }
+                v_flex()
+                    .gap_2()
+                    .child(
+                        Label::new("Single server (not a cluster). Replication:")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(table)
+                    .into_any_element()
+            }
+            Some(Fetch::Loaded(Topology::Cluster(nodes))) => {
+                let mut primaries = nodes.iter().filter(|node| node.primary).collect::<Vec<_>>();
+                primaries.sort_by_key(|node| {
+                    node.slots
+                        .first()
+                        .and_then(|slot| slot.split('-').next()?.parse::<u32>().ok())
+                        .unwrap_or(u32::MAX)
+                });
+                let covered: u32 = primaries.iter().map(|node| node.slot_count).sum();
+                let health = |node: &ClusterNode| {
+                    if !node.connected || !node.problems.is_empty() {
+                        (
+                            format!(
+                                "{} {}",
+                                if node.connected {
+                                    "connected"
+                                } else {
+                                    "disconnected"
+                                },
+                                node.problems.join(",")
+                            ),
+                            Color::Error,
+                        )
+                    } else {
+                        ("ok".to_string(), Color::Success)
+                    }
+                };
+                let mut table = v_flex()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .child(
+                        h_flex()
+                            .px_3()
+                            .py_1()
+                            .gap_3()
+                            .bg(colors.element_background)
+                            .child(cell("Node".into(), Some(200.), Color::Default))
+                            .child(cell("Role".into(), Some(80.), Color::Default))
+                            .child(cell("Slots".into(), None, Color::Default))
+                            .child(cell("Health".into(), Some(160.), Color::Default)),
+                    );
+                for primary in &primaries {
+                    let (state_text, state_color) = health(primary);
+                    table = table.child(
+                        row(&colors)
+                            .child(cell(primary.address.clone(), Some(200.), Color::Default))
+                            .child(cell("primary".into(), Some(80.), Color::Accent))
+                            .child(cell(
+                                format!(
+                                    "{} ({} slots)",
+                                    primary.slots.join(" "),
+                                    primary.slot_count
+                                ),
+                                None,
+                                Color::Default,
+                            ))
+                            .child(cell(state_text, Some(160.), state_color)),
+                    );
+                    for replica in nodes
+                        .iter()
+                        .filter(|node| node.primary_id.as_deref() == Some(primary.id.as_str()))
+                    {
+                        let (state_text, state_color) = health(replica);
+                        table = table.child(
+                            row(&colors)
+                                .child(cell(
+                                    format!("  └ {}", replica.address),
+                                    Some(200.),
+                                    Color::Muted,
+                                ))
+                                .child(cell("replica".into(), Some(80.), Color::Muted))
+                                .child(cell(String::new(), None, Color::Muted))
+                                .child(cell(state_text, Some(160.), state_color)),
+                        );
+                    }
+                }
+                let orphans = nodes
+                    .iter()
+                    .filter(|node| {
+                        !node.primary
+                            && !primaries.iter().any(|primary| {
+                                Some(primary.id.as_str()) == node.primary_id.as_deref()
+                            })
+                    })
+                    .count();
+                v_flex()
+                    .gap_2()
+                    .child(
+                        Label::new(format!(
+                            "{} primaries, {} replicas · {covered} of 16384 slots covered{}",
+                            primaries.len(),
+                            nodes.len() - primaries.len(),
+                            if orphans > 0 {
+                                format!(" · {orphans} replicas of unknown primaries")
+                            } else {
+                                String::new()
+                            }
+                        ))
+                        .size(LabelSize::Small)
+                        .color(if covered == 16384 {
+                            Color::Muted
+                        } else {
+                            Color::Error
+                        }),
+                    )
+                    .child(table)
+                    .into_any_element()
+            }
+        }
+    }
+
     fn render_key_list(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
         let rows = state.rows();
         let meta = state.meta.clone();
@@ -1436,6 +1634,35 @@ impl DatabaseView {
                             .min_h_0()
                             .overflow_y_scroll()
                             .child(body),
+                    )
+                    .into_any_element();
+            }
+            RightPanel::Topology => {
+                return v_flex()
+                    .size_full()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .child(Headline::new("Topology").size(HeadlineSize::Small))
+                            .child(div().flex_1())
+                            .child(
+                                IconButton::new(
+                                    "database-redis-topology-refresh",
+                                    IconName::RotateCw,
+                                )
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Refresh"))
+                                .on_click(cx.listener(|this, _, _, cx| this.show_topology(cx))),
+                            )
+                            .child(close),
+                    )
+                    .child(
+                        v_flex()
+                            .id("database-redis-topology")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(self.render_topology(state, cx)),
                     )
                     .into_any_element();
             }
@@ -2114,6 +2341,12 @@ impl DatabaseView {
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Database information (INFO)"))
                             .on_click(cx.listener(|this, _, _, cx| this.show_info(cx))),
+                    )
+                    .child(
+                        IconButton::new("database-redis-topology-button", IconName::Server)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Topology: cluster nodes and slots, or replication"))
+                            .on_click(cx.listener(|this, _, _, cx| this.show_topology(cx))),
                     )
                     .child({
                         let writable = self.writes_allowed(connection);
