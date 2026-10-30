@@ -48,6 +48,7 @@ pub(crate) enum RedisTab {
     Browse,
     Workbench,
     Analyze,
+    PubSub,
 }
 
 /// One hash field, list item or member of the shown value, which its row can edit or remove.
@@ -294,6 +295,7 @@ pub(crate) struct RedisState {
     auto_refresh: Option<u64>,
     _auto_refresh: Option<Task<()>>,
     pub(crate) analyze: crate::redis_analyze::AnalyzeState,
+    pub(crate) pubsub: crate::redis_pubsub::PubSubState,
     /// A database number typed in when the menu cannot know how many there are.
     database_input: Option<Entity<editor::Editor>>,
 }
@@ -360,6 +362,7 @@ impl RedisState {
             auto_refresh: None,
             _auto_refresh: None,
             analyze: Default::default(),
+            pubsub: Default::default(),
             database_input: None,
         }
     }
@@ -3463,11 +3466,17 @@ impl DatabaseView {
                                 if target != RedisTab::Analyze {
                                     state.analyze.leave_database_analysis();
                                 }
+                                if target != RedisTab::PubSub {
+                                    state.pubsub.leave();
+                                }
                                 state.tab = target;
                                 state.analyze.tab()
                             });
                             if let (RedisTab::Analyze, Some(analyze)) = (target, analyze) {
                                 this.open_analyze_tab(analyze, window, cx);
+                            }
+                            if target == RedisTab::PubSub {
+                                this.open_pubsub(window, cx);
                             }
                             cx.notify();
                         }))
@@ -3499,6 +3508,7 @@ impl DatabaseView {
             RedisTab::Browse => self.render_browse(state, cx),
             RedisTab::Workbench => self.render_workbench(state, cx),
             RedisTab::Analyze => self.render_analyze(&state.analyze, cx),
+            RedisTab::PubSub => self.render_pubsub(&state.pubsub, cx),
         };
         let cli_lines = Self::workbench_lines(state);
         v_flex()
@@ -3612,7 +3622,12 @@ impl DatabaseView {
                         Some(RedisTab::Analyze),
                         cx,
                     ))
-                    .child(tab("database-redis-tab-pubsub", "Pub/Sub", None, cx))
+                    .child(tab(
+                        "database-redis-tab-pubsub",
+                        "Pub/Sub",
+                        Some(RedisTab::PubSub),
+                        cx,
+                    ))
                     .child(div().flex_1())
                     .child(
                         Button::new("database-redis-bulk", "Bulk actions")

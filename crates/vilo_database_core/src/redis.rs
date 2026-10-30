@@ -9,7 +9,9 @@ use fred::{
 pub type Bytes = Vec<u8>;
 
 pub struct RedisSession {
-    client: Client,
+    pub(crate) client: Client,
+    /// Kept so Pub/Sub can open its own connection with the same settings.
+    pub(crate) config: Config,
     clustered: bool,
     /// The logical database every connection of this session selects, also after a reconnect.
     database: u8,
@@ -701,7 +703,7 @@ impl RedisSession {
             config.database = Some(database);
         }
         let selected = config.database.unwrap_or(0);
-        let mut builder = Builder::from_config(config);
+        let mut builder = Builder::from_config(config.clone());
         builder.with_connection_config(|connection| {
             // A command whose answer was lost is reported as unknown rather than sent again.
             connection.max_command_attempts = 1;
@@ -710,6 +712,7 @@ impl RedisSession {
         client.init().await.context("Could not reach Redis")?;
         Ok(Self {
             client,
+            config,
             clustered,
             database: selected,
         })
@@ -1605,7 +1608,7 @@ impl RedisWrite {
     }
 }
 
-fn classify_redis(error: fred::error::Error) -> crate::mongo::WriteError {
+pub(crate) fn classify_redis(error: fred::error::Error) -> crate::mongo::WriteError {
     use fred::error::ErrorKind;
     let message = error.details().to_string();
     match error.kind() {
