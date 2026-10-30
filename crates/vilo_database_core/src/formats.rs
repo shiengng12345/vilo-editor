@@ -84,6 +84,17 @@ fn text_size(node: &Node) -> usize {
 }
 
 impl Arena {
+    /// Refuses before a copy of `bytes` that would go past `MAX_BYTES` (counted when added).
+    fn fits(&self, bytes: usize) -> Result<(), String> {
+        if self.bytes.saturating_add(bytes) > MAX_BYTES {
+            return Err(format!(
+                "more than {} MB of text; not read further",
+                MAX_BYTES / (1024 * 1024)
+            ));
+        }
+        Ok(())
+    }
+
     /// Counts text about to be held against `MAX_BYTES`; called before copying it.
     fn charge(&mut self, bytes: usize) -> Result<(), String> {
         self.bytes = self.bytes.saturating_add(bytes);
@@ -411,6 +422,7 @@ fn msgpack_value(
                 0xdb => take_length(4)?,
                 _ => usize::from(marker - 0xa0),
             };
+            arena.fits(length)?;
             let text = take(length)?;
             match std::str::from_utf8(text) {
                 Ok(text) => Node::Text(text.to_string()),
@@ -419,6 +431,7 @@ fn msgpack_value(
         }
         0xc4..=0xc6 => {
             let length = take_length(1 << (marker - 0xc4))?;
+            arena.fits(length)?;
             Node::Bytes(take(length)?.to_vec())
         }
         0xc7..=0xc9 | 0xd4..=0xd8 => {
@@ -429,6 +442,7 @@ fn msgpack_value(
                 _ => 1 << (marker - 0xd4),
             };
             let kind = take(1)?[0] as i8;
+            arena.fits(length)?;
             Node::Custom(format!("extension {kind}"), take(length)?.to_vec())
         }
         0x90..=0x9f | 0xdc | 0xdd => {
@@ -522,8 +536,10 @@ impl Php<'_> {
 
     fn count(&mut self, end: u8) -> Result<usize, String> {
         let text = self.number(end)?;
-        text.parse()
-            .or_else(|_| self.error(&format!("bad length {text}")))
+        text.parse().or_else(|_| {
+            let shown = text.chars().take(40).collect::<String>();
+            self.error(&format!("bad length {shown}"))
+        })
     }
 
     /// `LEN:"…"` with exactly LEN bytes between the quotes.
@@ -537,6 +553,7 @@ impl Php<'_> {
         else {
             return self.error("a string runs past the end");
         };
+        self.arena.fits(length)?;
         let text = text.to_vec();
         self.at += length;
         self.expect(b'"')?;
@@ -654,6 +671,7 @@ impl Php<'_> {
                 else {
                     return self.error("custom data runs past the end");
                 };
+                self.arena.fits(length)?;
                 let data = data.to_vec();
                 self.at += length;
                 self.expect(b'}')?;
@@ -716,6 +734,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
     }
     let mut stack: Vec<Slot> = Vec::new();
     let mut memo: std::collections::HashMap<u64, Id> = Default::default();
+    let mut steps = 0_usize;
     let mut at = 0;
     let fail = |at: usize, what: &str| Err(format!("not a pickle: {what} at byte {at}"));
     macro_rules! take {
@@ -795,6 +814,10 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             return fail(at, "too many values");
         }
         let opcode = take!(1)[0];
+        steps += 1;
+        if steps > MAX_STEPS {
+            return fail(at, "too much to read");
+        }
         let push = |arena: &mut Arena, stack: &mut Vec<Slot>, node: Node| -> Result<(), String> {
             stack.push(Slot::Value(arena.add(node)?));
             Ok(())
@@ -815,6 +838,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 pop_mark(&mut stack, at)?;
             }
             b'2' => {
+                arena.entries(1)?;
                 let id = top(&stack, at)?;
                 stack.push(Slot::Value(id));
             }
@@ -919,6 +943,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             }
             b'T' | b'X' | b'B' => {
                 let length = u32::from_le_bytes(take!(4).try_into().map_err(|_| "ends early")?);
+                arena.fits(length as usize)?;
                 let data = take!(length as usize).to_vec();
                 let node = match opcode {
                     b'X' => Node::Text(String::from_utf8_lossy(&data).to_string()),
@@ -932,6 +957,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             }
             b'U' | b'C' | 0x8c => {
                 let length = usize::from(take!(1)[0]);
+                arena.fits(length)?;
                 let data = take!(length).to_vec();
                 let node = match opcode {
                     b'C' => Node::Bytes(data),
@@ -946,6 +972,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             0x8d | 0x8e | 0x96 => {
                 let length = u64::from_le_bytes(take!(8).try_into().map_err(|_| "ends early")?);
                 let length = usize::try_from(length).map_err(|_| "a value too long")?;
+                arena.fits(length)?;
                 let data = take!(length).to_vec();
                 let node = if opcode == 0x8d {
                     Node::Text(String::from_utf8_lossy(&data).to_string())
@@ -960,18 +987,22 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             0x8f => push(arena, &mut stack, Node::Set(Vec::new()))?,
             b'l' => {
                 let items = pop_mark(&mut stack, at)?;
+                arena.entries(items.len())?;
                 push(arena, &mut stack, Node::List(items))?
             }
             b't' => {
                 let items = pop_mark(&mut stack, at)?;
+                arena.entries(items.len())?;
                 push(arena, &mut stack, Node::Tuple(items))?
             }
             0x91 => {
                 let items = pop_mark(&mut stack, at)?;
+                arena.entries(items.len())?;
                 push(arena, &mut stack, Node::Set(items))?
             }
             0x85..=0x87 => {
                 let count = usize::from(opcode - 0x84);
+                arena.entries(count)?;
                 let mut items = (0..count)
                     .map(|_| pop(&mut stack, at))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -980,6 +1011,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             }
             b'd' => {
                 let items = pop_mark(&mut stack, at)?;
+                arena.entries(items.len())?;
                 let Some(pairs) = pairs_of(&items) else {
                     return fail(at, "a dict with a key and no value");
                 };
@@ -1224,6 +1256,7 @@ impl Java<'_> {
         } else {
             usize::from(u16::from_be_bytes(self.array()?))
         };
+        self.arena.fits(length)?;
         Ok(modified_utf8(self.take(length)?))
     }
 
@@ -1281,6 +1314,7 @@ impl Java<'_> {
                         // The field's class name, as a string object.
                         self.content(depth + 1)?;
                     }
+                    self.arena.charge(field.len())?;
                     fields.push((code, field));
                 }
                 self.annotations(depth + 1)?;
@@ -1573,12 +1607,14 @@ impl Java<'_> {
             }
             0x77 => {
                 let length = usize::from(self.u8()?);
+                self.arena.fits(length)?;
                 let data = self.take(length)?.to_vec();
                 self.arena.add(Node::Custom("block data".into(), data))
             }
             0x7A => {
                 let length = usize::try_from(u32::from_be_bytes(self.array()?))
                     .or_else(|_| self.error("block data too long"))?;
+                self.arena.fits(length)?;
                 let data = self.take(length)?.to_vec();
                 self.arena.add(Node::Custom("block data".into(), data))
             }
@@ -2034,6 +2070,31 @@ mod tests {
             text.contains("assuming its writeObject called defaultWriteObject"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn test_every_copy_is_counted() {
+        // Many lists, each holding one value DUP'd 199,990 times: refused, not ~1.6 GB of ids.
+        let mut lists = b"]".to_vec();
+        for _ in 0..10 {
+            lists.extend_from_slice(b"(N");
+            lists.extend(std::iter::repeat_n(b'2', 199_990));
+            lists.extend_from_slice(b"la");
+        }
+        lists.push(b'.');
+        assert!(decode(Decoder::Pickle, &lists).is_err());
+        // A string longer than the text budget is refused before it is copied.
+        let mut huge = vec![0xdb];
+        huge.extend_from_slice(&(70_u32 * 1024 * 1024).to_be_bytes());
+        huge.extend(std::iter::repeat_n(b'a', 70 * 1024 * 1024));
+        assert!(
+            decode(Decoder::Msgpack, &huge)
+                .unwrap_err()
+                .contains("MB of text")
+        );
+        // A PHP length error does not quote the whole bad length.
+        let long = format!("s:{}:\"\";", "9x".repeat(1_000_000));
+        assert!(decode(Decoder::Php, long.as_bytes()).unwrap_err().len() < 200);
     }
 
     #[test]

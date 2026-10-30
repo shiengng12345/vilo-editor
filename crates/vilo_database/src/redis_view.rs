@@ -773,17 +773,27 @@ fn formatted(bytes: &[u8], format: Format) -> String {
         // Read for its structure only; a value in another form says why and shows as text.
         Format::Decoded(decoder) => vilo_database_core::formats::decode(decoder, bytes)
             .unwrap_or_else(|error| {
-                // The text after the reason is bounded like a decoded value.
+                // The reason and the text after it are bounded like a decoded value.
                 const SHOWN: usize = 1_000_000;
                 let shown = &bytes[..bytes.len().min(SHOWN)];
-                let text =
+                let mut text =
                     String::from_utf8(shown.to_vec()).unwrap_or_else(|_| escape_bytes(shown));
-                let rest = if bytes.len() > SHOWN {
+                let mut cut = bytes.len() > SHOWN;
+                if text.len() > SHOWN {
+                    let end = (0..=SHOWN)
+                        .rev()
+                        .find(|end| text.is_char_boundary(*end))
+                        .unwrap_or(0);
+                    text.truncate(end);
+                    cut = true;
+                }
+                let reason = error.chars().take(500).collect::<String>();
+                let rest = if cut {
                     format!("\n… cut at {} KB", SHOWN / 1000)
                 } else {
                     String::new()
                 };
-                format!("({error})\n{text}{rest}")
+                format!("({reason})\n{text}{rest}")
             }),
     }
 }
@@ -4080,6 +4090,11 @@ mod tests {
         assert!(
             shown.len() < 1_100_000 && shown.ends_with("KB"),
             "the fallback text is bounded"
+        );
+        let escaped = formatted(&vec![0xff; 1_000_000], Format::Decoded(Decoder::Php));
+        assert!(
+            escaped.len() < 1_100_000 && escaped.ends_with("KB"),
+            "escaping does not grow it past the limit"
         );
         assert_eq!(describe_ttl(-1), "No limit");
         assert_eq!(describe_ttl(90_000), "1 min");
