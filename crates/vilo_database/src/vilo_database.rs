@@ -347,6 +347,8 @@ pub struct DatabaseView {
     /// Readable dates in this Mac's time zone instead of UTC.
     local_dates: bool,
     pattern: Entity<Editor>,
+    /// Searches the values of the open Redis key.
+    value_search: Entity<Editor>,
     workbench_input: Entity<Editor>,
     redis_state: Option<RedisState>,
     doc_write: Option<mongo_write::DocWrite>,
@@ -481,6 +483,7 @@ impl DatabaseView {
             history: load_history(),
             local_dates: false,
             pattern: editor("Filter by Key Name or Pattern", "", false, window, cx),
+            value_search: editor("Search this key's values (Enter)", "", false, window, cx),
             workbench_input: editor(
                 "Enter a Redis command, e.g. HGETALL user:1",
                 "",

@@ -105,6 +105,11 @@ enum Value {
         members: Vec<(Bytes, String)>,
         next: Option<i64>,
     },
+    /// A sorted set searched with ZSCAN MATCH, in the server's scan order.
+    SortedSetMatch {
+        members: Vec<(Bytes, String)>,
+        cursor: Option<String>,
+    },
     Stream {
         entries: Vec<StreamEntry>,
         groups: Vec<Vec<(String, String)>>,
@@ -120,6 +125,12 @@ struct Detail {
     length: Option<u64>,
     size: Option<u64>,
     value: Value,
+    /// The MATCH pattern a hash, set or sorted set was scanned with, across the whole key.
+    pattern: Option<Bytes>,
+    /// Text a list's loaded items are filtered by; lists have no server-side search.
+    local_filter: Option<String>,
+    /// Why the last "Load more" failed.
+    more_error: Option<SharedString>,
 }
 
 /// What the right panel shows.
@@ -421,6 +432,81 @@ fn badge(kind: &str) -> AnyElement {
         .into_any_element()
 }
 
+/// Commands that recreate the key as loaded, for pasting into redis-cli, and whether only part
+/// of the key is in them. `None` for types Vilo cannot rebuild or an empty value.
+fn rebuild_command(
+    key: &[u8],
+    value: &Value,
+    partial: bool,
+    ttl_ms: i64,
+) -> Option<(String, bool)> {
+    let key = quote_bytes(key);
+    let join = |items: Vec<String>| items.join(" ");
+    let (command, more) = match value {
+        Value::String(Some(bytes)) => (format!("SET {key} {}", quote_bytes(bytes)), false),
+        Value::Hash { fields, cursor } if !fields.is_empty() => (
+            format!(
+                "HSET {key} {}",
+                join(
+                    fields
+                        .iter()
+                        .map(|(field, value)| format!(
+                            "{} {}",
+                            quote_bytes(field),
+                            quote_bytes(value)
+                        ))
+                        .collect()
+                )
+            ),
+            cursor.is_some(),
+        ),
+        Value::List { items, next } if !items.is_empty() => (
+            format!(
+                "RPUSH {key} {}",
+                join(items.iter().map(|item| quote_bytes(item)).collect())
+            ),
+            next.is_some(),
+        ),
+        Value::Set { members, cursor } if !members.is_empty() => (
+            format!(
+                "SADD {key} {}",
+                join(members.iter().map(|member| quote_bytes(member)).collect())
+            ),
+            cursor.is_some(),
+        ),
+        Value::SortedSet { members, next } if !members.is_empty() => (
+            format!(
+                "ZADD {key} {}",
+                join(
+                    members
+                        .iter()
+                        .map(|(member, score)| format!("{score} {}", quote_bytes(member)))
+                        .collect()
+                )
+            ),
+            next.is_some(),
+        ),
+        Value::SortedSetMatch { members, cursor } if !members.is_empty() => (
+            format!(
+                "ZADD {key} {}",
+                join(
+                    members
+                        .iter()
+                        .map(|(member, score)| format!("{score} {}", quote_bytes(member)))
+                        .collect()
+                )
+            ),
+            cursor.is_some(),
+        ),
+        _ => return None,
+    };
+    let mut text = command;
+    if ttl_ms > 0 {
+        text.push_str(&format!("\nPEXPIRE {key} {ttl_ms}"));
+    }
+    Some((text, partial || more))
+}
+
 /// A value in the chosen format; JSON pretty-prints only when the bytes are valid JSON.
 fn formatted(bytes: &[u8], format: Format) -> String {
     let text = || String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| escape_bytes(bytes));
@@ -657,6 +743,26 @@ impl DatabaseView {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Searches the open key: hash, set and sorted set across the whole key on the server; a list
+    /// only among its loaded items, as lists have no server-side search.
+    fn search_key_values(&mut self, cx: &mut Context<Self>) {
+        let text = self.value_search.read(cx).text(cx);
+        let Some(state) = self.redis_state() else {
+            return;
+        };
+        let Some(Fetch::Loaded(detail)) = &mut state.detail else {
+            return;
+        };
+        let key = detail.key.clone();
+        if detail.info.kind == "list" {
+            detail.local_filter = (!text.trim().is_empty()).then(|| text.trim().to_string());
+            cx.notify();
+            return;
+        }
+        let pattern = vilo_database_core::redis::search_pattern(&text);
+        self.open_key_matching(key, pattern, None, cx);
     }
 
     pub(crate) fn close_redis_key(&mut self) {
@@ -906,6 +1012,16 @@ impl DatabaseView {
     }
 
     fn open_key(&mut self, key: Bytes, cx: &mut Context<Self>) {
+        self.open_key_matching(key, None, None, cx);
+    }
+
+    fn open_key_matching(
+        &mut self,
+        key: Bytes,
+        pattern: Option<Bytes>,
+        local_filter: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = self.redis() else {
             return;
         };
@@ -925,7 +1041,9 @@ impl DatabaseView {
                 let value = match info.kind.as_str() {
                     "string" => Value::String(session.get_string(&key).await?),
                     "hash" => {
-                        let (fields, cursor) = session.hash_page(&key, "0", PAGE).await?;
+                        let (fields, cursor) = session
+                            .hash_page(&key, "0", PAGE, pattern.as_deref())
+                            .await?;
                         Value::Hash {
                             fields,
                             cursor: (cursor != "0").then_some(cursor),
@@ -937,8 +1055,19 @@ impl DatabaseView {
                         Value::List { items, next }
                     }
                     "set" => {
-                        let (members, cursor) = session.set_page(&key, "0", PAGE).await?;
+                        let (members, cursor) = session
+                            .set_page(&key, "0", PAGE, pattern.as_deref())
+                            .await?;
                         Value::Set {
+                            members,
+                            cursor: (cursor != "0").then_some(cursor),
+                        }
+                    }
+                    "zset" if pattern.is_some() => {
+                        let (members, cursor) = session
+                            .zset_scan(&key, "0", PAGE, pattern.as_deref())
+                            .await?;
+                        Value::SortedSetMatch {
                             members,
                             cursor: (cursor != "0").then_some(cursor),
                         }
@@ -967,6 +1096,9 @@ impl DatabaseView {
                     length,
                     size,
                     value,
+                    pattern,
+                    local_filter,
+                    more_error: None,
                 })
             }
         });
@@ -1011,8 +1143,10 @@ impl DatabaseView {
             List(i64),
             Set(String),
             SortedSet(i64),
+            SortedSetMatch(String),
             Stream(String),
         }
+        let pattern = detail.pattern.clone();
         let next = match &detail.value {
             Value::Hash {
                 cursor: Some(cursor),
@@ -1028,6 +1162,10 @@ impl DatabaseView {
             Value::SortedSet {
                 next: Some(start), ..
             } => Next::SortedSet(*start),
+            Value::SortedSetMatch {
+                cursor: Some(cursor),
+                ..
+            } => Next::SortedSetMatch(cursor.clone()),
             Value::Stream {
                 entries,
                 more: true,
@@ -1043,6 +1181,7 @@ impl DatabaseView {
             List(Vec<Bytes>, i64),
             Set(Vec<Bytes>, String),
             SortedSet(Vec<(Bytes, String)>, i64),
+            SortedSetMatch(Vec<(Bytes, String)>, String),
             Stream(Vec<StreamEntry>),
         }
         let task = run(cx, {
@@ -1050,7 +1189,9 @@ impl DatabaseView {
             async move {
                 Ok(match next {
                     Next::Hash(cursor) => {
-                        let (fields, cursor) = session.hash_page(&key, &cursor, PAGE).await?;
+                        let (fields, cursor) = session
+                            .hash_page(&key, &cursor, PAGE, pattern.as_deref())
+                            .await?;
                         More::Hash(fields, cursor)
                     }
                     Next::List(start) => More::List(
@@ -1060,7 +1201,9 @@ impl DatabaseView {
                         start,
                     ),
                     Next::Set(cursor) => {
-                        let (members, cursor) = session.set_page(&key, &cursor, PAGE).await?;
+                        let (members, cursor) = session
+                            .set_page(&key, &cursor, PAGE, pattern.as_deref())
+                            .await?;
                         More::Set(members, cursor)
                     }
                     Next::SortedSet(start) => More::SortedSet(
@@ -1069,6 +1212,12 @@ impl DatabaseView {
                             .await?,
                         start,
                     ),
+                    Next::SortedSetMatch(cursor) => {
+                        let (members, cursor) = session
+                            .zset_scan(&key, &cursor, PAGE, pattern.as_deref())
+                            .await?;
+                        More::SortedSetMatch(members, cursor)
+                    }
                     Next::Stream(after) => {
                         More::Stream(session.stream_range(&key, Some(&after), PAGE).await?)
                     }
@@ -1076,9 +1225,7 @@ impl DatabaseView {
             }
         });
         state.keep(cx.spawn(async move |this, cx| {
-            let Ok(more) = task.await else {
-                return;
-            };
+            let result = task.await;
             this.update(cx, |this, cx| {
                 if this.generation != connection {
                     return;
@@ -1092,6 +1239,17 @@ impl DatabaseView {
                 if detail.key != key {
                     return;
                 }
+                let more = match result {
+                    Ok(more) => {
+                        detail.more_error = None;
+                        more
+                    }
+                    Err(error) => {
+                        detail.more_error = Some(format!("Could not load more: {error:#}").into());
+                        cx.notify();
+                        return;
+                    }
+                };
                 match (&mut detail.value, more) {
                     (Value::Hash { fields, cursor }, More::Hash(page, next)) => {
                         for field in page {
@@ -1116,6 +1274,17 @@ impl DatabaseView {
                     (Value::SortedSet { members, next }, More::SortedSet(page, start)) => {
                         *next = (page.len() == PAGE as usize).then_some(start + i64::from(PAGE));
                         members.extend(page);
+                    }
+                    (
+                        Value::SortedSetMatch { members, cursor },
+                        More::SortedSetMatch(page, next),
+                    ) => {
+                        for member in page {
+                            if !members.contains(&member) {
+                                members.push(member);
+                            }
+                        }
+                        *cursor = (next != "0").then_some(next);
                     }
                     (Value::Stream { entries, more, .. }, More::Stream(page)) => {
                         *more = page.len() == PAGE as usize;
@@ -1573,8 +1742,16 @@ impl DatabaseView {
                 }
             }
             Value::List { items, .. } => {
+                let filter = detail.local_filter.as_ref().map(|text| text.to_lowercase());
                 for (index, item) in items.iter().enumerate() {
-                    push_block(format!("{index:<8} "), show(item));
+                    let matches = filter.as_ref().is_none_or(|filter| {
+                        String::from_utf8_lossy(item)
+                            .to_lowercase()
+                            .contains(filter.as_str())
+                    });
+                    if matches {
+                        push_block(format!("{index:<8} "), show(item));
+                    }
                 }
             }
             Value::Set { members, .. } => {
@@ -1582,7 +1759,7 @@ impl DatabaseView {
                     push_block(String::new(), show(member));
                 }
             }
-            Value::SortedSet { members, .. } => {
+            Value::SortedSet { members, .. } | Value::SortedSetMatch { members, .. } => {
                 for (member, score) in members {
                     push_block(format!("{score:<16} "), show(member));
                 }
@@ -1748,7 +1925,9 @@ impl DatabaseView {
             Some(Fetch::Loaded(detail)) => detail,
         };
         let more = match &detail.value {
-            Value::Hash { cursor, .. } | Value::Set { cursor, .. } => cursor.is_some(),
+            Value::Hash { cursor, .. }
+            | Value::Set { cursor, .. }
+            | Value::SortedSetMatch { cursor, .. } => cursor.is_some(),
             Value::List { next, .. } | Value::SortedSet { next, .. } => next.is_some(),
             Value::Stream { more, .. } => *more,
             _ => false,
@@ -1757,7 +1936,7 @@ impl DatabaseView {
             Value::Hash { .. } => Some(("Field", "Value")),
             Value::List { .. } => Some(("Index", "Element")),
             Value::Set { .. } => Some(("Member", "")),
-            Value::SortedSet { .. } => Some(("Score", "Member")),
+            Value::SortedSet { .. } | Value::SortedSetMatch { .. } => Some(("Score", "Member")),
             Value::Stream { .. } => Some(("Entry ID", "Fields")),
             _ => None,
         };
@@ -1917,6 +2096,7 @@ impl DatabaseView {
                     .child(div().flex_1())
                     .child(formats),
             )
+            .child(self.render_value_tools(detail, cx))
             .when_some(groups, |this, groups| {
                 this.child(
                     Label::new("Consumer Groups")
@@ -1969,6 +2149,79 @@ impl DatabaseView {
                             .style(ButtonStyle::Outlined)
                             .on_click(cx.listener(|this, _, _, cx| this.load_more_value(cx))),
                     ),
+                )
+            })
+            .when_some(detail.more_error.clone(), |this, error| {
+                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
+            .into_any_element()
+    }
+
+    /// Value search and copying for the open key.
+    fn render_value_tools(&self, detail: &Detail, cx: &mut Context<Self>) -> AnyElement {
+        let searchable = matches!(detail.info.kind.as_str(), "hash" | "set" | "zset" | "list");
+        let rebuilt = rebuild_command(
+            &detail.key,
+            &detail.value,
+            detail.pattern.is_some() || detail.local_filter.is_some(),
+            detail.info.ttl_ms,
+        );
+        let note = match (&detail.pattern, &detail.local_filter) {
+            (Some(pattern), _) => Some(format!(
+                "Matching {} across the whole key",
+                quote_bytes(pattern)
+            )),
+            (None, Some(filter)) => Some(format!(
+                "Showing loaded items containing “{filter}” (lists are filtered here, not on the server)"
+            )),
+            (None, None) => None,
+        };
+        let value_text = match &detail.value {
+            Value::String(Some(bytes)) => Some(String::from_utf8_lossy(bytes).to_string()),
+            _ => None,
+        };
+        h_flex()
+            .gap_2()
+            .when(searchable, |this| {
+                this.child(
+                    div()
+                        .w(px(300.))
+                        .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| {
+                            this.search_key_values(cx)
+                        }))
+                        .child(crate::boxed(self.value_search.clone(), cx)),
+                )
+            })
+            .when_some(note, |this, note| {
+                this.child(Label::new(note).size(LabelSize::Small).color(Color::Muted))
+            })
+            .child(div().flex_1())
+            .when_some(value_text, |this, text| {
+                this.child(
+                    Button::new("database-redis-copy-value", "Copy value")
+                        .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::Copy).size(IconSize::XSmall))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+                        }),
+                )
+            })
+            .when_some(rebuilt, |this, (command, partial)| {
+                this.child(
+                    Button::new(
+                        "database-redis-copy-command",
+                        if partial { "Copy as command (loaded part only)" } else { "Copy as command" },
+                    )
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::Copy).size(IconSize::XSmall))
+                    .tooltip(Tooltip::text(if partial {
+                        "Only the items loaded or matching so far are in the command; load the rest first for the whole key"
+                    } else {
+                        "Commands that recreate this key, for redis-cli"
+                    }))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(command.clone()))
+                    }),
                 )
             })
             .into_any_element()
@@ -2647,6 +2900,56 @@ impl DatabaseView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_rebuild_command() {
+        let (text, partial) =
+            rebuild_command(b"k", &Value::String(Some(b"a b".to_vec())), false, 5000).unwrap();
+        assert_eq!(text, "SET \"k\" \"a b\"\nPEXPIRE \"k\" 5000");
+        assert!(!partial);
+        let hash = Value::Hash {
+            fields: vec![(b"f".to_vec(), b"v".to_vec())],
+            cursor: Some("12".into()),
+        };
+        let (text, partial) = rebuild_command(b"h", &hash, false, -1).unwrap();
+        assert_eq!(text, "HSET \"h\" \"f\" \"v\"");
+        assert!(partial, "more pages remain");
+        let zset = Value::SortedSet {
+            members: vec![(b"m".to_vec(), "1.5".into())],
+            next: None,
+        };
+        assert_eq!(
+            rebuild_command(b"z", &zset, true, -1).unwrap(),
+            ("ZADD \"z\" 1.5 \"m\"".into(), true)
+        );
+        assert_eq!(
+            rebuild_command(
+                b"l",
+                &Value::List {
+                    items: vec![b"x".to_vec()],
+                    next: None
+                },
+                false,
+                -1
+            )
+            .unwrap()
+            .0,
+            "RPUSH \"l\" \"x\""
+        );
+        assert!(
+            rebuild_command(
+                b"s",
+                &Value::Set {
+                    members: Vec::new(),
+                    cursor: None
+                },
+                false,
+                -1
+            )
+            .is_none()
+        );
+        assert!(rebuild_command(b"o", &Value::Other, false, -1).is_none());
+    }
+
     use super::*;
 
     #[test]

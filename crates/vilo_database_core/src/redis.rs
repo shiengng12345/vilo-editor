@@ -597,6 +597,29 @@ pub fn format_reply(value: &Value) -> Vec<String> {
     lines
 }
 
+fn scan_args(key: &[u8], cursor: &str, count: u32, pattern: Option<&[u8]>) -> Vec<Value> {
+    let mut args = vec![bytes_arg(key), Value::from(cursor.to_string())];
+    if let Some(pattern) = pattern {
+        args.push("MATCH".into());
+        args.push(bytes_arg(pattern));
+    }
+    args.push("COUNT".into());
+    args.push(Value::from(i64::from(count)));
+    args
+}
+
+/// A typed search as a Redis glob: a plain word matches anywhere, a glob is used as typed.
+pub fn search_pattern(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else if text.contains(['*', '?', '[']) {
+        Some(text.as_bytes().to_vec())
+    } else {
+        Some(format!("*{text}*").into_bytes())
+    }
+}
+
 fn bytes_arg(bytes: &[u8]) -> Value {
     Value::Bytes(bytes.to_vec().into())
 }
@@ -1023,17 +1046,10 @@ impl RedisSession {
         key: &[u8],
         cursor: &str,
         count: u32,
+        pattern: Option<&[u8]>,
     ) -> Result<(Vec<(Bytes, Bytes)>, String)> {
         let reply = self
-            .call(
-                "HSCAN",
-                vec![
-                    bytes_arg(key),
-                    Value::from(cursor.to_string()),
-                    "COUNT".into(),
-                    Value::from(count as i64),
-                ],
-            )
+            .call("HSCAN", scan_args(key, cursor, count, pattern))
             .await?;
         let mut parts = reply.into_array().into_iter();
         let cursor = parts
@@ -1055,17 +1071,10 @@ impl RedisSession {
         key: &[u8],
         cursor: &str,
         count: u32,
+        pattern: Option<&[u8]>,
     ) -> Result<(Vec<Bytes>, String)> {
         let reply = self
-            .call(
-                "SSCAN",
-                vec![
-                    bytes_arg(key),
-                    Value::from(cursor.to_string()),
-                    "COUNT".into(),
-                    Value::from(count as i64),
-                ],
-            )
+            .call("SSCAN", scan_args(key, cursor, count, pattern))
             .await?;
         let mut parts = reply.into_array().into_iter();
         let cursor = parts
@@ -1076,6 +1085,32 @@ impl RedisSession {
             .next()
             .map(|members| members.into_array().iter().map(value_bytes).collect())
             .unwrap_or_default();
+        Ok((members, cursor))
+    }
+
+    /// One ZSCAN page: members with their scores as the server writes them.
+    pub async fn zset_scan(
+        &self,
+        key: &[u8],
+        cursor: &str,
+        count: u32,
+        pattern: Option<&[u8]>,
+    ) -> Result<(Vec<(Bytes, String)>, String)> {
+        let reply = self
+            .call("ZSCAN", scan_args(key, cursor, count, pattern))
+            .await?;
+        let mut parts = reply.into_array().into_iter();
+        let cursor = parts
+            .next()
+            .and_then(|cursor| cursor.as_string())
+            .context("ZSCAN returned no cursor")?;
+        let members = parts
+            .next()
+            .map(pairs)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(member, score)| (value_bytes(&member), score.as_string().unwrap_or_default()))
+            .collect();
         Ok((members, cursor))
     }
 
@@ -1833,6 +1868,95 @@ broken line";
             .unwrap();
     }
 
+    async fn values_can_be_searched(session: &RedisSession) {
+        let (hash, set, zset) = (b"vilo_test:sh", b"vilo_test:ss", b"vilo_test:sz");
+        session
+            .call(
+                "DEL",
+                vec![bytes_arg(hash), bytes_arg(set), bytes_arg(zset)],
+            )
+            .await
+            .unwrap();
+        let mut hash_args = vec![bytes_arg(hash)];
+        let mut set_args = vec![bytes_arg(set)];
+        let mut zset_args = vec![bytes_arg(zset)];
+        for index in 0..300 {
+            let name = format!(
+                "{}:{index}",
+                if index % 100 == 7 { "needle" } else { "hay" }
+            );
+            hash_args.extend([Value::from(name.clone()), Value::from("v")]);
+            set_args.push(Value::from(name.clone()));
+            zset_args.extend([Value::from(index as i64), Value::from(name)]);
+        }
+        session.call("HSET", hash_args).await.unwrap();
+        session.call("SADD", set_args).await.unwrap();
+        session.call("ZADD", zset_args).await.unwrap();
+        let pattern = search_pattern("needle");
+        // Walk every page; matches can be spread over pages and a page can be empty.
+        let mut found = Vec::new();
+        let mut cursor = "0".to_string();
+        loop {
+            let (page, next) = session
+                .hash_page(hash, &cursor, 50, pattern.as_deref())
+                .await
+                .unwrap();
+            found.extend(page.into_iter().map(|(field, _)| field));
+            if next == "0" {
+                break;
+            }
+            cursor = next;
+        }
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                b"needle:107".to_vec(),
+                b"needle:207".to_vec(),
+                b"needle:7".to_vec()
+            ]
+        );
+        let mut members = Vec::new();
+        let mut cursor = "0".to_string();
+        loop {
+            let (page, next) = session
+                .set_page(set, &cursor, 50, pattern.as_deref())
+                .await
+                .unwrap();
+            members.extend(page);
+            if next == "0" {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(members.len(), 3);
+        let mut scored = Vec::new();
+        let mut cursor = "0".to_string();
+        loop {
+            let (page, next) = session
+                .zset_scan(zset, &cursor, 50, pattern.as_deref())
+                .await
+                .unwrap();
+            scored.extend(page);
+            if next == "0" {
+                break;
+            }
+            cursor = next;
+        }
+        scored.sort();
+        assert_eq!(scored[0], (b"needle:107".to_vec(), "107".to_string()));
+        assert_eq!(scored.len(), 3);
+        assert_eq!(search_pattern(" "), None);
+        assert_eq!(search_pattern("a*b"), Some(b"a*b".to_vec()));
+        session
+            .call(
+                "DEL",
+                vec![bytes_arg(hash), bytes_arg(set), bytes_arg(zset)],
+            )
+            .await
+            .unwrap();
+    }
+
     async fn writes_are_guarded(session: &RedisSession) {
         let key = b"vilo_test:w".to_vec();
         session
@@ -1979,6 +2103,7 @@ broken line";
         };
         let session = RedisSession::connect(&url).await.unwrap();
         writes_are_guarded(&session).await;
+        values_can_be_searched(&session).await;
         databases_are_separate(&url).await;
         slowlog_and_clients(&url).await;
         assert!(session.cluster_nodes().await.unwrap().is_none());
@@ -2144,7 +2269,10 @@ broken line";
                 .is_err()
         );
 
-        let (mut fields, _) = session.hash_page(b"vilo_test:h", "0", 100).await.unwrap();
+        let (mut fields, _) = session
+            .hash_page(b"vilo_test:h", "0", 100, None)
+            .await
+            .unwrap();
         fields.sort();
         assert_eq!(
             fields,
@@ -2157,7 +2285,10 @@ broken line";
             session.list_range(b"vilo_test:l", 1, 2).await.unwrap(),
             vec![b"b".to_vec(), b"c".to_vec()]
         );
-        let (mut members, _) = session.set_page(b"vilo_test:s", "0", 100).await.unwrap();
+        let (mut members, _) = session
+            .set_page(b"vilo_test:s", "0", 100, None)
+            .await
+            .unwrap();
         members.sort();
         assert_eq!(members, vec![b"m1".to_vec(), b"m2".to_vec()]);
         assert_eq!(
