@@ -1,23 +1,24 @@
+mod mongo_tab;
+
 use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow};
-use collections::{HashMap, HashSet};
+use collections::HashMap;
 use editor::Editor;
 use gpui::{
-    App, AsyncApp, ClipboardItem, Entity, FocusHandle, Focusable, ListHorizontalSizingBehavior, Task, TaskExt as _, UniformListScrollHandle,
-    Window, prelude::*, uniform_list,
+    App, AsyncApp, Entity, FocusHandle, Focusable, ListHorizontalSizingBehavior, Task, TaskExt as _, UniformListScrollHandle, Window,
+    prelude::*, uniform_list,
 };
 use gpui_tokio::Tokio;
 use serde::{Deserialize, Serialize};
 use ui::{Button, ButtonStyle, IconButton, Tooltip, prelude::*};
 use util::ResultExt as _;
 use vilo_database_core::{
-    bson::{Bson, Document},
-    display::{Shown, ValueKind, show},
-    mongo::{CollectionInfo, DatabaseInfo, FindRequest, MongoSession, to_display_json},
+    mongo::{CollectionInfo, DatabaseInfo, MongoSession},
     redis::{KeyInfo, RedisSession},
-    shell::parse_query,
 };
+
+use mongo_tab::{MongoTab, SavedQuery, load_history};
 use workspace::Workspace;
 
 const MODULE_ID: &str = "database";
@@ -26,8 +27,6 @@ const SCAN_COUNT: u32 = 200;
 const QUERY_TIME_LIMIT: Duration = Duration::from_secs(30);
 /// Counting can be slow on big collections; past this the total is simply not shown.
 const COUNT_TIME_LIMIT: Duration = Duration::from_secs(5);
-/// Top-level fields shown per document before "Show N more fields", as Compass does.
-const FIELDS_SHOWN: usize = 25;
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, cx| {
@@ -118,19 +117,6 @@ struct Form {
     _task: Option<Task<()>>,
 }
 
-struct MongoPage {
-    documents: Vec<Document>,
-    /// The JSON view's lines, made once off the UI thread.
-    json_lines: Vec<SharedString>,
-    has_more: bool,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum DocumentView {
-    List,
-    Json,
-}
-
 struct KeyDetail {
     info: KeyInfo,
     /// The raw value of a string key; other types get their own viewers.
@@ -149,24 +135,13 @@ pub struct DatabaseView {
     form: Option<Form>,
     databases: Fetch<Vec<DatabaseInfo>>,
     collections: HashMap<String, Fetch<Vec<CollectionInfo>>>,
-    selected_collection: Option<(String, String)>,
-    collection_filter: Entity<Editor>,
-    filter: Entity<Editor>,
-    projection: Entity<Editor>,
-    sort: Entity<Editor>,
-    skip_editor: Entity<Editor>,
-    show_options: bool,
-    document_view: DocumentView,
-    page_size: u32,
-    skip: u64,
-    page: Option<Fetch<MongoPage>>,
-    /// Matches for the current filter; `None` while counting or when it took too long.
-    total: Option<u64>,
-    estimated: Option<u64>,
-    /// Nested values the user opened, by document index and dotted path.
-    expanded: HashSet<(usize, String)>,
-    /// Documents showing all their fields.
-    show_all: HashSet<usize>,
+    /// Searches connections and collections at once, keeping each match's parents visible.
+    search: Entity<Editor>,
+    tabs: Vec<MongoTab>,
+    active_tab: Option<usize>,
+    history: Vec<SavedQuery>,
+    /// Readable dates in this Mac's time zone instead of UTC.
+    local_dates: bool,
     pattern: Entity<Editor>,
     keys: Vec<Vec<u8>>,
     /// The next SCAN cursor; `None` once the walk came back to "0".
@@ -210,18 +185,6 @@ fn escape_bytes(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Compass's colours: ObjectId red, strings green, numbers and dates blue, booleans orange.
-fn kind_color(kind: ValueKind) -> Color {
-    match kind {
-        ValueKind::String => Color::Success,
-        ValueKind::Number | ValueKind::Date => Color::Accent,
-        ValueKind::ObjectId => Color::Error,
-        ValueKind::Boolean => Color::Warning,
-        ValueKind::Null => Color::Muted,
-        ValueKind::Other => Color::Default,
-    }
-}
-
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ")
 }
@@ -257,8 +220,14 @@ impl DatabaseView {
             .into_iter()
             .filter_map(|entry| serde_json::from_value::<Connection>(entry).log_err())
             .collect::<Vec<_>>();
-        let collection_filter = editor("Search collections", "", false, window, cx);
-        let subscriptions = vec![cx.subscribe(&collection_filter, |_, _, _: &editor::EditorEvent, cx| cx.notify())];
+        let search = editor("Search connections and collections", "", false, window, cx);
+        let subscriptions = vec![cx.subscribe(&search, |this, _, _: &editor::EditorEvent, cx| {
+            // Searching needs every database's collections; load the ones not opened yet.
+            if !this.search.read(cx).text(cx).trim().is_empty() {
+                this.load_all_collections(cx);
+            }
+            cx.notify();
+        })];
         let mut view = Self {
             focus_handle: cx.focus_handle(),
             path,
@@ -270,21 +239,11 @@ impl DatabaseView {
             form: None,
             databases: Fetch::Loaded(Vec::new()),
             collections: HashMap::default(),
-            selected_collection: None,
-            collection_filter,
-            filter: editor("Type a query: { field: 'value' }", "", false, window, cx),
-            projection: editor("{ field: 0 }", "", false, window, cx),
-            sort: editor("{ field: -1 } or [['field', -1]]", "", false, window, cx),
-            skip_editor: editor("0", "", false, window, cx),
-            show_options: false,
-            document_view: DocumentView::List,
-            page_size: PAGE_SIZES[0],
-            skip: 0,
-            page: None,
-            total: None,
-            estimated: None,
-            expanded: HashSet::default(),
-            show_all: HashSet::default(),
+            search,
+            tabs: Vec::new(),
+            active_tab: None,
+            history: load_history(),
+            local_dates: false,
             pattern: editor("Key pattern, e.g. user:*", "*", false, window, cx),
             keys: Vec::new(),
             cursor: None,
@@ -328,11 +287,8 @@ impl DatabaseView {
         self.status = None;
         self.databases = Fetch::Loaded(Vec::new());
         self.collections.clear();
-        self.selected_collection = None;
-        self.page = None;
-        self.total = None;
-        self.estimated = None;
-        self.skip = 0;
+        self.tabs.clear();
+        self.active_tab = None;
         self.keys.clear();
         self.cursor = None;
         self.scanning = false;
@@ -425,6 +381,20 @@ impl DatabaseView {
             cx.notify();
             return;
         }
+        self.load_collections(database, cx);
+    }
+
+    fn load_all_collections(&mut self, cx: &mut Context<Self>) {
+        let Fetch::Loaded(databases) = &self.databases else {
+            return;
+        };
+        let missing = databases.iter().map(|database| database.name.clone()).filter(|name| !self.collections.contains_key(name)).collect::<Vec<_>>();
+        for database in missing {
+            self.load_collections(database, cx);
+        }
+    }
+
+    fn load_collections(&mut self, database: String, cx: &mut Context<Self>) {
         let Some(session) = self.mongo() else {
             return;
         };
@@ -437,112 +407,6 @@ impl DatabaseView {
             this.update(cx, |this, cx| {
                 if this.generation == generation && this.collections.contains_key(&database) {
                     this.collections.insert(database, fetched(result));
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn open_collection(&mut self, database: String, collection: String, cx: &mut Context<Self>) {
-        self.selected_collection = Some((database.clone(), collection.clone()));
-        self.skip = 0;
-        self.estimated = None;
-        if let Some(session) = self.mongo() {
-            let task = run(cx, async move { session.estimated_count(&database, &collection).await });
-            let generation = self.generation;
-            self.tasks.push(cx.spawn(async move |this, cx| {
-                let result = task.await;
-                this.update(cx, |this, cx| {
-                    if this.generation == generation {
-                        this.estimated = result.ok();
-                        cx.notify();
-                    }
-                })
-                .ok();
-            }));
-        }
-        self.find(cx);
-    }
-
-    fn reset_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for editor in [&self.filter, &self.projection, &self.sort, &self.skip_editor] {
-            editor.update(cx, |editor, cx| editor.set_text("", window, cx));
-        }
-        self.skip = 0;
-        self.find(cx);
-    }
-
-    fn find(&mut self, cx: &mut Context<Self>) {
-        let (Some(session), Some((database, collection))) = (self.mongo(), self.selected_collection.clone()) else {
-            return;
-        };
-        let parse = |editor: &Entity<Editor>, label: &str, cx: &App| {
-            let text = editor.read(cx).text(cx);
-            parse_query(&text).map_err(|error| anyhow!("{label}: {error:#}"))
-        };
-        let base_skip = self.skip_editor.read(cx).text(cx).trim().to_string();
-        let parsed = (|| {
-            let filter = parse(&self.filter, "Filter", cx)?;
-            let projection = parse(&self.projection, "Project", cx)?;
-            let sort = parse(&self.sort, "Sort", cx)?;
-            let base_skip = if base_skip.is_empty() { 0 } else { base_skip.parse::<u64>().map_err(|_| anyhow!("Skip must be a whole number"))? };
-            anyhow::Ok((filter, projection, sort, base_skip))
-        })();
-        let (filter, projection, sort, base_skip) = match parsed {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                self.page = Some(Fetch::Failed(format!("{error:#}").into()));
-                cx.notify();
-                return;
-            }
-        };
-        let count_task = {
-            let (session, database, collection, filter) = (session.clone(), database.clone(), collection.clone(), filter.clone());
-            run(cx, async move { session.count(&database, &collection, filter, COUNT_TIME_LIMIT).await })
-        };
-        let request = FindRequest {
-            database,
-            collection,
-            filter,
-            projection: (!projection.is_empty()).then_some(projection),
-            sort: (!sort.is_empty()).then_some(sort),
-            skip: base_skip + self.skip,
-            page_size: self.page_size,
-            max_time: Some(QUERY_TIME_LIMIT),
-        };
-        self.generation += 1;
-        let generation = self.generation;
-        self.page = Some(Fetch::Loading);
-        self.total = None;
-        self.expanded.clear();
-        self.show_all.clear();
-        let task = run(cx, async move {
-            let page = session.find_page(&request).await?;
-            // Formatting happens on Tokio; the list then only hands out shared lines.
-            let mut json_lines = Vec::new();
-            for document in &page.documents {
-                json_lines.extend(to_display_json(document).lines().map(|line| SharedString::from(line.to_string())));
-                json_lines.push(SharedString::default());
-            }
-            Ok(MongoPage { documents: page.documents, json_lines, has_more: page.has_more })
-        });
-        self.tasks.push(cx.spawn(async move |this, cx| {
-            let total = count_task.await;
-            this.update(cx, |this, cx| {
-                if this.generation == generation {
-                    this.total = total.ok();
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
-        self.tasks.push(cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                if this.generation == generation {
-                    this.page = Some(fetched(result));
                     cx.notify();
                 }
             })
@@ -781,20 +645,29 @@ fn render_lines(id: &'static str, lines: Vec<SharedString>, scroll: &UniformList
 impl DatabaseView {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let mut connections = v_flex().gap_0p5().px_1();
+        let search = self.search.read(cx).text(cx).trim().to_lowercase();
+        let matches = |name: &str| search.is_empty() || name.to_lowercase().contains(&search);
+        let mut tree = v_flex().gap_0p5().px_1();
         for connection in &self.connections {
+            let active = self.active.as_ref() == Some(&connection.id);
+            let mongo_open = active && matches!(self.session, Some(Session::Mongo(_)));
+            // Under a search, the active connection's matching collections keep it visible.
+            if !matches(&connection.name) && !mongo_open {
+                continue;
+            }
             let id = connection.id.clone();
-            connections = connections.child(
+            tree = tree.child(
                 h_flex()
                     .id(SharedString::from(format!("database-connection-{}", connection.id)))
                     .px_2()
                     .py_1()
-                    .gap_2()
+                    .gap_1p5()
                     .rounded_md()
                     .cursor_pointer()
-                    .when(self.active.as_ref() == Some(&connection.id), |this| this.bg(colors.element_selected))
+                    .when(active, |this| this.bg(colors.element_selected))
                     .hover(|style| style.bg(colors.element_hover))
                     .on_click(cx.listener(move |this, _, _, cx| this.connect(id.clone(), cx)))
+                    .child(Icon::new(if active { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Muted))
                     .child(Icon::new(IconName::DatabaseZap).size(IconSize::Small).color(Color::Muted))
                     .child(Label::new(connection.name.clone()).truncate())
                     .child(div().flex_1())
@@ -804,61 +677,65 @@ impl DatabaseView {
                             .color(if connection.production() { Color::Warning } else { Color::Muted }),
                     ),
             );
-        }
-        let mut tree = v_flex().gap_0p5().px_1();
-        let search = self.collection_filter.read(cx).text(cx).to_lowercase();
-        if matches!(self.session, Some(Session::Mongo(_))) {
+            if !mongo_open {
+                continue;
+            }
             match &self.databases {
-                Fetch::Loading => tree = tree.child(div().px_3().child(Label::new("Loading…").size(LabelSize::Small).color(Color::Muted))),
-                Fetch::Failed(message) => {
-                    tree = tree.child(div().px_3().child(Label::new(message.clone()).size(LabelSize::Small).color(Color::Warning)))
-                }
+                Fetch::Loading => tree = tree.child(div().pl_8().child(Label::new("Loading…").size(LabelSize::Small).color(Color::Muted))),
+                Fetch::Failed(message) => tree = tree.child(div().pl_8().child(Label::new(message.clone()).size(LabelSize::Small).color(Color::Warning))),
                 Fetch::Loaded(databases) => {
                     for database in databases {
-                        let open = self.collections.get(&database.name);
+                        let collections = self.collections.get(&database.name);
+                        let matching = match collections {
+                            Some(Fetch::Loaded(collections)) => {
+                                collections.iter().filter(|collection| matches(&collection.name) || matches(&database.name)).collect::<Vec<_>>()
+                            }
+                            _ => Vec::new(),
+                        };
+                        if !search.is_empty() && matching.is_empty() && !matches(&database.name) {
+                            continue;
+                        }
+                        let open = collections.is_some();
                         let name = database.name.clone();
                         tree = tree.child(
                             h_flex()
                                 .id(SharedString::from(format!("database-db-{}", database.name)))
-                                .px_2()
+                                .pl_6()
+                                .pr_2()
                                 .py_0p5()
                                 .gap_1()
                                 .rounded_sm()
                                 .cursor_pointer()
                                 .hover(|style| style.bg(colors.element_hover))
                                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_database(name.clone(), cx)))
-                                .child(
-                                    Icon::new(if open.is_some() { IconName::ChevronDown } else { IconName::ChevronRight })
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted),
-                                )
+                                .child(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Muted))
+                                .child(Icon::new(IconName::DatabaseZap).size(IconSize::XSmall).color(Color::Muted))
                                 .child(Label::new(database.name.clone()).size(LabelSize::Small).truncate()),
                         );
-                        match open {
-                            Some(Fetch::Loading) => {
-                                tree = tree.child(div().pl_8().child(Label::new("Loading…").size(LabelSize::XSmall).color(Color::Muted)))
-                            }
+                        match collections {
+                            Some(Fetch::Loading) => tree = tree.child(div().pl_12().child(Label::new("Loading…").size(LabelSize::XSmall).color(Color::Muted))),
                             Some(Fetch::Failed(message)) => {
-                                tree = tree.child(div().pl_8().child(Label::new(message.clone()).size(LabelSize::XSmall).color(Color::Warning)))
+                                tree = tree.child(div().pl_12().child(Label::new(message.clone()).size(LabelSize::XSmall).color(Color::Warning)))
                             }
-                            Some(Fetch::Loaded(collections)) => {
-                                for collection in collections.iter().filter(|collection| search.is_empty() || collection.name.to_lowercase().contains(&search)) {
-                                    let selected = self.selected_collection.as_ref()
-                                        == Some(&(database.name.clone(), collection.name.clone()));
+                            Some(Fetch::Loaded(_)) => {
+                                for collection in matching {
+                                    let selected = self.tab().is_some_and(|tab| tab.database == database.name && tab.collection == collection.name);
                                     let (database_name, collection_name) = (database.name.clone(), collection.name.clone());
                                     tree = tree.child(
                                         h_flex()
                                             .id(SharedString::from(format!("database-coll-{}-{}", database.name, collection.name)))
-                                            .pl_6()
+                                            .pl_12()
                                             .pr_2()
                                             .py_0p5()
+                                            .gap_1p5()
                                             .rounded_sm()
                                             .cursor_pointer()
                                             .when(selected, |this| this.bg(colors.element_selected))
                                             .hover(|style| style.bg(colors.element_hover))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.open_collection(database_name.clone(), collection_name.clone(), cx)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_collection(database_name.clone(), collection_name.clone(), window, cx)
                                             }))
+                                            .child(Icon::new(IconName::Folder).size(IconSize::XSmall).color(Color::Muted))
                                             .child(Label::new(collection.name.clone()).size(LabelSize::Small).truncate())
                                             .when(collection.kind != "collection", |this| {
                                                 this.child(div().flex_1()).child(Label::new(collection.kind.clone()).size(LabelSize::XSmall).color(Color::Muted))
@@ -880,26 +757,27 @@ impl DatabaseView {
             .border_color(colors.border)
             .bg(colors.panel_background)
             .child(
-                section("CONNECTIONS").child(
-                    IconButton::new("database-add-connection", IconName::Plus)
-                        .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text("Add a MongoDB or Redis connection"))
-                        .on_click(cx.listener(|this, _, window, cx| this.open_form(None, window, cx))),
-                ),
-            )
-            .child(connections)
-            .when(matches!(self.session, Some(Session::Mongo(_))), |this| {
-                this.child(
-                    section("DATABASES").mt_2().border_t_1().border_color(colors.border_variant).child(
-                        IconButton::new("database-reload", IconName::RotateCw)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Reload databases"))
-                            .on_click(cx.listener(|this, _, _, cx| this.load_databases(cx))),
+                section("CONNECTIONS")
+                    .child(
+                        h_flex()
+                            .when(matches!(self.session, Some(Session::Mongo(_))), |this| {
+                                this.child(
+                                    IconButton::new("database-reload", IconName::RotateCw)
+                                        .icon_size(IconSize::Small)
+                                        .tooltip(Tooltip::text("Reload databases"))
+                                        .on_click(cx.listener(|this, _, _, cx| this.load_databases(cx))),
+                                )
+                            })
+                            .child(
+                                IconButton::new("database-add-connection", IconName::Plus)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Add a MongoDB or Redis connection"))
+                                    .on_click(cx.listener(|this, _, window, cx| this.open_form(None, window, cx))),
+                            ),
                     ),
-                )
-                .child(div().mx_2().mb_1().child(boxed(self.collection_filter.clone(), cx)))
-                .child(v_flex().id("database-tree").flex_1().min_h_0().overflow_y_scroll().pb_2().child(tree))
-            })
+            )
+            .child(div().mx_2().mb_1().child(boxed(self.search.clone(), cx)))
+            .child(v_flex().id("database-tree").flex_1().min_h_0().overflow_y_scroll().pb_2().child(tree))
     }
 
     fn render_form(&self, form: &Form, cx: &mut Context<Self>) -> AnyElement {
@@ -979,262 +857,6 @@ impl DatabaseView {
                     .label_size(LabelSize::Small)
                     .on_click(cx.listener(move |this, _, window, cx| this.open_form(Some(id.clone()), window, cx))),
             )
-    }
-
-    /// One field and, when opened, its nested fields, as rows of `key: value` like Compass's list view.
-    fn push_field_rows(&self, rows: &mut Vec<AnyElement>, index: usize, path: String, key: &str, value: &Bson, depth: usize, cx: &mut Context<Self>) {
-        let shown = show(value);
-        let expandable = matches!(shown, Shown::Object(_) | Shown::Array(_));
-        let open = expandable && self.expanded.contains(&(index, path.clone()));
-        let value_label = match &shown {
-            Shown::Scalar { text, kind } => Label::new(text.clone()).buffer_font(cx).color(kind_color(*kind)),
-            Shown::Object(count) => Label::new(format!("Object ({count})")).buffer_font(cx).color(Color::Muted),
-            Shown::Array(count) => Label::new(format!("Array ({count})")).buffer_font(cx).color(Color::Muted),
-        };
-        let toggle = (index, path.clone());
-        rows.push(
-            h_flex()
-                .id(SharedString::from(format!("database-field-{index}-{path}")))
-                .pl(px(depth as f32 * 18.))
-                .gap_1()
-                .items_start()
-                .when(expandable, |this| {
-                    this.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.expanded.remove(&toggle) {
-                            this.expanded.insert(toggle.clone());
-                        }
-                        cx.notify();
-                    }))
-                })
-                .child(
-                    div().w(px(12.)).flex_none().when(expandable, |this| {
-                        this.child(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Muted))
-                    }),
-                )
-                .child(Label::new(format!("{key}:")).buffer_font(cx).weight(gpui::FontWeight::SEMIBOLD))
-                .child(div().min_w_0().child(value_label))
-                .into_any_element(),
-        );
-        if !open {
-            return;
-        }
-        match value {
-            Bson::Document(document) => {
-                for (child, value) in document {
-                    self.push_field_rows(rows, index, format!("{path}.{child}"), child, value, depth + 1, cx);
-                }
-            }
-            Bson::Array(items) => {
-                for (position, value) in items.iter().enumerate() {
-                    self.push_field_rows(rows, index, format!("{path}.{position}"), &position.to_string(), value, depth + 1, cx);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // shortcut: renders every document of the page as elements (at most 100 per page, 25 top-level fields each); a virtual list comes with very large documents.
-    fn render_document_list(&self, page: &MongoPage, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let mut list = v_flex().id("database-documents").flex_1().min_h_0().overflow_y_scroll().gap_2().pr_1();
-        for (index, document) in page.documents.iter().enumerate() {
-            let all = self.show_all.contains(&index);
-            let mut rows = Vec::new();
-            for (key, value) in document.iter().take(if all { usize::MAX } else { FIELDS_SHOWN }) {
-                self.push_field_rows(&mut rows, index, key.clone(), key, value, 0, cx);
-            }
-            let hidden = document.len().saturating_sub(FIELDS_SHOWN);
-            let json = to_display_json(document);
-            list = list.child(
-                v_flex()
-                    .p_3()
-                    .gap_0p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.editor_background)
-                    .child(
-                        h_flex()
-                            .items_start()
-                            .child(v_flex().flex_1().min_w_0().gap_0p5().children(rows))
-                            .child(
-                                IconButton::new(SharedString::from(format!("database-copy-{index}")), IconName::Copy)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Copy document"))
-                                    .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(json.clone()))),
-                            ),
-                    )
-                    .when(hidden > 0 && !all, |this| {
-                        this.child(
-                            Button::new(SharedString::from(format!("database-more-{index}")), format!("Show {hidden} more field{}", if hidden == 1 { "" } else { "s" }))
-                                .label_size(LabelSize::Small)
-                                .color(Color::Accent)
-                                .start_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.show_all.insert(index);
-                                    cx.notify();
-                                })),
-                        )
-                    }),
-            );
-        }
-        list.into_any_element()
-    }
-
-    fn render_mongo(&self, connection: &Connection, cx: &mut Context<Self>) -> AnyElement {
-        let Some((database, collection)) = self.selected_collection.clone() else {
-            return v_flex()
-                .gap_3()
-                .child(self.render_header(connection, connection.name.clone(), cx))
-                .child(Label::new("Pick a collection on the left.").color(Color::Muted))
-                .into_any_element();
-        };
-        let page_button = |size: u32, cx: &mut Context<Self>| {
-            Button::new(SharedString::from(format!("database-page-size-{size}")), size.to_string())
-                .label_size(LabelSize::Small)
-                .style(if self.page_size == size { ButtonStyle::Filled } else { ButtonStyle::Subtle })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.page_size = size;
-                    this.skip = 0;
-                    this.find(cx);
-                }))
-        };
-        let view_button = |id: &'static str, label: &'static str, view: DocumentView, cx: &mut Context<Self>| {
-            Button::new(id, label)
-                .label_size(LabelSize::Small)
-                .style(if self.document_view == view { ButtonStyle::Filled } else { ButtonStyle::Subtle })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.document_view = view;
-                    cx.notify();
-                }))
-        };
-        let (shown, has_more) = match &self.page {
-            Some(Fetch::Loaded(page)) => (page.documents.len(), page.has_more),
-            _ => (0, false),
-        };
-        let skip = self.skip;
-        let page_size = u64::from(self.page_size);
-        let status = match &self.page {
-            Some(Fetch::Loaded(_)) if shown == 0 => "No documents match.".to_string(),
-            Some(Fetch::Loaded(_)) => {
-                let total = match self.total {
-                    Some(total) => format!(" of {total}"),
-                    None if has_more => " of many".into(),
-                    None => String::new(),
-                };
-                format!("{} – {}{total}", skip + 1, skip + shown as u64)
-            }
-            Some(Fetch::Loading) => "Running…".into(),
-            _ => String::new(),
-        };
-        let body = match &self.page {
-            Some(Fetch::Failed(message)) => Label::new(message.clone()).size(LabelSize::Small).color(Color::Error).into_any_element(),
-            Some(Fetch::Loaded(page)) if !page.documents.is_empty() => match self.document_view {
-                DocumentView::List => self.render_document_list(page, cx),
-                DocumentView::Json => render_lines("database-documents-json", page.json_lines.clone(), &self.lines_scroll, cx),
-            },
-            _ => div().into_any_element(),
-        };
-        let option = |label: &'static str, editor: &Entity<Editor>, width: f32, cx: &App| {
-            h_flex()
-                .gap_2()
-                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
-                .child(div().w(px(width)).child(boxed(editor.clone(), cx)))
-        };
-        let title = format!("{} › {database} › {collection}", connection.name);
-        v_flex()
-            .size_full()
-            .gap_2()
-            .child(self.render_header(connection, title, cx))
-            .when_some(self.estimated, |this, estimated| {
-                this.child(Label::new(format!("Documents  ≈{estimated}")).size(LabelSize::Small).color(Color::Muted))
-            })
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| {
-                                this.skip = 0;
-                                this.find(cx);
-                            }))
-                            .child(boxed(self.filter.clone(), cx)),
-                    )
-                    .child(
-                        Button::new("database-reset", "Reset")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|this, _, window, cx| this.reset_query(window, cx))),
-                    )
-                    .child(
-                        Button::new("database-find", "Find")
-                            .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.skip = 0;
-                                this.find(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("database-options", "Options")
-                            .label_size(LabelSize::Small)
-                            .color(Color::Accent)
-                            .end_icon(Icon::new(if self.show_options { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_options = !this.show_options;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .when(self.show_options, |this| {
-                this.child(
-                    h_flex()
-                        .gap_4()
-                        .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| {
-                            this.skip = 0;
-                            this.find(cx);
-                        }))
-                        .child(option("Project", &self.projection, 260., cx))
-                        .child(option("Sort", &self.sort, 220., cx))
-                        .child(option("Skip", &self.skip_editor, 80., cx)),
-                )
-            })
-            .child(
-                h_flex()
-                    .gap_1()
-                    .children(PAGE_SIZES.map(|size| page_button(size, cx)))
-                    .child(div().w(px(12.)))
-                    .child(Label::new(status).size(LabelSize::Small).color(Color::Muted))
-                    .child(
-                        IconButton::new("database-refresh", IconName::RotateCw)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Run the query again"))
-                            .on_click(cx.listener(|this, _, _, cx| this.find(cx))),
-                    )
-                    .child(
-                        IconButton::new("database-previous", IconName::ChevronLeft)
-                            .icon_size(IconSize::Small)
-                            .disabled(skip == 0)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.skip = skip.saturating_sub(page_size);
-                                this.find(cx);
-                            })),
-                    )
-                    .child(
-                        IconButton::new("database-next", IconName::ChevronRight)
-                            .icon_size(IconSize::Small)
-                            .disabled(!has_more)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.skip = skip + page_size;
-                                this.find(cx);
-                            })),
-                    )
-                    .child(div().flex_1())
-                    .child(view_button("database-view-list", "List", DocumentView::List, cx))
-                    .child(view_button("database-view-json", "JSON", DocumentView::Json, cx)),
-            )
-            .child(body)
-            .into_any_element()
     }
 
     fn render_redis(&self, connection: &Connection, cx: &mut Context<Self>) -> AnyElement {

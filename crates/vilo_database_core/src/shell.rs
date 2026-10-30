@@ -27,6 +27,8 @@ struct Reader<'a> {
     position: usize,
     output: String,
     _text: &'a str,
+    /// Keys seen in each open object, so a key given twice is refused instead of silently keeping the last.
+    keys: Vec<Vec<String>>,
 }
 
 impl Reader<'_> {
@@ -41,6 +43,16 @@ impl Reader<'_> {
     /// Whether a value (not an operator or key) is expected here, which decides what `/` means.
     fn expects_value(&self) -> bool {
         matches!(self.output.trim_end().chars().last(), Some(':' | ',' | '[' | '(') | None)
+    }
+
+    fn note_key(&mut self, key: &str) -> Result<()> {
+        if let Some(keys) = self.keys.last_mut() {
+            if keys.iter().any(|seen| seen == key) {
+                bail!("“{key}” appears twice in the same object");
+            }
+            keys.push(key.to_string());
+        }
+        Ok(())
     }
 
     fn skip_whitespace(&mut self) {
@@ -155,12 +167,24 @@ fn date_value(text: &str) -> String {
 
 /// Rewrites Compass query text into Extended JSON text.
 pub fn to_extended_json(text: &str) -> Result<String> {
-    let mut reader = Reader { chars: text.chars().collect(), position: 0, output: String::new(), _text: text };
+    let mut reader = Reader { chars: text.chars().collect(), position: 0, output: String::new(), _text: text, keys: Vec::new() };
     while let Some(character) = reader.peek() {
         match character {
             '\'' | '"' => {
                 let value = reader.read_string()?;
+                if reader.next_significant() == Some(':') {
+                    reader.note_key(&value)?;
+                }
                 reader.output.push_str(&json_string(&value));
+            }
+            '{' | '}' => {
+                if character == '{' {
+                    reader.keys.push(Vec::new());
+                } else {
+                    reader.keys.pop();
+                }
+                reader.output.push(character);
+                reader.position += 1;
             }
             '/' if reader.expects_value() => {
                 let regex = reader.read_regex()?;
@@ -170,6 +194,7 @@ pub fn to_extended_json(text: &str) -> Result<String> {
                 let identifier = reader.read_identifier();
                 // Only a key is followed by a colon.
                 if reader.next_significant() == Some(':') {
+                    reader.note_key(&identifier)?;
                     reader.output.push_str(&json_string(&identifier));
                     continue;
                 }
@@ -191,6 +216,10 @@ pub fn to_extended_json(text: &str) -> Result<String> {
                     "NumberInt" | "Int32" => {
                         let number = reader.read_argument()?.ok_or_else(|| anyhow!("{identifier}() needs a number"))?;
                         format!(r#"{{"$numberInt":{}}}"#, json_string(&number))
+                    }
+                    "UUID" => {
+                        let uuid = reader.read_argument()?.ok_or_else(|| anyhow!("UUID() needs a value"))?;
+                        format!(r#"{{"$uuid":{}}}"#, json_string(&uuid))
                     }
                     "NumberDecimal" | "Decimal128" => {
                         let number = reader.read_argument()?.ok_or_else(|| anyhow!("{identifier}() needs a number"))?;
@@ -236,6 +265,12 @@ mod tests {
         // A quote inside a string survives the rewrite.
         assert_eq!(parse_query(r#"{note: 'it\'s "fine"'}"#).unwrap(), doc! { "note": "it's \"fine\"" });
         assert!(parse_query("{$where: function() { return 1 }}").is_err());
+        assert!(parse_query("{a: 1, 'a': 2}").is_err());
+        assert!(parse_query("{a: {b: 1}, b: 2}").is_ok());
+        assert!(matches!(
+            parse_query("{id: UUID('00010203-0405-0607-0809-0a0b0c0d0e0f')}").unwrap().get("id"),
+            Some(Bson::Binary(binary)) if binary.bytes.len() == 16
+        ));
         assert!(parse_query("{a: 'unclosed}").is_err());
         assert!(parse_query("[1, 2]").is_err());
     }
