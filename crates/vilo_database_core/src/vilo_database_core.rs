@@ -4,6 +4,7 @@
 pub use mongodb::bson;
 
 pub mod display;
+pub mod edit;
 pub mod mongo;
 pub mod redis;
 pub mod shell;

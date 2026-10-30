@@ -237,6 +237,120 @@ fn walk_plan(plan: &Document, stages: &mut Vec<String>, indexes: &mut Vec<String
     }
 }
 
+/// Why a write did not report success. `Refused` means the server certainly did not apply it;
+/// `Unknown` means it may have, so the caller must check before trying again.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WriteError {
+    Refused(String),
+    Unknown(String),
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::Refused(message) => write!(formatter, "{message}"),
+            WriteError::Unknown(message) => {
+                write!(
+                    formatter,
+                    "The outcome is unknown ({message}). Reload to check before trying again."
+                )
+            }
+        }
+    }
+}
+
+fn classify(error: mongodb::error::Error) -> WriteError {
+    use mongodb::error::{ErrorKind, WriteFailure};
+    let message = error.to_string();
+    match *error.kind {
+        // Never left this machine, or the server answered no.
+        ErrorKind::ServerSelection { .. }
+        | ErrorKind::InvalidArgument { .. }
+        | ErrorKind::Authentication { .. }
+        | ErrorKind::Command(_)
+        | ErrorKind::Write(WriteFailure::WriteError(_)) => WriteError::Refused(message),
+        // A dropped connection or a write concern that timed out may still have applied the write.
+        _ => WriteError::Unknown(message),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UpdateOutcome {
+    pub matched: u64,
+    pub modified: u64,
+}
+
+impl MongoSession {
+    pub async fn find_by_id(
+        &self,
+        database: &str,
+        collection: &str,
+        id: &Bson,
+    ) -> Result<Option<Document>> {
+        Ok(self
+            .client
+            .database(database)
+            .collection::<Document>(collection)
+            .find_one(doc! { "_id": { "$eq": id.clone() } })
+            .await?)
+    }
+
+    /// One `updateOne`, sent once; see `edit::build_update` for the guard in `filter`.
+    pub async fn update_guarded(
+        &self,
+        database: &str,
+        collection: &str,
+        filter: Document,
+        update: Document,
+    ) -> Result<UpdateOutcome, WriteError> {
+        let result = self
+            .client
+            .database(database)
+            .collection::<Document>(collection)
+            .update_one(filter, update)
+            .await
+            .map_err(classify)?;
+        Ok(UpdateOutcome {
+            matched: result.matched_count,
+            modified: result.modified_count,
+        })
+    }
+
+    /// One `deleteOne`, sent once; returns how many documents went (0 when the guard failed).
+    pub async fn delete_guarded(
+        &self,
+        database: &str,
+        collection: &str,
+        filter: Document,
+    ) -> Result<u64, WriteError> {
+        let result = self
+            .client
+            .database(database)
+            .collection::<Document>(collection)
+            .delete_one(filter)
+            .await
+            .map_err(classify)?;
+        Ok(result.deleted_count)
+    }
+
+    /// One `insertOne`, sent once; returns the new document's `_id`.
+    pub async fn insert_document(
+        &self,
+        database: &str,
+        collection: &str,
+        document: Document,
+    ) -> Result<Bson, WriteError> {
+        let result = self
+            .client
+            .database(database)
+            .collection::<Document>(collection)
+            .insert_one(document)
+            .await
+            .map_err(classify)?;
+        Ok(result.inserted_id)
+    }
+}
+
 /// One top-level field across a sample of documents, as Compass's schema view lists it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldSummary {
@@ -800,5 +914,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seen, 1, "export follows the query's own skip, not paging");
+
+        // Guarded writes: an edit applies once, a stale edit is refused, delete checks the snapshot.
+        let writes = session
+            .client
+            .database("vilo_test")
+            .collection::<Document>("writes");
+        writes.drop().await.unwrap();
+        let id = session
+            .insert_document("vilo_test", "writes", doc! { "count": 1_i32, "name": "a" })
+            .await
+            .unwrap();
+        let original = session
+            .find_by_id("vilo_test", "writes", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut edited = original.clone();
+        edited.insert("count", 2_i32);
+        let (filter, update) = crate::edit::build_update(&original, &edited).unwrap();
+        let outcome = session
+            .update_guarded("vilo_test", "writes", filter.clone(), update.clone())
+            .await
+            .unwrap();
+        assert_eq!((outcome.matched, outcome.modified), (1, 1));
+        // The same edit again was made against a stale copy: the guard matches nothing.
+        let stale = session
+            .update_guarded("vilo_test", "writes", filter, update)
+            .await
+            .unwrap();
+        assert_eq!(stale.matched, 0);
+        // The server holds Int32 2; a copy that believes it is Int64 2 is stale, so its edit is refused.
+        let mut believed = edited.clone();
+        believed.insert("count", 2_i64);
+        let mut next = believed.clone();
+        next.insert("count", 3_i64);
+        let (filter, update) = crate::edit::build_update(&believed, &next).unwrap();
+        let mismatch = session
+            .update_guarded("vilo_test", "writes", filter, update)
+            .await
+            .unwrap();
+        assert_eq!(mismatch.matched, 0);
+        assert_eq!(
+            session
+                .delete_guarded(
+                    "vilo_test",
+                    "writes",
+                    crate::edit::build_delete(&original).unwrap()
+                )
+                .await
+                .unwrap(),
+            0,
+            "the snapshot is stale, so nothing is deleted"
+        );
+        let current = session
+            .find_by_id("vilo_test", "writes", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session
+                .delete_guarded(
+                    "vilo_test",
+                    "writes",
+                    crate::edit::build_delete(&current).unwrap()
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        let duplicate = session
+            .insert_document("vilo_test", "writes", doc! { "_id": 1 })
+            .await;
+        assert!(duplicate.is_ok());
+        assert!(matches!(
+            session
+                .insert_document("vilo_test", "writes", doc! { "_id": 1 })
+                .await,
+            Err(WriteError::Refused(_))
+        ));
     }
 }
