@@ -285,6 +285,8 @@ pub(crate) struct MongoTab {
     explain: Option<Fetch<ExplainResult>>,
     explain_raw: bool,
     indexes: Option<Fetch<Vec<Document>>>,
+    /// The document under the pointer, whose card shows its actions.
+    hovered_document: Option<usize>,
     /// Field paths seen in this collection, shared with the query fields' completions.
     fields: Rc<RefCell<Vec<String>>>,
     /// Filters the Indexes list by name or field.
@@ -377,6 +379,7 @@ impl MongoTab {
             explain_raw: false,
             indexes: None,
             open_indexes: HashSet::default(),
+            hovered_document: None,
             index_search: editor("Search indexes by name or field", "", false, window, cx),
             _subscriptions: Vec::new(),
             fields,
@@ -1266,10 +1269,17 @@ impl DatabaseView {
                 if let Some(tab) = this.tab_at(&database, &collection)
                     && tab.generation == generation
                 {
+                    let loaded = result.is_ok();
                     if let Ok(page) = &result {
                         tab.learn_fields(&page.documents);
                     }
                     tab.page = Some(fetched(result));
+                    // A fresh read shows what an unknown write did, so its lock can go.
+                    if loaded && let Some(active) = this.active.clone() {
+                        let prefix = format!("{active}/{database}/{collection}/");
+                        this.unknown_writes.retain(|key| !key.starts_with(&prefix));
+                        this.write_notice = None;
+                    }
                     cx.notify();
                 }
             })
@@ -1866,6 +1876,10 @@ impl DatabaseView {
         let view = cx.entity().downgrade();
         let colors = cx.theme().colors().clone();
         let count = rows.len();
+        let hovered = tab.hovered_document;
+        let writable = self
+            .active_connection()
+            .is_some_and(|connection| self.writes_allowed(connection));
         uniform_list("database-documents", count, move |range, _, cx| {
             range
                 .filter_map(|index| rows.get(index).cloned().map(|row| (index, row)))
@@ -1879,9 +1893,29 @@ impl DatabaseView {
                     }
                     let group = SharedString::from(format!("database-card-row-{index}"));
                     let document = row.document;
+                    let hover_view = view.clone();
                     let mut card = h_flex()
                         .id(("database-row", index))
                         .group(group.clone())
+                        .on_hover(move |is_hovered, _, cx| {
+                            hover_view
+                                .update(cx, |this, cx| {
+                                    if let Some(tab) = this.tab_mut() {
+                                        let next = if *is_hovered {
+                                            Some(document)
+                                        } else if tab.hovered_document == Some(document) {
+                                            None
+                                        } else {
+                                            tab.hovered_document
+                                        };
+                                        if tab.hovered_document != next {
+                                            tab.hovered_document = next;
+                                            cx.notify();
+                                        }
+                                    }
+                                })
+                                .ok();
+                        })
                         .w_full()
                         .h(px(ROW_HEIGHT))
                         .pr_3()
@@ -2101,6 +2135,55 @@ impl DatabaseView {
                         }
                     };
                     card = card.child(div().flex_1().min_w_0().child(content));
+                    if row.first && hovered == Some(document) {
+                        let id = documents
+                            .get(document)
+                            .and_then(|item| item.get("_id"))
+                            .cloned();
+                        let action =
+                            |name: &'static str,
+                             icon: IconName,
+                             tip: &'static str,
+                             op: crate::mongo_write::DocOp| {
+                                let view = view.clone();
+                                let id = id.clone();
+                                IconButton::new((name, document), icon)
+                                    .icon_size(IconSize::Small)
+                                    .style(ButtonStyle::Outlined)
+                                    .disabled(!writable || id.is_none())
+                                    .tooltip(Tooltip::text(if writable {
+                                        tip
+                                    } else {
+                                        "Switch writes on (top right) to change documents"
+                                    }))
+                                    .on_click(move |_, window, cx| {
+                                        let id = id.clone();
+                                        view.update(cx, |this, cx| {
+                                            this.start_doc_write(op, id, window, cx)
+                                        })
+                                        .ok();
+                                    })
+                            };
+                        card = card
+                            .child(action(
+                                "database-edit-document",
+                                IconName::Pencil,
+                                "Edit document",
+                                crate::mongo_write::DocOp::Edit,
+                            ))
+                            .child(action(
+                                "database-clone-document",
+                                IconName::FileMultiple,
+                                "Clone document",
+                                crate::mongo_write::DocOp::Insert,
+                            ))
+                            .child(action(
+                                "database-delete-document",
+                                IconName::Trash,
+                                "Delete document",
+                                crate::mongo_write::DocOp::Delete,
+                            ));
+                    }
                     if row.first {
                         let documents = documents.clone();
                         card = card.child(
@@ -2736,6 +2819,9 @@ impl DatabaseView {
     }
 
     fn render_toolbar(&self, tab: &MongoTab, cx: &mut Context<Self>) -> AnyElement {
+        let writable = self
+            .active_connection()
+            .is_some_and(|connection| self.writes_allowed(connection));
         let view = cx.entity().downgrade();
         let export = PopoverMenu::new("database-export")
             .trigger(
@@ -2815,15 +2901,22 @@ impl DatabaseView {
         h_flex()
             .gap_2()
             .child(
-                compass_primary("database-add-data", "ADD DATA", Some(IconName::Plus), true)
-                    .child(
-                        Icon::new(IconName::ChevronDown)
-                            .size(IconSize::XSmall)
-                            .color(Color::Custom(rgb(0xFFFFFF).into())),
-                    )
-                    .tooltip(Tooltip::text(
-                        "Adding and editing documents comes with the next release",
-                    )),
+                compass_primary(
+                    "database-add-data",
+                    "ADD DATA",
+                    Some(IconName::Plus),
+                    !writable,
+                )
+                .tooltip(Tooltip::text(if writable {
+                    "Insert a document"
+                } else {
+                    "Switch writes on (top right) to insert documents"
+                }))
+                .when(writable, |this| {
+                    this.on_click(cx.listener(|this, _, window, cx| {
+                        this.start_doc_write(crate::mongo_write::DocOp::Insert, None, window, cx)
+                    }))
+                }),
             )
             .child(
                 compass_button("database-bulk", "BULK", IconName::Copy)
@@ -3680,6 +3773,21 @@ impl DatabaseView {
                 .flex_1()
                 .min_h_0()
                 .gap_3()
+                .when_some(self.write_notice.clone(), |this, notice| {
+                    this.child(
+                        h_flex()
+                            .p_2()
+                            .gap_2()
+                            .rounded_md()
+                            .bg(cx.theme().status().warning_background)
+                            .child(
+                                Icon::new(IconName::Warning)
+                                    .size(IconSize::Small)
+                                    .color(Color::Warning),
+                            )
+                            .child(Label::new(notice).size(LabelSize::Small)),
+                    )
+                })
                 .child(self.render_query_bar(tab, cx))
                 .child(self.render_toolbar(tab, cx))
                 .child(match tab.panel {
@@ -3723,6 +3831,18 @@ impl DatabaseView {
                                     .color(if connection.production() { Color::Warning } else { Color::Muted }),
                             )
                             .child(div().flex_1())
+                            .child({
+                                let writable = self.writes_allowed(connection);
+                                Button::new("database-writes", if writable { "Writes on" } else { "Read only" })
+                                    .style(if writable { ButtonStyle::Tinted(ui::TintColor::Warning) } else { ButtonStyle::Outlined })
+                                    .start_icon(Icon::new(if writable { IconName::LockOff } else { IconName::Lock }).size(IconSize::Small))
+                                    .tooltip(Tooltip::text(if crate::mongo_write::guarded(connection) {
+                                        "Production (or no environment): writes switch off again when Vilo restarts, and each write needs the connection name typed."
+                                    } else {
+                                        "Allow editing, inserting and deleting documents on this connection."
+                                    }))
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_writes(cx)))
+                            })
                             .child(
                                 Button::new("database-open-shell", "Open MongoDB shell")
                                     .style(ButtonStyle::Outlined)

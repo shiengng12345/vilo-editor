@@ -1,4 +1,5 @@
 mod mongo_tab;
+mod mongo_write;
 mod redis_view;
 
 use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
@@ -82,6 +83,9 @@ struct Connection {
     site: String,
     /// e.g. CP QAT; shown on every page so results are never mistaken for another environment's.
     environment: String,
+    /// Saved only for non-production connections; production asks again on every run of Vilo.
+    #[serde(default)]
+    allow_writes: bool,
 }
 
 impl Connection {
@@ -329,6 +333,12 @@ pub struct DatabaseView {
     pattern: Entity<Editor>,
     workbench_input: Entity<Editor>,
     redis_state: Option<RedisState>,
+    doc_write: Option<mongo_write::DocWrite>,
+    /// Production connections with writes switched on for this run of Vilo only.
+    session_writes: collections::HashSet<String>,
+    /// Documents whose last write has an unknown outcome; writing to them waits for a refresh.
+    unknown_writes: collections::HashSet<String>,
+    write_notice: Option<SharedString>,
     /// While a page is open the site, environment and connection columns fold away; hovering the
     /// kind icons shows them over the page.
     rail_peek: bool,
@@ -451,6 +461,10 @@ impl DatabaseView {
                 cx,
             ),
             redis_state: None,
+            doc_write: None,
+            session_writes: Default::default(),
+            unknown_writes: Default::default(),
+            write_notice: None,
             rail_peek: false,
             query_language: None,
             hover_pick: None,
@@ -994,7 +1008,12 @@ impl DatabaseView {
             kind: form.kind,
             site: site.clone(),
             environment: environment.clone(),
+            // A new address starts with writes off again.
+            allow_writes: uri.is_empty() && existing.as_ref().is_some_and(|c| c.allow_writes),
         };
+        if !uri.is_empty() {
+            self.session_writes.remove(&connection.id);
+        }
         for (level, name) in [(Level::Site, site), (Level::Environment, environment)] {
             if !self.names[level as usize].contains(&name) {
                 self.names[level as usize].push(name.clone());
@@ -1838,6 +1857,8 @@ impl Render for DatabaseView {
         let naming = self.name_edit.is_some() || self.name_message.is_some();
         let dialog = if naming {
             Some((false, self.render_name_form(cx)))
+        } else if let Some(write) = &self.doc_write {
+            Some((write.editing(), self.render_doc_write(write, cx)))
         } else {
             self.form
                 .as_ref()
@@ -1947,6 +1968,10 @@ impl Render for DatabaseView {
                             if this.name_edit.is_some() || this.name_message.is_some() {
                                 this.name_edit = None;
                                 this.name_message = None;
+                            } else if let Some(write) = &this.doc_write {
+                                if !write.sending_now() {
+                                    this.doc_write = None;
+                                }
                             } else if closable {
                                 this.form = None;
                             }
