@@ -367,9 +367,6 @@ pub struct DatabaseView {
     session_writes: collections::HashSet<String>,
     /// Documents whose last write has an unknown outcome; writing to them waits for a refresh.
     unknown_writes: collections::HashSet<String>,
-    /// Channels with a publish that is still awaiting its answer or ended unknown, by lock key:
-    /// the operation that holds the lock, and whether its outcome is unknown (else pending).
-    publish_locks: HashMap<String, (String, bool)>,
     /// The write log was read since start, so locks of unsettled publishes are restored.
     write_log_checked: bool,
     write_notice: Option<SharedString>,
@@ -540,7 +537,6 @@ impl DatabaseView {
             admin_write: None,
             session_writes: Default::default(),
             unknown_writes: Default::default(),
-            publish_locks: Default::default(),
             write_log_checked: false,
             write_notice: None,
             dangling_writes: Vec::new(),
@@ -1961,12 +1957,13 @@ impl DatabaseView {
                             }
                             // A publish without a settled answer keeps its channel locked.
                             if let Some(lock) = lock {
-                                this.publish_locks
-                                    .insert(lock.clone(), (operation.clone(), true));
+                                redis_pubsub::recover_publish_lock(lock, operation);
                             }
                         }
+                        // A publish still awaiting its answer in this process is not unsettled.
                         this.dangling_writes = dangling
                             .into_iter()
+                            .filter(|(operation, ..)| !redis_pubsub::publish_pending(operation))
                             .map(|(operation, summary, ..)| (operation, summary))
                             .collect();
                         this.write_log_checked = true;
@@ -2056,9 +2053,7 @@ impl DatabaseView {
                                                     this.unlogged_writes.retain(|(operation, _)| {
                                                         !operations.contains(operation)
                                                     });
-                                                    this.publish_locks.retain(|_, (operation, _)| {
-                                                        !operations.contains(operation)
-                                                    });
+                                                    redis_pubsub::acknowledge_publishes(&operations);
                                                     this.audit_problem = None;
                                                 }
                                                 Err(error) => {
