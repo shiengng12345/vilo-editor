@@ -623,6 +623,7 @@ impl Php<'_> {
                 // A reference is not a value of its own for later references' numbering, but
                 // `r:` counts as one in PHP; both are kept as the value they point at.
                 if kind == b'r' {
+                    self.arena.entries(1)?;
                     self.values.push(target);
                 }
                 Ok(target)
@@ -633,6 +634,7 @@ impl Php<'_> {
                 let id = self.remember(Node::Map(Vec::new()))?;
                 let mut pairs = Vec::new();
                 for _ in 0..length {
+                    self.arena.entries(1)?;
                     let key = self.key()?;
                     let value = self.value(depth + 1)?;
                     pairs.push((key, value));
@@ -652,7 +654,9 @@ impl Php<'_> {
                 })?;
                 let mut fields = Vec::new();
                 for _ in 0..length {
+                    self.arena.entries(1)?;
                     let name = self.property_name()?;
+                    self.arena.charge(name.len())?;
                     let value = self.value(depth + 1)?;
                     fields.push((name, value));
                 }
@@ -938,6 +942,8 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 };
                 let raw = &bytes[at..at + length];
                 at += length + 1;
+                // Latin-1 can take two bytes per input byte as text.
+                arena.fits(raw.len().saturating_mul(2))?;
                 let Some(text) = raw_unicode_escape(raw) else {
                     return fail(at, "a UNICODE with a bad escape");
                 };
@@ -1027,11 +1033,12 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 };
                 let target = top(&stack, at)?;
                 arena.entries(items.len())?;
+                let target = match arena.nodes.get(target) {
+                    Some(Node::Object { .. }) => object_items(arena, target, false)?,
+                    _ => target,
+                };
                 match arena.get_mut(target)? {
                     Node::List(list) | Node::Set(list) => list.extend(items),
-                    Node::Object { fields, .. } => {
-                        fields.extend(items.into_iter().map(|item| ("item".to_string(), item)))
-                    }
                     _ => return fail(at, "items added to something that is not a list"),
                 }
             }
@@ -1048,13 +1055,12 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                     return fail(at, "a key with no value");
                 };
                 arena.entries(pairs.len())?;
+                let target = match arena.nodes.get(target) {
+                    Some(Node::Object { .. }) => object_items(arena, target, true)?,
+                    _ => target,
+                };
                 match arena.get_mut(target)? {
                     Node::Map(map) => map.extend(pairs),
-                    Node::Object { fields, .. } => fields.extend(
-                        pairs
-                            .into_iter()
-                            .map(|(_, value)| ("item".to_string(), value)),
-                    ),
                     _ => return fail(at, "entries set on something that is not a dict"),
                 }
             }
@@ -1345,7 +1351,9 @@ impl Java<'_> {
                     return self.error("a proxy with too many interfaces");
                 }
                 for _ in 0..count {
-                    names.push(self.utf(false)?);
+                    let name = self.utf(false)?;
+                    self.arena.charge(name.len() + 2)?;
+                    names.push(name);
                 }
                 self.annotations(depth + 1)?;
                 let parent = self.class_desc(depth + 1)?;
@@ -1631,6 +1639,31 @@ impl Java<'_> {
             other => self.error(&format!("unknown content 0x{other:02x}")),
         }
     }
+}
+
+/// The container an object built by a call keeps added items in (a map for SETITEM, a list
+/// for APPEND), shown as its `items` field, so keys and values stay together.
+fn object_items(arena: &mut Arena, object: Id, map: bool) -> Result<Id, String> {
+    if let Some(Node::Object { fields, .. }) = arena.nodes.get(object)
+        && let Some((_, id)) = fields.iter().find(|(name, id)| {
+            name == "items"
+                && matches!(
+                    (arena.nodes.get(*id), map),
+                    (Some(Node::Map(_)), true) | (Some(Node::List(_)), false)
+                )
+        })
+    {
+        return Ok(*id);
+    }
+    let items = arena.add(if map {
+        Node::Map(Vec::new())
+    } else {
+        Node::List(Vec::new())
+    })?;
+    if let Node::Object { fields, .. } = arena.get_mut(object)? {
+        fields.push(("items".to_string(), items));
+    }
+    Ok(items)
 }
 
 /// Key and value pairs from a flat run of items; `None` when one is left over.
@@ -2097,6 +2130,33 @@ mod tests {
         // A PHP length error does not quote the whole bad length.
         let long = format!("s:{}:\"\";", "9x".repeat(1_000_000));
         assert!(decode(Decoder::Php, long.as_bytes()).unwrap_err().len() < 200);
+    }
+
+    #[test]
+    fn test_more_growth_is_bounded() {
+        let mut properties = b"O:1:\"A\":1100000:{".to_vec();
+        for _ in 0..1_100_000 {
+            properties.extend_from_slice(b"s:0:\"\";r:1;");
+        }
+        properties.push(b'}');
+        assert!(
+            decode(Decoder::Php, &properties).is_err(),
+            "properties are counted"
+        );
+        let mut unicode = b"V".to_vec();
+        unicode.extend(std::iter::repeat_n(b'a', 70 * 1024 * 1024));
+        unicode.extend_from_slice(b"\n.");
+        assert!(
+            decode(Decoder::Pickle, &unicode)
+                .unwrap_err()
+                .contains("MB of text")
+        );
+        // python3: pickle.dumps(collections.OrderedDict(secret=7), protocol=2) keeps its key.
+        let ordered = hex(
+            "800263636f6c6c656374696f6e730a4f726465726564446963740a710029527101580600000073656372657471024b07732e",
+        );
+        let text = decode(Decoder::Pickle, &ordered).unwrap();
+        assert!(text.contains(r#""secret": 7"#), "{text}");
     }
 
     #[test]
