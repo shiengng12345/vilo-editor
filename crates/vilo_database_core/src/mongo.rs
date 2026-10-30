@@ -237,6 +237,70 @@ fn walk_plan(plan: &Document, stages: &mut Vec<String>, indexes: &mut Vec<String
     }
 }
 
+/// One top-level field across a sample of documents, as Compass's schema view lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldSummary {
+    pub name: String,
+    /// Documents in the sample that have the field.
+    pub present: usize,
+    /// BSON type names with how many documents hold each, most common first.
+    pub types: Vec<(&'static str, usize)>,
+}
+
+fn type_name(value: &Bson) -> &'static str {
+    match value {
+        Bson::Double(_) => "Double",
+        Bson::String(_) => "String",
+        Bson::Array(_) => "Array",
+        Bson::Document(_) => "Document",
+        Bson::Boolean(_) => "Boolean",
+        Bson::Null => "Null",
+        Bson::Int32(_) => "Int32",
+        Bson::Int64(_) => "Int64",
+        Bson::DateTime(_) => "Date",
+        Bson::ObjectId(_) => "ObjectId",
+        Bson::Decimal128(_) => "Decimal128",
+        Bson::Binary(_) => "Binary",
+        Bson::Timestamp(_) => "Timestamp",
+        Bson::RegularExpression(_) => "RegExp",
+        _ => "Other",
+    }
+}
+
+/// Fields in the sample, `_id` first and the rest by name.
+pub fn summarize_schema(documents: &[Document]) -> Vec<FieldSummary> {
+    let mut fields: Vec<FieldSummary> = Vec::new();
+    for document in documents {
+        for (key, value) in document {
+            let index = match fields.iter().position(|field| field.name == *key) {
+                Some(index) => index,
+                None => {
+                    fields.push(FieldSummary {
+                        name: key.clone(),
+                        present: 0,
+                        types: Vec::new(),
+                    });
+                    fields.len() - 1
+                }
+            };
+            let Some(field) = fields.get_mut(index) else {
+                continue;
+            };
+            field.present += 1;
+            let name = type_name(value);
+            match field.types.iter_mut().find(|(known, _)| *known == name) {
+                Some((_, count)) => *count += 1,
+                None => field.types.push((name, 1)),
+            }
+        }
+    }
+    for field in &mut fields {
+        field.types.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    }
+    fields.sort_by_key(|field| (field.name != "_id", field.name.to_lowercase()));
+    fields
+}
+
 pub fn summarize_explain(explain: &Document) -> ExplainSummary {
     let mut summary = ExplainSummary::default();
     if let Ok(stats) = explain.get_document("executionStats") {
@@ -467,6 +531,24 @@ pub fn to_display_json(document: &Document) -> String {
 mod tests {
     use super::*;
     use mongodb::bson::{Decimal128, oid::ObjectId};
+
+    #[test]
+    fn test_schema_summary() {
+        let documents = vec![
+            doc! { "_id": 1, "name": "a", "age": 3 },
+            doc! { "_id": 2, "name": "b", "age": "4" },
+            doc! { "_id": 3, "Zone": true },
+        ];
+        let fields = summarize_schema(&documents);
+        let names = fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["_id", "age", "name", "Zone"]);
+        assert_eq!(fields[1].present, 2);
+        assert_eq!(fields[1].types.len(), 2);
+        assert_eq!(fields[2].types, vec![("String", 2)]);
+    }
 
     #[test]
     fn test_explain_summary_and_write_stages() {

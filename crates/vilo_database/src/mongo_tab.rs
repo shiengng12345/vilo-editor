@@ -19,13 +19,14 @@ use gpui::{
     Window, prelude::*, rgb, uniform_list,
 };
 use serde::{Deserialize, Serialize};
-use ui::{
-    Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, TintColor, Tooltip, prelude::*,
-};
+use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
 use vilo_database_core::{
     bson::{Bson, Document},
     display::{Shown, ValueKind, human_date, show, to_canonical_json},
-    mongo::{ExplainSummary, FindRequest, Hint, summarize_explain, to_display_json},
+    mongo::{
+        ExplainSummary, FieldSummary, FindRequest, Hint, summarize_explain, summarize_schema,
+        to_display_json,
+    },
     shell::{parse_pipeline, parse_query},
 };
 
@@ -41,6 +42,9 @@ const ITEMS_SHOWN: usize = 100;
 const ROW_HEIGHT: f32 = 22.;
 const PAGE_SIZES: [u32; 6] = [10, 20, 25, 50, 75, 100];
 const HISTORY_PER_COLLECTION: usize = 30;
+/// Documents sampled for the schema view, as in Compass.
+const SCHEMA_SAMPLE: u32 = 1000;
+const COMPASS_GREEN: u32 = 0x00ED64;
 /// Compass's Max Time MS default.
 const DEFAULT_MAX_TIME: Duration = Duration::from_secs(60);
 
@@ -141,6 +145,10 @@ pub(crate) struct MongoTab {
     explain: Option<Fetch<ExplainResult>>,
     explain_raw: bool,
     indexes: Option<Fetch<Vec<Document>>>,
+    /// Index names whose definition is open in the Indexes list.
+    open_indexes: HashSet<String>,
+    /// The sample size and its fields.
+    schema: Option<Fetch<(usize, Vec<FieldSummary>)>>,
     options: Option<Fetch<Option<Document>>>,
     export: Option<Export>,
     expanded: HashSet<(usize, FieldPath)>,
@@ -204,6 +212,8 @@ impl MongoTab {
             explain: None,
             explain_raw: false,
             indexes: None,
+            open_indexes: HashSet::default(),
+            schema: None,
             options: None,
             export: None,
             expanded: HashSet::default(),
@@ -580,6 +590,54 @@ fn compass_primary(
                 .size(LabelSize::Small)
                 .weight(gpui::FontWeight::SEMIBOLD)
                 .color(text),
+        )
+}
+
+/// Compass's empty page: an icon, a green title, a line of text and its buttons.
+fn compass_empty(
+    icon: IconName,
+    title: &'static str,
+    body: &'static str,
+    buttons: Vec<AnyElement>,
+) -> AnyElement {
+    v_flex()
+        .pt_16()
+        .items_center()
+        .gap_3()
+        .child(
+            Icon::new(icon)
+                .size(IconSize::XLarge)
+                .color(Color::Custom(rgb(COMPASS_GREEN).into())),
+        )
+        .child(
+            Label::new(title)
+                .size(LabelSize::Large)
+                .weight(gpui::FontWeight::SEMIBOLD)
+                .color(Color::Custom(rgb(COMPASS_GREEN).into())),
+        )
+        .child(
+            div()
+                .max_w(px(460.))
+                .child(Label::new(body).color(Color::Muted)),
+        )
+        .child(h_flex().gap_2().children(buttons))
+        .into_any_element()
+}
+
+/// Compass's outlined pill, used for index types and properties.
+fn compass_pill(text: String, cx: &App) -> gpui::Div {
+    let colors = cx.theme().colors();
+    div()
+        .px_2()
+        .py_0p5()
+        .rounded_full()
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.element_background)
+        .child(
+            Label::new(text.to_uppercase())
+                .size(LabelSize::XSmall)
+                .weight(gpui::FontWeight::SEMIBOLD),
         )
 }
 
@@ -1033,6 +1091,62 @@ impl DatabaseView {
                     && tab.generation == generation
                 {
                     tab.aggregation = Some(fetched(result));
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn analyze_schema(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.mongo() else {
+            return;
+        };
+        let connection = self.generation;
+        let Some(tab) = self.tab_mut() else {
+            return;
+        };
+        let filter = match parse_query(&tab.filter.read(cx).text(cx)) {
+            Ok(filter) => filter,
+            Err(error) => {
+                tab.schema = Some(Fetch::Failed(format!("Filter: {error:#}").into()));
+                cx.notify();
+                return;
+            }
+        };
+        tab.generation += 1;
+        let generation = tab.generation;
+        tab.schema = Some(Fetch::Loading);
+        let (database, collection) = (tab.database.clone(), tab.collection.clone());
+        let task = {
+            let (database, collection) = (database.clone(), collection.clone());
+            run(cx, async move {
+                let pipeline = [
+                    vilo_database_core::bson::doc! { "$match": filter },
+                    vilo_database_core::bson::doc! { "$sample": { "size": i64::from(SCHEMA_SAMPLE) } },
+                ];
+                let page = session
+                    .aggregate_page(
+                        &database,
+                        &collection,
+                        &pipeline,
+                        0,
+                        SCHEMA_SAMPLE,
+                        QUERY_TIME_LIMIT,
+                    )
+                    .await?;
+                Ok((page.documents.len(), summarize_schema(&page.documents)))
+            })
+        };
+        tab.keep(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if this.generation == connection
+                    && let Some(tab) = this.tab_at(&database, &collection)
+                    && tab.generation == generation
+                {
+                    tab.schema = Some(fetched(result));
                     cx.notify();
                 }
             })
@@ -2622,15 +2736,64 @@ impl DatabaseView {
 
     fn render_indexes(&self, tab: &MongoTab, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
+        let toolbar = h_flex()
+            .gap_2()
+            .child(
+                compass_primary("database-index-create", "Create", None, true)
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Custom(rgb(0xFFFFFF).into())),
+                    )
+                    .tooltip(Tooltip::text(
+                        "Creating indexes comes with the next release",
+                    )),
+            )
+            .child(
+                Button::new("database-index-refresh", "Refresh")
+                    .style(ButtonStyle::Filled)
+                    .start_icon(Icon::new(IconName::RotateCw).size(IconSize::XSmall))
+                    .on_click(cx.listener(|this, _, _, cx| this.load_indexes(cx))),
+            )
+            .child(div().flex_1())
+            .child(
+                Label::new("VIEWING")
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::SEMIBOLD)
+                    .color(Color::Muted),
+            )
+            .child(
+                h_flex()
+                    .p_0p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .child(
+                        Button::new("database-index-regular", "INDEXES")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Filled)
+                            .toggle_state(true),
+                    )
+                    .child(
+                        Button::new("database-index-search", "SEARCH INDEXES")
+                            .label_size(LabelSize::Small)
+                            .disabled(true)
+                            .tooltip(Tooltip::text("Atlas Search indexes are not in Vilo yet")),
+                    ),
+            );
         let indexes = match &tab.indexes {
             None | Some(Fetch::Loading) => {
-                return Label::new("Loading indexes…")
-                    .color(Color::Muted)
+                return v_flex()
+                    .gap_3()
+                    .child(toolbar)
+                    .child(Label::new("Loading indexes…").color(Color::Muted))
                     .into_any_element();
             }
             Some(Fetch::Failed(message)) => {
-                return Label::new(message.clone())
-                    .color(Color::Error)
+                return v_flex()
+                    .gap_3()
+                    .child(toolbar)
+                    .child(Label::new(message.clone()).color(Color::Error))
                     .into_any_element();
             }
             Some(Fetch::Loaded(indexes)) => indexes,
@@ -2644,70 +2807,102 @@ impl DatabaseView {
                 None => div().flex_1().child(label),
             }
         };
-        let mut table = v_flex()
-            .rounded_md()
-            .border_1()
-            .border_color(colors.border)
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_2()
-                    .gap_3()
-                    .bg(colors.element_background)
-                    .child(header("Name & Definition", None))
-                    .child(header("Type", Some(120.)))
-                    .child(header("Properties", Some(260.))),
-            );
+        let mut table = v_flex().child(
+            h_flex()
+                .px_3()
+                .py_2()
+                .gap_3()
+                .border_b_2()
+                .border_color(colors.border)
+                .child(header("Name & Definition", None))
+                .child(header("Type", Some(120.)))
+                .child(header("Properties", Some(260.))),
+        );
         for index in indexes {
             let keys = index.get_document("key").cloned().unwrap_or_default();
-            let definition = keys
-                .iter()
-                .map(|(key, value)| format!("{key} {value}"))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let name = index.get_str("name").unwrap_or_default().to_string();
+            let open = tab.open_indexes.contains(&name);
+            let toggle = name.clone();
             table = table.child(
-                h_flex()
+                v_flex()
+                    .id(SharedString::from(format!("database-index-{name}")))
                     .px_3()
                     .py_2()
-                    .gap_3()
-                    .border_t_1()
+                    .gap_1()
+                    .border_b_1()
                     .border_color(colors.border_variant)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(tab) = this.tab_mut()
+                            && !tab.open_indexes.remove(&toggle)
+                        {
+                            tab.open_indexes.insert(toggle.clone());
+                        }
+                        cx.notify();
+                    }))
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
+                        h_flex()
+                            .gap_3()
                             .child(
-                                Label::new(index.get_str("name").unwrap_or_default().to_string())
-                                    .buffer_font(cx),
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(if open {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .size(IconSize::Small),
+                                    )
+                                    .child(Label::new(name.clone()).buffer_font(cx).truncate()),
                             )
                             .child(
-                                Label::new(definition)
+                                div()
+                                    .w(px(120.))
+                                    .flex_none()
+                                    .child(compass_pill(index_type(&keys).to_string(), cx)),
+                            )
+                            .child(
+                                h_flex()
+                                    .w(px(260.))
+                                    .flex_none()
+                                    .gap_1()
+                                    .flex_wrap()
+                                    .children(
+                                        index_properties(index)
+                                            .into_iter()
+                                            .map(|property| compass_pill(property, cx)),
+                                    ),
+                            ),
+                    )
+                    .when(open, |this| {
+                        this.child(
+                            div().pl_6().child(
+                                Label::new(to_display_json(&keys))
                                     .size(LabelSize::Small)
                                     .buffer_font(cx)
                                     .color(Color::Muted),
                             ),
-                    )
-                    .child(
-                        div()
-                            .w(px(120.))
-                            .flex_none()
-                            .child(Label::new(index_type(&keys)).size(LabelSize::Small)),
-                    )
-                    .child(
-                        div().w(px(260.)).flex_none().child(
-                            Label::new(index_properties(index).join(" · "))
-                                .size(LabelSize::Small)
-                                .color(Color::Accent),
-                        ),
-                    ),
+                        )
+                    }),
             );
         }
         v_flex()
-            .id("database-indexes")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .child(table)
+            .gap_3()
+            .child(toolbar)
+            .child(
+                v_flex()
+                    .id("database-indexes")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(table),
+            )
             .into_any_element()
     }
 
@@ -2736,65 +2931,270 @@ impl DatabaseView {
                     );
                     render_lines("database-validation", lines, &tab.scroll, cx)
                 }
-                Err(_) => v_flex()
-                    .pt_8()
-                    .items_center()
-                    .gap_2()
-                    .child(Headline::new("No validation rules").size(HeadlineSize::Small))
-                    .child(
-                        Label::new(
-                            "Documents in this collection are not checked against a schema.",
+                Err(_) => compass_empty(
+                    IconName::FileCode,
+                    "Create validation rules",
+                    "Generate rules via schema analysis from existing sample data or add them manually to enforce document structure during updates and inserts.",
+                    vec![
+                        compass_primary(
+                            "database-validation-generate",
+                            "Generate rules",
+                            None,
+                            true,
                         )
-                        .color(Color::Muted),
-                    )
-                    .into_any_element(),
+                        .tooltip(Tooltip::text(
+                            "Adding validation rules comes with the next release",
+                        ))
+                        .into_any_element(),
+                        compass_primary("database-validation-add", "Add rule", None, true)
+                            .tooltip(Tooltip::text(
+                                "Adding validation rules comes with the next release",
+                            ))
+                            .into_any_element(),
+                    ],
+                ),
             },
         }
     }
 
     fn render_aggregations(&self, tab: &MongoTab, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
+        let run = |this: &mut DatabaseView, cx: &mut Context<DatabaseView>| {
+            if let Some(tab) = this.tab_mut() {
+                tab.aggregation_skip = 0;
+            }
+            this.run_aggregation(cx);
+        };
+        let segment = |id: &'static str, label: &'static str, icon: IconName, selected: bool| {
+            Button::new(id, label)
+                .label_size(LabelSize::Small)
+                .start_icon(Icon::new(icon).size(IconSize::XSmall))
+                .style(if selected {
+                    ButtonStyle::Filled
+                } else {
+                    ButtonStyle::Subtle
+                })
+                .toggle_state(selected)
+        };
         v_flex()
             .flex_1()
             .min_h_0()
             .gap_3()
             .child(
-                v_flex()
+                h_flex()
                     .p_3()
                     .gap_2()
-                    .rounded_md()
+                    .items_start()
+                    .rounded_lg()
                     .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.editor_background)
+                    .border_color(colors.border_variant)
+                    .bg(colors.surface_background)
+                    .on_action(cx.listener(move |this, _: &menu::Confirm, _, cx| run(this, cx)))
+                    .child(div().flex_1().min_w_0().child(tab.pipeline.clone()))
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .child(Label::new("Pipeline").weight(gpui::FontWeight::SEMIBOLD))
-                            .child(
-                                Label::new("Read-only: $out and $merge are refused.")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                Button::new("database-run-pipeline", "Run")
-                                    .style(ButtonStyle::Tinted(TintColor::Success))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(tab) = this.tab_mut() {
-                                            tab.aggregation_skip = 0;
-                                        }
-                                        this.run_aggregation(cx);
-                                    })),
-                            ),
-                    )
-                    .child(tab.pipeline.clone()),
+                        compass_primary("database-run-pipeline", "Run", None, false)
+                            .on_click(cx.listener(move |this, _, _, cx| run(this, cx))),
+                    ),
             )
             .child(
                 h_flex()
+                    .gap_2()
+                    .child(Label::new("Untitled").color(Color::Muted))
+                    .child(
+                        compass_primary("database-save-pipeline", "SAVE", Some(IconName::Check), true)
+                            .tooltip(Tooltip::text("Saving pipelines comes with the next release")),
+                    )
+                    .child(
+                        Label::new("Read-only: $out and $merge are refused.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                     .child(div().flex_1())
-                    .child(self.render_pager(tab, true, cx)),
+                    .child(
+                        h_flex()
+                            .p_0p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .child(
+                                segment("database-pipeline-stages", "STAGES", IconName::Code, false)
+                                    .disabled(true)
+                                    .tooltip(Tooltip::text("The stage editor is not in Vilo yet")),
+                            )
+                            .child(segment("database-pipeline-text", "TEXT", IconName::Code, true)),
+                    ),
             )
-            .child(self.render_results(tab, tab.aggregation.as_ref(), cx))
+            .map(|this| match &tab.aggregation {
+                None => this.child(
+                    v_flex()
+                        .p_3()
+                        .gap_1()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.surface_background)
+                        .child(
+                            Label::new(match tab.estimated {
+                                Some(count) => format!("{count} Documents in the collection"),
+                                None => "Documents in the collection".to_string(),
+                            })
+                            .weight(gpui::FontWeight::SEMIBOLD),
+                        )
+                        .child(
+                            Label::new("Type a pipeline above, e.g. [ { $match: { status: 1 } } ], and Run it.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                ),
+                Some(_) => this
+                    .child(
+                        h_flex()
+                            .child(div().flex_1())
+                            .child(self.render_pager(tab, true, cx)),
+                    )
+                    .child(self.render_results(tab, tab.aggregation.as_ref(), cx)),
+            })
+            .into_any_element()
+    }
+
+    fn render_schema(&self, tab: &MongoTab, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let analyze =
+            |this: &mut DatabaseView, cx: &mut Context<DatabaseView>| this.analyze_schema(cx);
+        let untouched = tab.filter.read(cx).text(cx).trim().is_empty();
+        let bar = h_flex()
+            .p_3()
+            .gap_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.surface_background)
+            .on_action(cx.listener(move |this, _: &menu::Confirm, _, cx| analyze(this, cx)))
+            .child(div().flex_1().min_w_0().child(tab.filter.clone()))
+            .child(
+                Button::new("database-schema-reset", "Reset")
+                    .style(ButtonStyle::Filled)
+                    .disabled(untouched)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(tab) = this.tab_mut() {
+                            tab.filter
+                                .update(cx, |filter, cx| filter.set_text("", window, cx));
+                            tab.schema = None;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                compass_primary("database-schema-analyze", "Analyze", None, false)
+                    .on_click(cx.listener(move |this, _, _, cx| analyze(this, cx))),
+            );
+        let body = match &tab.schema {
+            None => compass_empty(
+                IconName::ListTree,
+                "Explore your schema",
+                "Quickly visualize your schema to understand the frequency, types and ranges of fields in your data set.",
+                vec![
+                    compass_primary("database-schema-start", "Analyze schema", None, false)
+                        .on_click(cx.listener(move |this, _, _, cx| analyze(this, cx)))
+                        .into_any_element(),
+                ],
+            ),
+            Some(Fetch::Loading) => Label::new(format!(
+                "Analyzing a sample of up to {SCHEMA_SAMPLE} documents…"
+            ))
+            .color(Color::Muted)
+            .into_any_element(),
+            Some(Fetch::Failed(message)) => Label::new(message.clone())
+                .color(Color::Error)
+                .into_any_element(),
+            Some(Fetch::Loaded((sampled, fields))) => {
+                let palette = [
+                    0x00ED64, 0x0498EC, 0xFFC010, 0xFF6960, 0xB45AF2, 0x71F6BA, 0x889397,
+                ];
+                let mut list = v_flex().gap_2().child(
+                    Label::new(format!(
+                        "This report is based on a sample of {sampled} document{}.",
+                        if *sampled == 1 { "" } else { "s" }
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                );
+                let total = (*sampled).max(1) as f32;
+                for field in fields {
+                    let mut strip = h_flex()
+                        .w_full()
+                        .h(px(8.))
+                        .rounded_sm()
+                        .overflow_hidden()
+                        .bg(colors.element_background);
+                    let mut legend = h_flex().gap_3().flex_wrap();
+                    for (index, (name, count)) in field.types.iter().enumerate() {
+                        let color = rgb(palette[index % palette.len()]);
+                        strip = strip.child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(*count as f32 / total))
+                                .bg(color),
+                        );
+                        legend = legend.child(
+                            h_flex()
+                                .gap_1()
+                                .child(div().size(px(8.)).rounded_full().bg(color))
+                                .child(
+                                    Label::new(format!(
+                                        "{name} {:.0}%",
+                                        *count as f32 * 100. / total
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                ),
+                        );
+                    }
+                    list = list.child(
+                        h_flex()
+                            .p_3()
+                            .gap_4()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .bg(colors.surface_background)
+                            .child(
+                                v_flex()
+                                    .w(px(220.))
+                                    .flex_none()
+                                    .child(
+                                        Label::new(field.name.clone())
+                                            .buffer_font(cx)
+                                            .weight(gpui::FontWeight::BOLD)
+                                            .truncate(),
+                                    )
+                                    .child(
+                                        Label::new(format!("in {} of {sampled}", field.present))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1p5()
+                                    .child(strip)
+                                    .child(legend),
+                            ),
+                    );
+                }
+                list.into_any_element()
+            }
+        };
+        v_flex()
+            .id("database-schema")
+            .flex_1()
+            .min_h_0()
+            .gap_3()
+            .overflow_y_scroll()
+            .child(bar)
+            .child(body)
             .into_any_element()
     }
 
@@ -2888,18 +3288,7 @@ impl DatabaseView {
                 })
                 .into_any_element(),
             SubTab::Aggregations => self.render_aggregations(tab, cx),
-            SubTab::Schema => v_flex()
-                .pt_8()
-                .items_center()
-                .gap_2()
-                .child(Headline::new("Schema analysis").size(HeadlineSize::Small))
-                .child(
-                    Label::new(
-                        "Not in Vilo yet. Use the Table view to compare fields across documents.",
-                    )
-                    .color(Color::Muted),
-                )
-                .into_any_element(),
+            SubTab::Schema => self.render_schema(tab, cx),
             SubTab::Indexes => self.render_indexes(tab, cx),
             SubTab::Validation => self.render_validation(tab, cx),
         };
