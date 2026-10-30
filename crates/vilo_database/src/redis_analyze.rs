@@ -316,45 +316,49 @@ fn render_report(analysis: &Analysis, colors: &theme::ThemeColors, cx: &App) -> 
             .filter(|total| *total > 0)
             .map(|total| format!(" ({}%)", node.scanned * 100 / total))
             .unwrap_or_default();
-        let unread = node
-            .first_unread_error
-            .as_ref()
-            .map(|error| format!("; {} keys could not be read ({error})", node.unread))
-            .unwrap_or_default();
-        let (text, color) = match &node.error {
-            Some(error) => (
-                format!("{}: stopped, {error}{unread}", node.label),
-                Color::Error,
-            ),
-            None if node.unread > 0 => (
-                format!(
-                    "{}: sampled {} of {total}{share}{unread}",
-                    node.label, node.scanned
-                ),
-                Color::Warning,
-            ),
-            None if node.finished => (
-                format!(
-                    "{}: every key visited, {} of {total}",
-                    node.label, node.scanned
-                ),
-                Color::Muted,
-            ),
-            None => (
-                format!("{}: sampled {} of {total}{share}", node.label, node.scanned),
-                Color::Muted,
-            ),
+        // Visited counts every key read or tried, including ones that vanished or could not be read.
+        let mut parts = vec![format!(
+            "{}: visited {} of {total}{share}",
+            node.label, node.scanned
+        )];
+        if node.finished {
+            parts.push("every key visited".to_string());
+        } else if node.scanned == 0
+            && node.total.is_none()
+            && node.total_error.is_none()
+            && node.error.is_none()
+            && analysis.stopped.is_some()
+        {
+            parts.push("not scanned: the analysis stopped first".to_string());
+        }
+        if let Some(error) = &node.total_error {
+            parts.push(format!("DBSIZE failed: {error}"));
+        }
+        if let Some(error) = &node.error {
+            parts.push(format!("scan stopped: {error}"));
+        }
+        if let Some(error) = &node.first_unread_error {
+            parts.push(format!("{} keys could not be read ({error})", node.unread));
+        }
+        let color = if node.error.is_some() {
+            Color::Error
+        } else if node.unread > 0 || node.total_error.is_some() {
+            Color::Warning
+        } else {
+            Color::Muted
         };
-        Label::new(text).size(LabelSize::Small).color(color)
+        Label::new(parts.join("; "))
+            .size(LabelSize::Small)
+            .color(color)
     });
+    let in_report = format!("{} keys in the report", analysis.sampled);
     v_flex()
         .gap_4()
         .child(
             v_flex()
                 .gap_1()
                 .child(Label::new(format!(
-                    "{} keys sampled · {} · {:.1} s",
-                    analysis.sampled,
+                    "{in_report} · {} · {:.1} s",
                     describe_size(analysis.memory),
                     analysis.elapsed.as_secs_f32()
                 )))

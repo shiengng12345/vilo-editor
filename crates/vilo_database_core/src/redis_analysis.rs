@@ -44,8 +44,9 @@ pub struct Bucket {
 pub struct NodeCoverage {
     pub label: String,
     pub scanned: u64,
-    /// DBSIZE when it answered.
+    /// DBSIZE when it answered, else why not.
     pub total: Option<u64>,
+    pub total_error: Option<String>,
     /// The node's SCAN came back to cursor 0, so every key it held was visited once.
     pub finished: bool,
     pub error: Option<String>,
@@ -243,6 +244,7 @@ impl RedisSession {
                 label: node.label.clone(),
                 scanned: 0,
                 total: None,
+                total_error: None,
                 finished: false,
                 error: None,
                 unread: 0,
@@ -299,10 +301,13 @@ impl RedisSession {
             }
         };
         check()?;
-        coverage.total = tokio::time::timeout_at(deadline, self.dbsize(node))
+        match tokio::time::timeout_at(deadline, self.dbsize(node))
             .await
             .map_err(|_| None)?
-            .ok();
+        {
+            Ok(total) => coverage.total = Some(total),
+            Err(error) => coverage.total_error = Some(format!("{error:#}")),
+        }
         // SCAN may return a key more than once while the server rehashes.
         let mut seen = HashSet::new();
         let mut cursor = "0".to_string();
@@ -551,6 +556,23 @@ mod tests {
         assert_eq!(no_type.sampled, 0);
         assert_eq!(no_type.vanished, 0);
         assert_eq!(no_type.nodes[0].unread, 25);
+        session
+            .call(
+                "ACL",
+                ["SETUSER", user, "+type", "-dbsize"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let no_total = limited.analyze(1_000, ":", &never).await;
+        assert_eq!(no_total.nodes[0].total, None);
+        assert!(
+            no_total.nodes[0].total_error.is_some(),
+            "a DBSIZE failure is kept"
+        );
+        assert_eq!(no_total.sampled, 25, "sampling goes on without DBSIZE");
         assert!(no_type.nodes[0].first_unread_error.is_some());
         limited.quit().await.unwrap();
         session
