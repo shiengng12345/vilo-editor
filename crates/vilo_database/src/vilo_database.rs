@@ -1894,7 +1894,21 @@ impl DatabaseView {
                     // The log is the record: a write whose result could not be logged has no result
                     // line there either, so the fresh list still holds it.
                     Ok(dangling) => {
-                        this.dangling_writes = dangling;
+                        // An administration write still to check keeps blocking new ones after a restart.
+                        let admin = [
+                            vilo_database_core::redis::AdminWrite::SlowlogReset.name(),
+                            vilo_database_core::redis::AdminWrite::SlowlogThreshold { micros: 0 }
+                                .name(),
+                        ];
+                        for (operation, _, kind) in &dangling {
+                            if admin.contains(&kind.as_str()) {
+                                this.admin_to_check.insert(operation.clone());
+                            }
+                        }
+                        this.dangling_writes = dangling
+                            .into_iter()
+                            .map(|(operation, summary, _)| (operation, summary))
+                            .collect();
                         this.audit_problem = None;
                     }
                     Err(error) => this.audit_problem = Some(

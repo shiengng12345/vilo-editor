@@ -102,10 +102,25 @@ pub(crate) fn slow_command(args: &[Vec<u8>], show_args: bool) -> String {
         .chain(rest.iter().map(|arg| quote_bytes(arg)))
         .collect::<Vec<_>>()
         .join(" ");
-    match text.char_indices().nth(240) {
+    match text.char_indices().nth(4000) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
         None => text,
     }
+}
+
+/// The whole command, every argument quoted, for copying.
+pub(crate) fn full_command(args: &[Vec<u8>]) -> String {
+    args.iter()
+        .enumerate()
+        .map(|(index, arg)| {
+            if index == 0 {
+                String::from_utf8_lossy(arg).to_uppercase()
+            } else {
+                quote_bytes(arg)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Clients matching every word of the filter, sorted with the longest idle (or oldest) first.
@@ -258,7 +273,7 @@ impl DatabaseView {
         cx: &mut Context<Self>,
     ) {
         if self
-            .unlogged_writes
+            .writes_to_check()
             .iter()
             .any(|(operation, _)| self.admin_to_check.contains(operation))
         {
@@ -747,9 +762,30 @@ impl DatabaseView {
                                         Label::new(slow_command(&entry.args, analyze.show_args))
                                             .size(LabelSize::Small)
                                             .buffer_font(cx)
-                                            .truncate(),
+                                            .when(!analyze.show_args, |label| label.truncate()),
                                     ),
                                 )
+                                .child({
+                                    let full = full_command(&entry.args);
+                                    IconButton::new(
+                                        SharedString::from(format!(
+                                            "database-slowlog-copy-{}-{}",
+                                            entry.node, entry.id
+                                        )),
+                                        IconName::Copy,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text(
+                                        "Copy the whole command with its arguments",
+                                    ))
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                full.clone(),
+                                            ))
+                                        },
+                                    )
+                                })
                                 .child(
                                     div().w(px(220.)).child(
                                         Label::new(format!(
@@ -985,7 +1021,10 @@ mod tests {
         assert_eq!(slow_command(&[b"ping".to_vec()], false), "PING");
         assert_eq!(slow_command(&[], false), "");
         let long = vec![b"set".to_vec(), vec![b'x'; 1000]];
-        assert!(slow_command(&long, true).chars().count() <= 241);
+        assert!(slow_command(&long, true).chars().count() <= 1008);
+        let script = vec![b"eval".to_vec(), vec![b'y'; 5000]];
+        assert!(slow_command(&script, true).ends_with('…'));
+        assert_eq!(full_command(&script).len(), "EVAL ".len() + 5002);
     }
 
     #[test]
