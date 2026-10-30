@@ -249,6 +249,11 @@ pub struct DatabaseView {
     pattern: Entity<Editor>,
     workbench_input: Entity<Editor>,
     redis_state: Option<RedisState>,
+    /// While a page is open the site, environment and connection columns fold away; hovering the
+    /// kind icons shows them over the page.
+    rail_peek: bool,
+    /// Pinned columns stay in place even while a page is open.
+    rail_pinned: bool,
     tasks: Vec<Task<()>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
@@ -364,6 +369,8 @@ impl DatabaseView {
                 cx,
             ),
             redis_state: None,
+            rail_peek: false,
+            rail_pinned: false,
             tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -971,12 +978,30 @@ impl DatabaseView {
                     ),
             );
         }
-
-        h_flex()
-            .h_full()
-            .child(kinds)
-            .child(self.render_names(Level::Site, cx))
-            .child(self.render_names(Level::Environment, cx))
+        kinds.child(div().flex_1()).child(
+            div().pb_2().child(
+                IconButton::new(
+                    "database-rail-pin",
+                    if self.rail_pinned {
+                        IconName::Unpin
+                    } else {
+                        IconName::Pin
+                    },
+                )
+                .icon_size(IconSize::Small)
+                .toggle_state(self.rail_pinned)
+                .tooltip(Tooltip::text(if self.rail_pinned {
+                    "Unpin: hide sites and connections while a page is open"
+                } else {
+                    "Pin sites and connections open"
+                }))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.rail_pinned = !this.rail_pinned;
+                    this.rail_peek = false;
+                    cx.notify();
+                })),
+            ),
+        )
     }
 
     /// A column as narrow as the kind icons; adding and renaming happen in a form in the page.
@@ -1582,14 +1607,33 @@ impl Render for DatabaseView {
             .color(Color::Muted)
             .into_any_element(),
         };
+        // Mongo folds once a collection is open; Redis has no collection step, so it folds on connect.
+        let folded = !self.rail_pinned
+            && full_bleed
+            && (self.tab().is_some() || matches!(self.session, Some(Session::Redis(_))));
         let colors = cx.theme().colors().clone();
         h_flex()
             .track_focus(&self.focus_handle)
             .relative()
             .size_full()
             .bg(colors.editor_background)
-            .child(self.render_rail(cx))
-            .child(self.render_sidebar(cx))
+            .child(
+                div()
+                    .id("database-kinds")
+                    .h_full()
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if folded && *hovered && !this.rail_peek {
+                            this.rail_peek = true;
+                            cx.notify();
+                        }
+                    }))
+                    .child(self.render_rail(cx)),
+            )
+            .when(!folded, |this| {
+                this.child(self.render_names(Level::Site, cx))
+                    .child(self.render_names(Level::Environment, cx))
+                    .child(self.render_sidebar(cx))
+            })
             // Mongo and Redis pages run edge to edge like Compass and RedisInsight.
             .child(
                 v_flex()
@@ -1599,6 +1643,26 @@ impl Render for DatabaseView {
                     .when(!full_bleed, |this| this.p_4())
                     .child(main),
             )
+            .when(folded && self.rail_peek, |this| {
+                this.child(
+                    h_flex()
+                        .id("database-rail-peek")
+                        .absolute()
+                        .top_0()
+                        .left(px(48.))
+                        .h_full()
+                        .shadow_lg()
+                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                            if !*hovered {
+                                this.rail_peek = false;
+                                cx.notify();
+                            }
+                        }))
+                        .child(self.render_names(Level::Site, cx))
+                        .child(self.render_names(Level::Environment, cx))
+                        .child(self.render_sidebar(cx)),
+                )
+            })
             .when_some(dialog, |this, (big, dialog)| {
                 this.child(
                     div()
