@@ -48,6 +48,9 @@ enum Node {
     Int(String),
     Float(f64),
     Text(String),
+    /// Text holding a lone surrogate (Python and Java allow them), kept as UTF-16 units so it
+    /// never equals ordinary text that merely spells the escape out.
+    Utf16(Vec<u16>),
     Bytes(Vec<u8>),
     List(Vec<Id>),
     Tuple(Vec<Id>),
@@ -75,6 +78,7 @@ fn text_size(node: &Node) -> usize {
     match node {
         Node::Text(text) | Node::Int(text) | Node::Name(text) => text.len(),
         Node::Bytes(bytes) => bytes.len(),
+        Node::Utf16(units) => units.len() * 2,
         Node::Custom(label, bytes) => label.len() + bytes.len(),
         Node::Object { class, fields } => {
             class.len() + fields.iter().map(|(name, _)| name.len()).sum::<usize>()
@@ -230,24 +234,43 @@ impl Output {
     /// reached instead of dropping it whole.
     fn push_text(&mut self, text: &str) {
         self.push("\"");
-        let mut buffer = [0; 4];
         for character in text.chars() {
             if self.cut {
                 return;
             }
-            match character {
-                '"' => self.push("\\\""),
-                '\\' => self.push("\\\\"),
-                '\n' => self.push("\\n"),
-                '\r' => self.push("\\r"),
-                '\t' => self.push("\\t"),
-                control if u32::from(control) < 0x20 => {
-                    self.push(&format!("\\u{:04x}", u32::from(control)))
-                }
-                character => self.push(character.encode_utf8(&mut buffer)),
+            self.push_char(character);
+        }
+        self.push("\"");
+    }
+
+    /// Like `push_text`, with each lone surrogate shown as \u{…}.
+    fn push_units(&mut self, units: &[u16]) {
+        self.push("\"");
+        for decoded in char::decode_utf16(units.iter().copied()) {
+            if self.cut {
+                return;
+            }
+            match decoded {
+                Ok(character) => self.push_char(character),
+                Err(error) => self.push(&format!("\\u{{{:x}}}", error.unpaired_surrogate())),
             }
         }
         self.push("\"");
+    }
+
+    fn push_char(&mut self, character: char) {
+        let mut buffer = [0; 4];
+        match character {
+            '"' => self.push("\\\""),
+            '\\' => self.push("\\\\"),
+            '\n' => self.push("\\n"),
+            '\r' => self.push("\\r"),
+            '\t' => self.push("\\t"),
+            control if u32::from(control) < 0x20 => {
+                self.push(&format!("\\u{:04x}", u32::from(control)))
+            }
+            character => self.push(character.encode_utf8(&mut buffer)),
+        }
     }
 
     /// Bytes quoted as `quote_bytes` writes them, escaped piece by piece like `push_text`.
@@ -323,6 +346,7 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
         Node::Int(number) => out.push(number),
         Node::Float(value) => out.push(&format_float(*value)),
         Node::Text(text) => out.push_text(text),
+        Node::Utf16(units) => out.push_units(units),
         Node::Bytes(bytes) => {
             out.push("b");
             out.push_bytes(bytes);
@@ -673,7 +697,6 @@ impl Php<'_> {
             }
             b'O' => {
                 let class = String::from_utf8_lossy(&self.sized()?).to_string();
-                self.arena.charge(class.len())?;
                 self.expect(b':')?;
                 let length = self.count(b':')?;
                 self.expect(b'{')?;
@@ -695,7 +718,6 @@ impl Php<'_> {
             }
             b'C' => {
                 let class = String::from_utf8_lossy(&self.sized()?).to_string();
-                self.arena.charge(class.len())?;
                 self.expect(b':')?;
                 let length = self.count(b':')?;
                 self.expect(b'{')?;
@@ -995,7 +1017,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 let data = take!(length as usize).to_vec();
                 let node = match opcode {
                     b'X' => match python_text(&data) {
-                        Some(text) => Node::Text(text),
+                        Some(node) => node,
                         None => return fail(at, "text that is not UTF-8"),
                     },
                     b'B' => Node::Bytes(data),
@@ -1013,7 +1035,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 let node = match opcode {
                     b'C' => Node::Bytes(data),
                     0x8c => match python_text(&data) {
-                        Some(text) => Node::Text(text),
+                        Some(node) => node,
                         None => return fail(at, "text that is not UTF-8"),
                     },
                     _ => match String::from_utf8(data) {
@@ -1030,7 +1052,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 let data = take!(length).to_vec();
                 let node = if opcode == 0x8d {
                     match python_text(&data) {
-                        Some(text) => Node::Text(text),
+                        Some(node) => node,
                         None => return fail(at, "text that is not UTF-8"),
                     }
                 } else {
@@ -1319,6 +1341,18 @@ impl Java<'_> {
         Ok(modified_utf8(self.take(length)?))
     }
 
+    /// A string object's text as UTF-16 units, as Java holds it.
+    fn utf_units(&mut self, long: bool) -> Result<Vec<u16>, String> {
+        let length = if long {
+            usize::try_from(u64::from_be_bytes(self.array()?))
+                .or_else(|_| self.error("too long"))?
+        } else {
+            usize::from(u16::from_be_bytes(self.array()?))
+        };
+        self.arena.fits(length.saturating_mul(2))?;
+        Ok(modified_utf8_units(self.take(length)?))
+    }
+
     fn read_all(mut self) -> Result<Id, String> {
         if self.take(4)? != [0xAC, 0xED, 0x00, 0x05] {
             return Err("not Java serialized data: it does not start with AC ED 00 05".into());
@@ -1450,10 +1484,10 @@ impl Java<'_> {
             b'C' => {
                 let unit = u16::from_be_bytes(self.array()?);
                 // A lone surrogate is a valid Java char but no character; it stays visible.
-                Node::Text(char::from_u32(u32::from(unit)).map_or_else(
-                    || format!("\\u{{{unit:x}}}"),
-                    |character| character.to_string(),
-                ))
+                match char::from_u32(u32::from(unit)) {
+                    Some(character) => Node::Text(character.to_string()),
+                    None => Node::Utf16(vec![unit]),
+                }
             }
             b'D' => Node::Float(f64::from_be_bytes(self.array()?)),
             b'F' => Node::Float(f64::from(f32::from_be_bytes(self.array()?))),
@@ -1514,8 +1548,12 @@ impl Java<'_> {
                 Handle::Class(class) => self.arena.add(Node::Name(format!("class {}", class.name))),
             },
             0x74 | 0x7C => {
-                let text = self.utf(code == 0x7C)?;
-                let id = self.arena.add(Node::Text(text))?;
+                let units = self.utf_units(code == 0x7C)?;
+                let node = match String::from_utf16(&units) {
+                    Ok(text) => Node::Text(text),
+                    Err(_) => Node::Utf16(units),
+                };
+                let id = self.arena.add(node)?;
                 self.handle(Handle::Value(id));
                 Ok(id)
             }
@@ -1729,23 +1767,28 @@ fn is_integer(text: &str) -> bool {
 
 /// Python text as pickled: UTF-8 with surrogates passed through (Python allows lone
 /// surrogates in a str), which stay visible as \u{…}. Anything else that is not UTF-8 is `None`.
-fn python_text(bytes: &[u8]) -> Option<String> {
-    let mut out = String::new();
+fn python_text(bytes: &[u8]) -> Option<Node> {
+    let mut units: Vec<u16> = Vec::new();
+    let mut lone = false;
     let mut rest = bytes;
     loop {
         match std::str::from_utf8(rest) {
             Ok(text) => {
-                out.push_str(text);
-                return Some(out);
+                if !lone {
+                    return Some(Node::Text(String::from_utf8(bytes.to_vec()).ok()?));
+                }
+                units.extend(text.encode_utf16());
+                return Some(Node::Utf16(units));
             }
             Err(error) => {
                 let (valid, after) = rest.split_at(error.valid_up_to());
-                out.push_str(std::str::from_utf8(valid).ok()?);
+                units.extend(std::str::from_utf8(valid).ok()?.encode_utf16());
                 match after {
                     [0xED, second @ 0xA0..=0xBF, third @ 0x80..=0xBF, ..] => {
-                        let unit =
-                            0xD000 | (u32::from(second & 0x3F) << 6) | u32::from(third & 0x3F);
-                        out.push_str(&format!("\\u{{{unit:x}}}"));
+                        units.push(
+                            0xD000 | (u16::from(second & 0x3F) << 6) | u16::from(third & 0x3F),
+                        );
+                        lone = true;
                         rest = &after[3..];
                     }
                     _ => return None,
@@ -1847,6 +1890,9 @@ fn raw_unicode_escape(bytes: &[u8]) -> Option<String> {
 /// one key whatever their type (1, 1.0 and True), text and bytes by content, tuples by their
 /// items. Keys this cannot compare (objects) are never merged.
 fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
+    /// Keys larger than this are shown as they are but not compared with others; comparing
+    /// nested shared tuples could otherwise take unbounded memory.
+    const MAX_KEY: usize = 4096;
     if depth > 16 {
         return None;
     }
@@ -1858,8 +1904,15 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
         Node::Float(value) if value.fract() == 0.0 && value.abs() < 1e30 => {
             format!("i{}", *value as i128).into_bytes()
         }
+        // NaN equals nothing, not even another NaN, so NaN keys are never merged.
+        Node::Float(value) if value.is_nan() => return None,
         Node::Float(value) => format!("f{}", value.to_bits()).into_bytes(),
+        Node::Text(text) if text.len() > MAX_KEY => return None,
         Node::Text(text) => [b"s".as_slice(), text.as_bytes()].concat(),
+        Node::Utf16(units) => std::iter::once(b'u')
+            .chain(units.iter().flat_map(|unit| unit.to_le_bytes()))
+            .collect(),
+        Node::Bytes(bytes) if bytes.len() > MAX_KEY => return None,
         Node::Bytes(bytes) => [b"b".as_slice(), bytes].concat(),
         Node::Tuple(items) => {
             let mut key = b"(".to_vec();
@@ -1867,6 +1920,9 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
                 let part = dict_key(arena, *item, depth + 1)?;
                 key.extend_from_slice(&part.len().to_le_bytes());
                 key.extend_from_slice(&part);
+                if key.len() > MAX_KEY {
+                    return None;
+                }
             }
             key
         }
@@ -1908,6 +1964,16 @@ fn set_items(
 /// Java's modified UTF-8: NUL as C0 80, characters outside the BMP as two 3-byte surrogates.
 /// A lone surrogate or a broken sequence is kept visible as \u{…} rather than replaced.
 fn modified_utf8(bytes: &[u8]) -> String {
+    char::decode_utf16(modified_utf8_units(bytes))
+        .map(|decoded| match decoded {
+            Ok(character) => character.to_string(),
+            Err(error) => format!("\\u{{{:x}}}", error.unpaired_surrogate()),
+        })
+        .collect()
+}
+
+/// Java's modified UTF-8 as UTF-16 units; a broken sequence becomes U+FFFD.
+fn modified_utf8_units(bytes: &[u8]) -> Vec<u16> {
     let mut units = Vec::new();
     let mut at = 0;
     while let Some(&first) = bytes.get(at) {
@@ -1944,12 +2010,7 @@ fn modified_utf8(bytes: &[u8]) -> String {
             }
         }
     }
-    char::decode_utf16(units.iter().copied())
-        .map(|decoded| match decoded {
-            Ok(character) => character.to_string(),
-            Err(error) => format!("\\u{{{:x}}}", error.unpaired_surrogate()),
-        })
-        .collect()
+    units
 }
 
 #[cfg(test)]
@@ -2349,7 +2410,7 @@ mod tests {
         assert!(
             decode(Decoder::Java, &lone)
                 .unwrap()
-                .contains(r#"\\u{d83d}"#)
+                .contains(r#""\u{d83d}""#)
         );
         // One object with many BUILD states, then many APPENDs to it: no per-append field search.
         let mut work = b"cm\nC\n)R\x94".to_vec();
@@ -2374,7 +2435,7 @@ mod tests {
                 &hex("80049507000000000000008c03eda080942e")
             )
             .unwrap(),
-            r#""\\u{d800}""#
+            r#""\u{d800}""#
         );
         assert!(
             decode(Decoder::Pickle, b"\x8c\x01\xff.").is_err(),
@@ -2436,6 +2497,40 @@ mod tests {
         );
         let property = decode(Decoder::Php, b"O:1:\"A\":1:{s:1:\"\xff\";i:1;}").unwrap();
         assert!(property.contains(r#""\xff": 1"#), "{property}");
+    }
+
+    #[test]
+    fn test_keys_python_keeps_apart() {
+        // python3: {chr(0xd800): 1, "\\u{d800}": 2} has two keys, and so does
+        // {float("nan"): 1, float("nan"): 2}.
+        let surrogate = decode(
+            Decoder::Pickle,
+            &hex("8004951a000000000000007d94288c03eda080944b018c085c757b643830307d944b02752e"),
+        )
+        .unwrap();
+        assert!(
+            surrogate.contains(": 1") && surrogate.contains(": 2"),
+            "{surrogate}"
+        );
+        let nan = decode(
+            Decoder::Pickle,
+            &hex("8004951b000000000000007d9428477ff80000000000004b01477ff80000000000004b02752e"),
+        )
+        .unwrap();
+        assert!(nan.contains(": 1") && nan.contains(": 2"), "{nan}");
+        // A key of nested shared tuples is not expanded to compare it.
+        let mut nested = b"\x80\x04}\x94".to_vec();
+        nested.push(0x8d);
+        nested.extend_from_slice(&(1_000_000_u64).to_le_bytes());
+        nested.extend(std::iter::repeat_n(b'a', 1_000_000));
+        nested.extend_from_slice(&[0x94, b'0']);
+        for index in 1..=15_u8 {
+            nested.extend_from_slice(&[b'h', index, b'h', index, 0x86, 0x94, b'0']);
+        }
+        nested.extend_from_slice(b"h\x10K\x01s.");
+        let started = std::time::Instant::now();
+        assert!(decode(Decoder::Pickle, &nested).is_ok());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
