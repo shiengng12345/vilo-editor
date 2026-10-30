@@ -2295,6 +2295,7 @@ broken line";
         let Ok(url) = std::env::var("VILO_TEST_REDIS_CLUSTER") else {
             return;
         };
+        let _cluster = crate::CLUSTER_TESTS.lock().await;
         let session = RedisSession::connect(&url).await.unwrap();
         assert!(session.is_clustered());
         let nodes = session.cluster_nodes().await.unwrap().unwrap();

@@ -16,3 +16,7 @@ pub mod redis_pubsub;
 pub mod redis_search;
 pub mod redis_workbench;
 pub mod shell;
+
+/// A cluster has only database 0, so tests that change or count its keys run one at a time.
+#[cfg(test)]
+pub(crate) static CLUSTER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

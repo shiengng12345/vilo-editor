@@ -185,6 +185,37 @@ impl DatabaseView {
             cx.notify();
             return;
         }
+        // Keys already waiting for a check refuse the whole batch, before its first command.
+        let locked = run_state
+            .commands
+            .iter()
+            .filter(|(_, _, planned)| match planned {
+                Planned::Write(write) => write.keys.iter().any(|key| {
+                    self.unknown_writes.contains(&crate::redis_write::lock_key(
+                        &connection.id,
+                        database,
+                        key,
+                    ))
+                }),
+                Planned::Read(_) => false,
+            })
+            .map(|(number, ..)| number.to_string())
+            .collect::<Vec<_>>();
+        let Some(run_state) = &mut self.workbench_run else {
+            return;
+        };
+        if !locked.is_empty() {
+            run_state.outcome = Some((
+                format!(
+                    "Nothing ran: line {} writes keys whose last write has an unknown outcome. Refresh those keys to check them first.",
+                    locked.join(", ")
+                )
+                .into(),
+                Color::Error,
+            ));
+            cx.notify();
+            return;
+        }
         run_state
             .typed
             .update(cx, |typed, cx| typed.set_text("", window, cx));

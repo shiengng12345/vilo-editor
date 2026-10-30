@@ -396,6 +396,7 @@ mod tests {
         let Ok(url) = std::env::var("VILO_TEST_REDIS_CLUSTER") else {
             return;
         };
+        let _cluster = crate::CLUSTER_TESTS.lock().await;
         let session = RedisSession::connect(&url).await.unwrap();
         let mut patterns = session
             .subscribe(Subscribe::Patterns, vec!["vilo_test.cps.*".into()])

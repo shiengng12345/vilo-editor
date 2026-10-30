@@ -173,6 +173,7 @@ pub fn plan(words: Vec<Bytes>) -> Result<Planned> {
         );
     }
     let args = words.get(1..).unwrap_or_default();
+    check_shape(&name, args)?;
     let keys = match keys {
         Keys::First => args.first().into_iter().cloned().collect::<Vec<_>>(),
         Keys::FirstTwo => {
@@ -185,7 +186,7 @@ pub fn plan(words: Vec<Bytes>) -> Result<Planned> {
         Keys::All => args.to_vec(),
         Keys::Pairs => {
             anyhow::ensure!(
-                !args.is_empty() && args.len() % 2 == 0,
+                !args.is_empty() && args.len().is_multiple_of(2),
                 "{name} needs keys and values in pairs."
             );
             args.iter().step_by(2).cloned().collect()
@@ -193,6 +194,91 @@ pub fn plan(words: Vec<Bytes>) -> Result<Planned> {
     };
     anyhow::ensure!(!keys.is_empty(), "{name} needs a key.");
     Ok(Planned::Write(WorkbenchWrite { name, words, keys }))
+}
+
+/// How arguments group, and how many some commands take at most: errors Redis would refuse a
+/// line for, checked before anything runs. Option words themselves are checked by the server
+/// when the line runs.
+fn check_shape(name: &str, args: &[Bytes]) -> Result<()> {
+    let word = |arg: &Bytes| String::from_utf8_lossy(arg).to_ascii_uppercase();
+    let at_most = |limit: usize| {
+        anyhow::ensure!(
+            args.len() <= limit,
+            "{name} takes at most {limit} arguments; this line has {}.",
+            args.len()
+        );
+        anyhow::Ok(())
+    };
+    // The arguments after the key, past any leading option words.
+    let after_options = |options: &[&str]| {
+        let mut rest = args.get(1..).unwrap_or_default();
+        while let Some((first, tail)) = rest.split_first() {
+            if !options.contains(&word(first).as_str()) {
+                break;
+            }
+            rest = tail;
+        }
+        rest
+    };
+    match name {
+        "HSET" | "HMSET" => anyhow::ensure!(
+            args.len().saturating_sub(1).is_multiple_of(2),
+            "{name} needs fields and values in pairs after the key."
+        ),
+        "LPOP" | "RPOP" | "SPOP" | "ZPOPMIN" | "ZPOPMAX" | "JSON.DEL" | "JSON.FORGET"
+        | "JSON.CLEAR" => at_most(2)?,
+        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "JSON.STRAPPEND" | "JSON.ARRPOP" => {
+            at_most(3)?
+        }
+        "ZADD" => {
+            let pairs = after_options(&["NX", "XX", "GT", "LT", "CH", "INCR"]);
+            anyhow::ensure!(
+                !pairs.is_empty() && pairs.len().is_multiple_of(2),
+                "ZADD needs scores and members in pairs."
+            );
+        }
+        "GEOADD" => {
+            let triples = after_options(&["NX", "XX", "CH"]);
+            anyhow::ensure!(
+                !triples.is_empty() && triples.len().is_multiple_of(3),
+                "GEOADD needs longitude, latitude and member in threes."
+            );
+        }
+        "XADD" => {
+            let mut rest = after_options(&["NOMKSTREAM"]);
+            if let Some((first, tail)) = rest.split_first()
+                && matches!(word(first).as_str(), "MAXLEN" | "MINID")
+            {
+                rest = tail;
+                if let Some((mark, tail)) = rest.split_first()
+                    && matches!(mark.as_slice(), b"=" | b"~")
+                {
+                    rest = tail;
+                }
+                let (_, tail) = rest
+                    .split_first()
+                    .context("XADD needs a threshold after MAXLEN or MINID.")?;
+                rest = tail;
+                if let Some((first, tail)) = rest.split_first()
+                    && word(first) == "LIMIT"
+                {
+                    let (_, tail) = tail
+                        .split_first()
+                        .context("XADD needs a count after LIMIT.")?;
+                    rest = tail;
+                }
+            }
+            let (_, fields) = rest
+                .split_first()
+                .context("XADD needs an entry id, such as *.")?;
+            anyhow::ensure!(
+                !fields.is_empty() && fields.len().is_multiple_of(2),
+                "XADD needs fields and values in pairs after the id."
+            );
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Parses a command file: one command per line as the Workbench takes it; empty lines and lines
@@ -285,6 +371,17 @@ mod tests {
         assert_eq!(keys("MSET a 1 b 2"), vec![b"a".to_vec(), b"b".to_vec()]);
         assert_eq!(keys("RENAME a b"), vec![b"a".to_vec(), b"b".to_vec()]);
         assert_eq!(keys("json.set doc $ 1"), vec![b"doc".to_vec()]);
+        for line in [
+            "HSET h a 1 b 2",
+            "ZADD z NX CH 1 a 2 b",
+            "GEOADD g XX 13.3 38.1 palermo",
+            "XADD s NOMKSTREAM MAXLEN ~ 100 LIMIT 10 * f v g w",
+            "XADD s MINID = 0-1 1-1 f v",
+            "LPOP l 3",
+            "EXPIRE k 10 GT",
+        ] {
+            assert!(plan(words(line)).is_ok(), "{line}");
+        }
         assert!(matches!(plan(words("GET a")).unwrap(), Planned::Read(_)));
 
         for (line, reason) in [
@@ -308,9 +405,29 @@ mod tests {
             ("INCR a b", "takes 1 argument; this line has 2"),
             ("LINSERT l BEFORE x", "takes 4 arguments"),
             ("JSON.SET doc $", "at least 3 arguments"),
+            ("HSET h field value orphan", "in pairs after the key"),
+            ("LPOP l 1 extra", "at most 2 arguments"),
+            ("EXPIRE k 10 NX extra", "at most 3 arguments"),
+            ("ZADD z NX 1", "scores and members in pairs"),
+            ("ZADD z 1 a 2", "scores and members in pairs"),
+            ("GEOADD g 1 2 m 3", "in threes"),
+            ("XADD s * f v g", "pairs after the id"),
+            ("XADD s NOMKSTREAM NOMKSTREAM MAXLEN", "threshold after MAXLEN"),
+            ("XADD s MAXLEN ~ 10 LIMIT", "count after LIMIT"),
         ] {
             let error = format!("{:#}", plan(words(line)).unwrap_err());
             assert!(error.contains(reason), "{line}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_no_reviewed_write_passes_as_a_read() {
+        for (name, ..) in WRITE_COMMANDS {
+            assert_eq!(
+                crate::redis::classify(name),
+                CommandKind::Write,
+                "{name} would skip the confirm step and the log"
+            );
         }
     }
 
@@ -336,6 +453,11 @@ mod tests {
             short.contains("line 2"),
             "a short later line refuses the file: {short}"
         );
+        let grouped = format!(
+            "{:#}",
+            parse_command_file("SET a 1\nHSET h field value orphan\n").unwrap_err()
+        );
+        assert!(grouped.contains("line 2"), "{grouped}");
         assert!(parse_command_file(&"#".repeat(MAX_FILE_BYTES as usize + 1)).is_err());
         assert!(error.contains("line 2") && error.contains("line 3") && error.contains("line 4"));
         assert!(parse_command_file("# only a comment\n").is_err());
@@ -381,6 +503,7 @@ mod tests {
         let Ok(url) = std::env::var("VILO_TEST_REDIS_CLUSTER") else {
             return;
         };
+        let _cluster = crate::CLUSTER_TESTS.lock().await;
         let session = RedisSession::connect(&url).await.unwrap();
         let run = |line: &str| {
             let Planned::Write(write) = plan(words(line)).unwrap() else {

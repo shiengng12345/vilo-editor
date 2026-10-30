@@ -302,6 +302,7 @@ mod tests {
         let Ok(url) = std::env::var("VILO_TEST_REDIS_CLUSTER") else {
             return;
         };
+        let _cluster = crate::CLUSTER_TESTS.lock().await;
         let session = RedisSession::connect(&url).await.unwrap();
         fill(&session, "vilo_test:bulk:", 300).await;
         let preview = session

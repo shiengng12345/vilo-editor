@@ -716,6 +716,7 @@ mod tests {
         let Ok(url) = std::env::var("VILO_TEST_REDIS_CLUSTER") else {
             return;
         };
+        let _cluster = crate::CLUSTER_TESTS.lock().await;
         let session = RedisSession::connect(&url).await.unwrap();
         let nodes = session.scan_nodes();
         assert!(nodes.len() > 1);
