@@ -22,7 +22,6 @@ use mongo_tab::{MongoTab, SavedQuery, load_history};
 use workspace::Workspace;
 
 const MODULE_ID: &str = "database";
-const PAGE_SIZES: [u32; 3] = [25, 50, 100];
 const SCAN_COUNT: u32 = 200;
 const QUERY_TIME_LIMIT: Duration = Duration::from_secs(30);
 /// Counting can be slow on big collections; past this the total is simply not shown.
@@ -35,7 +34,8 @@ pub fn init(cx: &mut App) {
             "icons/vilo/codicons/database.svg",
             "Database",
             |window, cx| {
-                let view = cx.new(|cx| DatabaseView::new(window, cx));
+                let workspace = cx.entity().downgrade();
+                let view = cx.new(|cx| DatabaseView::new(workspace, window, cx));
                 let focus_handle = view.focus_handle(cx);
                 (view.into(), focus_handle)
             },
@@ -125,6 +125,8 @@ struct KeyDetail {
 
 pub struct DatabaseView {
     focus_handle: FocusHandle,
+    /// For opening mongosh in a Vilo terminal.
+    workspace: gpui::WeakEntity<Workspace>,
     path: PathBuf,
     connections: Vec<Connection>,
     active: Option<String>,
@@ -207,7 +209,7 @@ async fn connect(connection: &Connection, uri: String, cx: &AsyncApp) -> Result<
 }
 
 impl DatabaseView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(workspace: gpui::WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let path = paths::config_dir().join("database_connections.json");
         let connections = std::fs::read(&path)
             .ok()
@@ -230,6 +232,7 @@ impl DatabaseView {
         })];
         let mut view = Self {
             focus_handle: cx.focus_handle(),
+            workspace,
             path,
             connections,
             active: None,
@@ -998,6 +1001,7 @@ impl DatabaseView {
 impl Render for DatabaseView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connection = self.active_connection().cloned();
+        let full_bleed = self.form.is_none() && matches!(self.session, Some(Session::Mongo(_)));
         let main = match (&self.form, &connection, &self.session) {
             (Some(form), _, _) => self.render_form(form, cx),
             (None, Some(connection), Some(Session::Mongo(_))) => self.render_mongo(connection, cx),
@@ -1014,7 +1018,8 @@ impl Render for DatabaseView {
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.render_sidebar(cx))
-            .child(v_flex().flex_1().min_w_0().h_full().p_4().child(main))
+            // Mongo pages run edge to edge like Compass, starting with their tab strip.
+            .child(v_flex().flex_1().min_w_0().h_full().when(!full_bleed, |this| this.p_4()).child(main))
     }
 }
 

@@ -18,6 +18,20 @@ pub fn parse_query(text: &str) -> Result<Document> {
     }
 }
 
+/// Parses an aggregation pipeline as typed in Compass: an array of stages.
+pub fn parse_pipeline(text: &str) -> Result<Vec<Document>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wrapped = parse_query(&format!("{{pipeline: {text}}}"))?;
+    let stages = wrapped.get_array("pipeline").map_err(|_| anyhow!("A pipeline is a list of stages: [ {{ $match: {{…}} }}, … ]"))?;
+    stages
+        .iter()
+        .map(|stage| stage.as_document().cloned().ok_or_else(|| anyhow!("Every stage must be an object like {{ $match: {{…}} }}")))
+        .collect()
+}
+
 fn json_string(text: &str) -> String {
     serde_json::Value::String(text.to_string()).to_string()
 }
@@ -273,5 +287,11 @@ mod tests {
         ));
         assert!(parse_query("{a: 'unclosed}").is_err());
         assert!(parse_query("[1, 2]").is_err());
+        let pipeline = parse_pipeline("[{$match: {status: 'Success'}}, {$group: {_id: '$type', n: {$sum: 1}}}]").unwrap();
+        assert_eq!(pipeline.len(), 2);
+        assert_eq!(pipeline[0], doc! { "$match": { "status": "Success" } });
+        assert!(parse_pipeline("{$match: {}}").is_err());
+        assert!(parse_pipeline("[1]").is_err());
+        assert_eq!(parse_pipeline("").unwrap(), Vec::<Document>::new());
     }
 }
