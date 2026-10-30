@@ -108,6 +108,21 @@ pub(crate) fn slow_command(args: &[Vec<u8>], show_args: bool) -> String {
     }
 }
 
+/// Client address, name and node; Redis before 4 sends no client fields.
+pub(crate) fn slow_client(entry: &SlowEntry) -> String {
+    let client = match (entry.client.as_str(), entry.client_name.as_str()) {
+        ("", "") => String::new(),
+        (address, "") => address.to_string(),
+        ("", name) => format!("({name})"),
+        (address, name) => format!("{address} ({name})"),
+    };
+    if client.is_empty() {
+        entry.node.clone()
+    } else {
+        format!("{client} · {}", entry.node)
+    }
+}
+
 /// The whole command, every argument quoted, for copying.
 pub(crate) fn full_command(args: &[Vec<u8>]) -> String {
     args.iter()
@@ -409,14 +424,21 @@ impl DatabaseView {
                 );
                 let unknown = matches!(outcome, Err(WriteError::Unknown(_)));
                 // An unknown outcome is something to check even though its result line is logged.
-                let to_check = match (&outcome, logged) {
-                    (_, Err(error)) => Some(format!(
-                        "{summary} · its result is not in the log: {error:#}"
-                    )),
-                    (Err(WriteError::Unknown(message)), Ok(())) => {
-                        Some(format!("{summary} · outcome unknown: {message}"))
+                let unknown_note = match &outcome {
+                    Err(WriteError::Unknown(message)) => {
+                        Some(format!("outcome unknown: {message}"))
                     }
                     _ => None,
+                };
+                let to_check = match (unknown_note, logged) {
+                    (Some(note), Err(error)) => Some(format!(
+                        "{summary} · {note} · its result is not in the log: {error:#}"
+                    )),
+                    (None, Err(error)) => Some(format!(
+                        "{summary} · its result is not in the log: {error:#}"
+                    )),
+                    (Some(note), Ok(())) => Some(format!("{summary} · {note}")),
+                    (None, Ok(())) => None,
                 };
                 outcomes.push(NodeOutcome {
                     node: node.label.clone(),
@@ -802,19 +824,10 @@ impl DatabaseView {
                                 })
                                 .child(
                                     div().w(px(220.)).child(
-                                        Label::new(format!(
-                                            "{}{} · {}",
-                                            entry.client,
-                                            if entry.client_name.is_empty() {
-                                                String::new()
-                                            } else {
-                                                format!(" ({})", entry.client_name)
-                                            },
-                                            entry.node
-                                        ))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .truncate(),
+                                        Label::new(slow_client(entry))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate(),
                                     ),
                                 ),
                         );
@@ -1039,6 +1052,24 @@ mod tests {
         let script = vec![b"eval".to_vec(), vec![b'y'; 5000]];
         assert!(slow_command(&script, true).ends_with('…'));
         assert_eq!(full_command(&script).len(), "EVAL ".len() + 5002);
+    }
+
+    #[test]
+    fn test_slow_client() {
+        let mut entry = SlowEntry {
+            node: "server".into(),
+            id: 1,
+            time: 0,
+            micros: 0,
+            args: Vec::new(),
+            client: String::new(),
+            client_name: String::new(),
+        };
+        assert_eq!(slow_client(&entry), "server");
+        entry.client = "127.0.0.1:1".into();
+        assert_eq!(slow_client(&entry), "127.0.0.1:1 · server");
+        entry.client_name = "worker".into();
+        assert_eq!(slow_client(&entry), "127.0.0.1:1 (worker) · server");
     }
 
     #[test]
