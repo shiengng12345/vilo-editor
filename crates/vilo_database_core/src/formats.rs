@@ -1353,9 +1353,17 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 })?;
                 stack.push(Slot::Value(object));
             }
-            0x82..=0x84 => {
-                let width = [1, 2, 4][usize::from(opcode - 0x82)];
-                let code = small(take!(width))?;
+            // EXT1 and EXT2 codes are unsigned, EXT4 signed, as Python reads them.
+            0x82 => {
+                let code = take!(1)[0];
+                push(arena, &mut stack, Node::Name(format!("<extension {code}>")))?
+            }
+            0x83 => {
+                let code = u16::from_le_bytes(take!(2).try_into().map_err(|_| "ends early")?);
+                push(arena, &mut stack, Node::Name(format!("<extension {code}>")))?
+            }
+            0x84 => {
+                let code = i32::from_le_bytes(take!(4).try_into().map_err(|_| "ends early")?);
                 push(arena, &mut stack, Node::Name(format!("<extension {code}>")))?
             }
             0x97 => push(arena, &mut stack, Node::Name("<out-of-band buffer>".into()))?,
@@ -1999,6 +2007,11 @@ fn python_escapes(text: &str) -> Option<Vec<u8>> {
             'n' => out.push(b'\n'),
             'r' => out.push(b'\r'),
             't' => out.push(b'\t'),
+            'a' => out.push(0x07),
+            'b' => out.push(0x08),
+            'f' => out.push(0x0c),
+            'v' => out.push(0x0b),
+            '\n' => {}
             'x' => {
                 let high = chars.next()?.to_digit(16)?;
                 let low = chars.next()?.to_digit(16)?;
@@ -2017,7 +2030,12 @@ fn python_escapes(text: &str) -> Option<Vec<u8>> {
                 }
                 out.push(u8::try_from(value).ok()?);
             }
-            _ => return None,
+            // Python keeps an unknown escape as it is, backslash included.
+            other => {
+                out.push(b'\\');
+                let mut buffer = [0; 4];
+                out.extend_from_slice(other.encode_utf8(&mut buffer).as_bytes());
+            }
         }
     }
     Some(out)
@@ -3218,6 +3236,27 @@ mod tests {
         assert!(
             decode(Decoder::Pickle, &persistent).is_err(),
             "a persistent id past the name limit"
+        );
+    }
+
+    #[test]
+    fn test_ext_codes_and_escapes_like_python() {
+        // As python3 pickletools.dis and pickle.loads read them.
+        assert_eq!(
+            decode(Decoder::Pickle, b"\x80\x02\x82\x80.").unwrap(),
+            "<extension 128>"
+        );
+        assert_eq!(
+            decode(Decoder::Pickle, b"\x80\x02\x83\x00\x80.").unwrap(),
+            "<extension 32768>"
+        );
+        assert_eq!(
+            decode(Decoder::Pickle, b"\x80\x02\x84\x00\x00\x00\x80.").unwrap(),
+            "<extension -2147483648>"
+        );
+        assert_eq!(
+            decode(Decoder::Pickle, b"S'\\a\\b\\f\\v\\q\\x41\\101'\n.").unwrap(),
+            r#""\u0007\u0008\u000c\u000b\\qAA""#
         );
     }
 
