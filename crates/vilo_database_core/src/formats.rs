@@ -109,6 +109,9 @@ impl Arena {
 
     /// Replaces a placeholder with the value it became, counting its text.
     fn replace(&mut self, id: Id, node: Node) -> Result<(), String> {
+        // The placeholder's own text was counted when it was added.
+        let before = self.nodes.get(id).map_or(0, text_size);
+        self.bytes = self.bytes.saturating_sub(before);
         self.charge(text_size(&node))?;
         *self.get_mut(id)? = node;
         Ok(())
@@ -740,6 +743,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
     let mut stack: Vec<Slot> = Vec::new();
     let mut memo: std::collections::HashMap<u64, Id> = Default::default();
     let mut steps = 0_usize;
+    let mut items_of = std::collections::HashMap::new();
     let mut at = 0;
     let fail = |at: usize, what: &str| Err(format!("not a pickle: {what} at byte {at}"));
     macro_rules! take {
@@ -1034,7 +1038,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 let target = top(&stack, at)?;
                 arena.entries(items.len())?;
                 let target = match arena.nodes.get(target) {
-                    Some(Node::Object { .. }) => object_items(arena, target, false)?,
+                    Some(Node::Object { .. }) => object_items(arena, &mut items_of, target, false)?,
                     _ => target,
                 };
                 match arena.get_mut(target)? {
@@ -1056,7 +1060,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 };
                 arena.entries(pairs.len())?;
                 let target = match arena.nodes.get(target) {
-                    Some(Node::Object { .. }) => object_items(arena, target, true)?,
+                    Some(Node::Object { .. }) => object_items(arena, &mut items_of, target, true)?,
                     _ => target,
                 };
                 match arena.get_mut(target)? {
@@ -1309,6 +1313,7 @@ impl Java<'_> {
             },
             0x72 => {
                 let name = self.utf(false)?;
+                self.arena.charge(name.len())?;
                 self.take(8)?;
                 // The handle is taken before the fields, as Java numbers them.
                 let slot = self.handle(Handle::Value(0));
@@ -1393,11 +1398,14 @@ impl Java<'_> {
     fn primitive(&mut self, code: u8) -> Result<Node, String> {
         Ok(match code {
             b'B' => Node::Int((self.u8()? as i8).to_string()),
-            b'C' => Node::Text(
-                char::from_u32(u32::from(u16::from_be_bytes(self.array()?)))
-                    .unwrap_or('\u{FFFD}')
-                    .to_string(),
-            ),
+            b'C' => {
+                let unit = u16::from_be_bytes(self.array()?);
+                // A lone surrogate is a valid Java char but no character; it stays visible.
+                Node::Text(char::from_u32(u32::from(unit)).map_or_else(
+                    || format!("\\u{{{unit:x}}}"),
+                    |character| character.to_string(),
+                ))
+            }
             b'D' => Node::Float(f64::from_be_bytes(self.array()?)),
             b'F' => Node::Float(f64::from(f32::from_be_bytes(self.array()?))),
             b'I' => Node::Int(i32::from_be_bytes(self.array()?).to_string()),
@@ -1642,18 +1650,16 @@ impl Java<'_> {
 }
 
 /// The container an object built by a call keeps added items in (a map for SETITEM, a list
-/// for APPEND), shown as its `items` field, so keys and values stay together.
-fn object_items(arena: &mut Arena, object: Id, map: bool) -> Result<Id, String> {
-    if let Some(Node::Object { fields, .. }) = arena.nodes.get(object)
-        && let Some((_, id)) = fields.iter().find(|(name, id)| {
-            name == "items"
-                && matches!(
-                    (arena.nodes.get(*id), map),
-                    (Some(Node::Map(_)), true) | (Some(Node::List(_)), false)
-                )
-        })
-    {
-        return Ok(*id);
+/// for APPEND), shown as its `items` field, so keys and values stay together. Remembered per
+/// object, so adding items never searches the object's fields.
+fn object_items(
+    arena: &mut Arena,
+    known: &mut std::collections::HashMap<(Id, bool), Id>,
+    object: Id,
+    map: bool,
+) -> Result<Id, String> {
+    if let Some(items) = known.get(&(object, map)) {
+        return Ok(*items);
     }
     let items = arena.add(if map {
         Node::Map(Vec::new())
@@ -1663,6 +1669,7 @@ fn object_items(arena: &mut Arena, object: Id, map: bool) -> Result<Id, String> 
     if let Node::Object { fields, .. } = arena.get_mut(object)? {
         fields.push(("items".to_string(), items));
     }
+    known.insert((object, map), items);
     Ok(items)
 }
 
@@ -1875,6 +1882,20 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("true") && text.contains("null") && text.contains("1.5"));
+        // php 8.3: r: takes a number for later references, R: does not.
+        let refs = "a:4:{i:0;O:8:\"stdClass\":0:{}i:1;r:2;i:2;O:8:\"stdClass\":0:{}i:3;r:4;}";
+        let text = decode(Decoder::Php, refs.as_bytes()).unwrap();
+        assert_eq!(text.matches("stdClass {}").count(), 4, "{text}");
+        let hard = "a:5:{i:0;s:1:\"x\";i:1;R:2;i:2;O:8:\"stdClass\":0:{}i:3;r:3;i:4;s:4:\"tail\";}";
+        let text = decode(Decoder::Php, hard.as_bytes()).unwrap();
+        assert_eq!(
+            (
+                text.matches(r#""x""#).count(),
+                text.matches("stdClass {}").count()
+            ),
+            (2, 2),
+            "{text}"
+        );
         let array = "a:3:{i:0;i:1;s:3:\"two\";s:3:\"dos\";s:6:\"nested\";a:1:{i:0;s:1:\"a\";}}";
         assert!(
             decode(Decoder::Php, array.as_bytes())
@@ -2157,6 +2178,33 @@ mod tests {
         );
         let text = decode(Decoder::Pickle, &ordered).unwrap();
         assert!(text.contains(r#""secret": 7"#), "{text}");
+    }
+
+    #[test]
+    fn test_char_and_append_work() {
+        // A class with one char field holding a lone high surrogate.
+        let mut lone = b"\xac\xed\x00\x05\x73\x72\x00\x01A".to_vec();
+        lone.extend_from_slice(&[0; 8]);
+        lone.extend_from_slice(&[
+            0x02, 0x00, 0x01, b'C', 0x00, 0x01, b'c', 0x78, 0x70, 0xd8, 0x3d,
+        ]);
+        assert!(
+            decode(Decoder::Java, &lone)
+                .unwrap()
+                .contains(r#"\\u{d83d}"#)
+        );
+        // One object with many BUILD states, then many APPENDs to it: no per-append field search.
+        let mut work = b"cm\nC\n)R\x94".to_vec();
+        for _ in 0..200_000 {
+            work.extend_from_slice(b"2b");
+        }
+        for _ in 0..299_999 {
+            work.extend_from_slice(b"h\x00a");
+        }
+        work.push(b'.');
+        let started = std::time::Instant::now();
+        assert!(decode(Decoder::Pickle, &work).is_ok(), "within the budgets");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
