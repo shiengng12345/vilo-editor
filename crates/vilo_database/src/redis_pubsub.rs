@@ -446,19 +446,21 @@ impl DatabaseView {
         // lock even if the user switches connection or database while it is in flight.
         cx.spawn(async move |this, cx| {
             let result = task.await;
-            this.update(cx, |this, cx| {
-                let mut locked = None;
-                let unknown = matches!(result, Ok((Err(WriteError::Unknown(_)), _)));
-                {
-                    let mut locks = publish_locks();
-                    if locks.get(&lock).is_some_and(|(owner, _)| *owner == operation) {
-                        if unknown {
-                            locks.insert(lock.clone(), (operation.clone(), true));
-                        } else {
-                            locks.remove(&lock);
-                        }
+            let unknown = matches!(result, Ok((Err(WriteError::Unknown(_)), _)));
+            // Settled before touching the window, which may be closed by now: the lock is shared
+            // by every window and must not stay pending.
+            {
+                let mut locks = publish_locks();
+                if locks.get(&lock).is_some_and(|(owner, _)| *owner == operation) {
+                    if unknown {
+                        locks.insert(lock.clone(), (operation.clone(), true));
+                    } else {
+                        locks.remove(&lock);
                     }
                 }
+            }
+            this.update(cx, |this, cx| {
+                let mut locked = None;
                 let message = match result {
                     Ok((outcome, logged)) => {
                         if let Some(error) = logged {
@@ -514,6 +516,12 @@ impl DatabaseView {
             .filter(|(_, unknown)| *unknown)
             .map(|(operation, _)| operation.clone());
         let Some(operation) = held else {
+            // Settled meanwhile (another window, or the banner); nothing is left to confirm.
+            if let Some(pubsub) = self.pubsub() {
+                pubsub.publish_locked = None;
+                pubsub.publish_result = None;
+            }
+            cx.notify();
             return;
         };
         let task = cx.background_spawn({
