@@ -16,7 +16,8 @@ use gpui::{
 };
 use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
 use vilo_database_core::redis::{
-    Bytes, ClusterNode, KeyInfo, ScanNode, StreamEntry, format_reply, quote_bytes, split_command,
+    Bytes, ClusterNode, KeyInfo, RedisWrite, ScanNode, StreamEntry, format_reply, quote_bytes,
+    split_command,
 };
 use vilo_database_core::redis_docs::{self, CommandDoc};
 
@@ -58,7 +59,7 @@ enum RowTarget {
     ZSetMember { member: Bytes, score: String },
 }
 
-/// A write a row button starts: the operation, its prefilled inputs, and the list item shown.
+/// An edit a row button starts: the operation, its prefilled inputs, and the list item shown.
 type RowWrite = (crate::redis_write::RedisOp, Vec<Bytes>, Option<Bytes>);
 
 impl RowTarget {
@@ -83,18 +84,32 @@ impl RowTarget {
         })
     }
 
-    fn remove(&self) -> RowWrite {
+    /// The removal, built from the row's exact bytes; a hash field goes only if it still holds
+    /// the value shown.
+    fn remove(&self, key: Bytes) -> (crate::redis_write::RedisOp, RedisWrite) {
         use crate::redis_write::RedisOp;
-        match self {
-            RowTarget::HashField { field, .. } => (RedisOp::HashDelete, vec![field.clone()], None),
-            RowTarget::ListItem { index, value } => (
-                RedisOp::ListRemoveAt { index: *index },
-                Vec::new(),
-                Some(value.clone()),
+        match self.clone() {
+            RowTarget::HashField { field, value } => (
+                RedisOp::HashDelete,
+                RedisWrite::HashDelete {
+                    key,
+                    field,
+                    expected: value,
+                },
             ),
-            RowTarget::SetMember(member) => (RedisOp::SetRemove, vec![member.clone()], None),
+            RowTarget::ListItem { index, value } => (
+                RedisOp::ListRemoveAt { index },
+                RedisWrite::ListRemoveAt {
+                    key,
+                    index,
+                    expected: value,
+                },
+            ),
+            RowTarget::SetMember(member) => {
+                (RedisOp::SetRemove, RedisWrite::SetRemove { key, member })
+            }
             RowTarget::ZSetMember { member, .. } => {
-                (RedisOp::ZSetRemove, vec![member.clone()], None)
+                (RedisOp::ZSetRemove, RedisWrite::ZSetRemove { key, member })
             }
         }
     }
@@ -2149,7 +2164,8 @@ impl DatabaseView {
         let button = move |id: (&'static str, usize),
                            icon: IconName,
                            tip: &'static str,
-                           write: RowWrite,
+                           target: RowTarget,
+                           edit: bool,
                            key: Bytes,
                            view: gpui::WeakEntity<Self>| {
             IconButton::new(id, icon)
@@ -2157,10 +2173,15 @@ impl DatabaseView {
                 .tooltip(Tooltip::text(tip))
                 .visible_on_hover("database-redis-value-row")
                 .on_click(move |_, window, cx| {
-                    let (op, prefill, shown) = write.clone();
-                    let key = key.clone();
-                    view.update(cx, |this, cx| {
-                        this.start_redis_write(op, key, prefill, shown, window, cx)
+                    let (target, key) = (target.clone(), key.clone());
+                    view.update(cx, |this, cx| match target.edit().filter(|_| edit) {
+                        Some((op, prefill, shown)) => {
+                            this.start_redis_write(op, key, prefill, shown, window, cx)
+                        }
+                        None => {
+                            let (op, planned) = target.remove(key);
+                            this.start_planned_redis_write(op, planned, window, cx)
+                        }
                     })
                     .ok();
                 })
@@ -2179,12 +2200,13 @@ impl DatabaseView {
                             .child(h_flex().w(px(44.)).flex_none().when_some(
                                 target,
                                 |this, target| {
-                                    this.when_some(target.edit(), |this, edit| {
+                                    this.when(target.edit().is_some(), |this| {
                                         this.child(button(
                                             ("database-redis-row-edit", index),
                                             IconName::Pencil,
                                             "Edit",
-                                            edit,
+                                            target.clone(),
+                                            true,
                                             key.clone(),
                                             view.clone(),
                                         ))
@@ -2193,7 +2215,8 @@ impl DatabaseView {
                                         ("database-redis-row-remove", index),
                                         IconName::Trash,
                                         "Remove",
-                                        target.remove(),
+                                        target,
+                                        false,
                                         key.clone(),
                                         view.clone(),
                                     ))
@@ -3809,16 +3832,40 @@ mod tests {
         let (op, prefill, shown) = item.edit().unwrap();
         assert!(op == RedisOp::ListSet { index: 3 });
         assert_eq!((prefill, shown), (vec![b"a".to_vec()], Some(b"a".to_vec())));
-        let (op, prefill, shown) = item.remove();
+        let (op, planned) = item.remove(b"k".to_vec());
         assert!(op == RedisOp::ListRemoveAt { index: 3 });
-        assert_eq!((prefill, shown), (Vec::<Bytes>::new(), Some(b"a".to_vec())));
+        assert_eq!(
+            planned,
+            RedisWrite::ListRemoveAt {
+                key: b"k".to_vec(),
+                index: 3,
+                expected: b"a".to_vec(),
+            }
+        );
         assert!(RowTarget::SetMember(b"m".to_vec()).edit().is_none());
         let field = RowTarget::HashField {
             field: b"f".to_vec(),
             value: b"v".to_vec(),
         };
         assert!(field.edit().unwrap().0 == RedisOp::HashSet);
-        assert!(field.remove().0 == RedisOp::HashDelete);
+        assert_eq!(
+            field.remove(b"k".to_vec()).1,
+            RedisWrite::HashDelete {
+                key: b"k".to_vec(),
+                field: b"f".to_vec(),
+                expected: b"v".to_vec(),
+            },
+            "a field goes only if it still holds the value shown"
+        );
+        let binary = RowTarget::SetMember(b"\xff".to_vec());
+        assert_eq!(
+            binary.remove(b"k".to_vec()).1,
+            RedisWrite::SetRemove {
+                key: b"k".to_vec(),
+                member: b"\xff".to_vec(),
+            },
+            "a member that is not text can still be removed"
+        );
         let member = RowTarget::ZSetMember {
             member: b"m".to_vec(),
             score: "1.5".into(),

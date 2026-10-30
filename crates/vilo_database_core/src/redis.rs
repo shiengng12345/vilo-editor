@@ -1396,6 +1396,9 @@ impl NewValue {
 
 /// Lua's unpack stops near 8000 values; new keys stay well under it.
 pub const NEW_KEY_ARGUMENTS: usize = 4000;
+/// A hundred years. Checked before sending, because a TTL Redis refuses would fail after the
+/// script already created the key, and scripts do not roll back.
+pub const MAX_TTL_SECONDS: u64 = 100 * 365 * 24 * 60 * 60;
 
 /// Replaces the value only if it is still `ARGV[1]`; XX and KEEPTTL keep an expired key gone
 /// and its expiry unchanged (Redis 6 and later).
@@ -1422,9 +1425,11 @@ const ADD_KEY: &str = "if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end \
 /// ARGV: index, expected, new value.
 const LIST_SET_AT: &str = "if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end \
      redis.call('LSET', KEYS[1], ARGV[1], ARGV[3]) return 1";
-/// ARGV: index, expected, a marker no item holds. The item becomes the marker and LREM removes
-/// that one marker, so an equal value elsewhere in the list stays.
+/// ARGV: index, expected, a marker. The item becomes the marker and LREM removes that one
+/// marker, so an equal value elsewhere in the list stays; a list already holding the marker is
+/// left alone (LPOS needs Redis 6.0.6).
 const LIST_REMOVE_AT: &str = "if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end \
+     if redis.call('LPOS', KEYS[1], ARGV[3]) then return 0 end \
      redis.call('LSET', KEYS[1], ARGV[1], ARGV[3]) \
      return redis.call('LREM', KEYS[1], 1, ARGV[3])";
 const SET_ADD_EXISTING: &str = "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end \
@@ -1732,6 +1737,11 @@ impl RedisSession {
                 if arguments.is_empty() || arguments.len() > NEW_KEY_ARGUMENTS {
                     return Err(crate::mongo::WriteError::Refused(format!(
                         "A new key takes 1 to {NEW_KEY_ARGUMENTS} values."
+                    )));
+                }
+                if ttl_seconds.is_some_and(|seconds| !(1..=MAX_TTL_SECONDS).contains(&seconds)) {
+                    return Err(crate::mongo::WriteError::Refused(format!(
+                        "The TTL must be 1 to {MAX_TTL_SECONDS} seconds."
                     )));
                 }
                 let mut all = vec![
@@ -2097,6 +2107,21 @@ broken line";
                 .await,
             Err(crate::mongo::WriteError::Refused(_))
         ));
+        assert!(matches!(
+            session
+                .write(&add(
+                    names[3],
+                    NewValue::List(vec![b"a".to_vec()]),
+                    Some(u64::MAX)
+                ))
+                .await,
+            Err(crate::mongo::WriteError::Refused(_))
+        ));
+        assert_eq!(
+            session.key_info(names[3].as_bytes()).await.unwrap().kind,
+            "none",
+            "a refused TTL creates nothing"
+        );
 
         let items = |values: &[&str]| {
             values

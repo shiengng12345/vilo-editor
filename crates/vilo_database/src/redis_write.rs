@@ -7,7 +7,7 @@ use gpui::{Entity, Window, prelude::*};
 use ui::{Button, ButtonStyle, Tooltip, prelude::*};
 use vilo_database_core::{
     mongo::WriteError,
-    redis::{Bytes, NEW_KEY_ARGUMENTS, NewValue, RedisWrite, quote_bytes},
+    redis::{Bytes, MAX_TTL_SECONDS, NEW_KEY_ARGUMENTS, NewValue, RedisWrite, quote_bytes},
 };
 
 use crate::{DatabaseView, boxed, editor as single_line, mongo_write, run};
@@ -151,9 +151,11 @@ fn new_key(kind: &'static str, values: &[String]) -> Result<RedisWrite> {
         Some(
             ttl.parse::<u64>()
                 .ok()
-                .filter(|seconds| *seconds > 0)
+                .filter(|seconds| (1..=MAX_TTL_SECONDS).contains(seconds))
                 .ok_or_else(|| {
-                    anyhow!("The TTL must be a whole number of seconds above 0, or empty.")
+                    anyhow!(
+                        "The TTL must be a whole number of seconds from 1 to {MAX_TTL_SECONDS}, or empty."
+                    )
                 })?,
         )
     };
@@ -235,25 +237,7 @@ impl DatabaseView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .redis_state
-            .as_ref()
-            .is_some_and(|state| state.switching_database())
-        {
-            // Shown by the database menu, so it goes when the switch ends.
-            if let Some(state) = self.redis_state.as_mut() {
-                state.switch_error =
-                    Some("Wait for the database switch to finish, then edit.".into());
-            }
-            cx.notify();
-            return;
-        }
-        if self.redis_writes_locked(&key) {
-            self.write_notice = Some(
-                "A write to this key has an unknown outcome. Refresh the key to check it first."
-                    .into(),
-            );
-            cx.notify();
+        if !self.can_start_redis_write(&key, cx) {
             return;
         }
         let Ok(prefill) = prefill
@@ -309,22 +293,68 @@ impl DatabaseView {
                 (RedisOp::Delete, _) => Some(RedisWrite::Delete {
                     key: form.key.clone(),
                 }),
-                (RedisOp::ListRemoveAt { index }, Some(expected)) => {
-                    Some(RedisWrite::ListRemoveAt {
-                        key: form.key.clone(),
-                        index,
-                        expected,
-                    })
-                }
                 _ => None,
             };
             if form.planned.is_none() {
-                self.write_notice = Some("Open the item from the list to remove it.".into());
+                self.write_notice = Some("Remove items from their row in the list.".into());
                 cx.notify();
                 return;
             }
         }
         self.redis_write = Some(form);
+        cx.notify();
+    }
+
+    /// Refuses while the database is switching or while a write to the key has an unknown outcome.
+    fn can_start_redis_write(&mut self, key: &[u8], cx: &mut Context<Self>) -> bool {
+        if self
+            .redis_state
+            .as_ref()
+            .is_some_and(|state| state.switching_database())
+        {
+            // Shown by the database menu, so it goes when the switch ends.
+            if let Some(state) = self.redis_state.as_mut() {
+                state.switch_error =
+                    Some("Wait for the database switch to finish, then edit.".into());
+            }
+            cx.notify();
+            return false;
+        }
+        if self.redis_writes_locked(key) {
+            self.write_notice = Some(
+                "A write to this key has an unknown outcome. Refresh the key to check it first."
+                    .into(),
+            );
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    /// Opens the confirm step for a write already built from a shown row, so a removal keeps the
+    /// row's exact bytes (text or not) instead of going through text inputs.
+    pub(crate) fn start_planned_redis_write(
+        &mut self,
+        op: RedisOp,
+        planned: RedisWrite,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_start_redis_write(planned.key(), cx) {
+            return;
+        }
+        self.redis_write = Some(RedisWriteForm {
+            op,
+            key: planned.key().to_vec(),
+            inputs: Vec::new(),
+            shown_item: None,
+            planned: Some(planned),
+            typed: single_line("Type the connection name", "", false, window, cx),
+            show_values: false,
+            sending: false,
+            message: None,
+            _task: None,
+        });
         cx.notify();
     }
 
@@ -358,6 +388,14 @@ impl DatabaseView {
                 let text = values.get(index).cloned().unwrap_or_default();
                 Ok(text.into_bytes())
             };
+            // Names (fields, members) are taken exactly as typed, so " a " never reaches "a".
+            let named = |index: usize| -> Result<Bytes> {
+                let text = values.get(index).cloned().unwrap_or_default();
+                if text.is_empty() {
+                    return Err(anyhow!("Fill in every field."));
+                }
+                Ok(text.into_bytes())
+            };
             let trimmed = |index: usize| -> Result<String> {
                 let text = values
                     .get(index)
@@ -378,7 +416,7 @@ impl DatabaseView {
                     key,
                 },
                 RedisOp::HashSet => {
-                    let field = trimmed(0)?.into_bytes();
+                    let field = named(0)?;
                     RedisWrite::HashSet {
                         expected: session.hash_get(&key, &field).await?,
                         value: input(1)?,
@@ -387,7 +425,7 @@ impl DatabaseView {
                     }
                 }
                 RedisOp::HashDelete => {
-                    let field = trimmed(0)?.into_bytes();
+                    let field = named(0)?;
                     RedisWrite::HashDelete {
                         expected: session
                             .hash_get(&key, &field)
@@ -406,7 +444,7 @@ impl DatabaseView {
                     key,
                 },
                 RedisOp::ZSetScore => {
-                    let member = trimmed(0)?.into_bytes();
+                    let member = named(0)?;
                     let score = trimmed(1)?
                         .parse::<f64>()
                         .map_err(|_| anyhow!("The score must be a number."))?;
@@ -452,11 +490,9 @@ impl DatabaseView {
                     index,
                     key,
                 },
-                RedisOp::ListRemoveAt { index } => RedisWrite::ListRemoveAt {
-                    expected: shown_item.ok_or_else(|| anyhow!("Open the item from the list."))?,
-                    index,
-                    key,
-                },
+                RedisOp::ListRemoveAt { .. } => {
+                    return Err(anyhow!("Remove items from their row in the list."));
+                }
                 RedisOp::AddKey(kind) => new_key(kind, &values)?,
             })
         });
@@ -498,6 +534,22 @@ impl DatabaseView {
             return;
         };
         if form.sending {
+            return;
+        }
+        // A new key's name is only known now, so its lock is checked here too.
+        let locked = self.active.as_ref().is_some_and(|connection| {
+            self.unknown_writes
+                .contains(&lock_key(connection, database, planned.key()))
+        });
+        let Some(form) = &mut self.redis_write else {
+            return;
+        };
+        if locked {
+            form.message = Some(
+                "A write to this key has an unknown outcome. Refresh the key to check it first."
+                    .into(),
+            );
+            cx.notify();
             return;
         }
         if mongo_write::guarded(&connection)
@@ -857,6 +909,10 @@ mod tests {
         assert!(
             new_key("list", &values(&["l", "1.5", "a"])).is_err(),
             "TTL not whole"
+        );
+        assert!(
+            new_key("list", &values(&["l", "18446744073709551615", "a"])).is_err(),
+            "TTL Redis would refuse after creating the key"
         );
         assert!(new_key("set", &values(&["s", "", ""])).is_err(), "no value");
         assert!(
