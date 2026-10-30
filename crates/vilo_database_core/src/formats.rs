@@ -748,7 +748,15 @@ impl Php<'_> {
                     std::collections::HashMap::new();
                 for _ in 0..length {
                     self.arena.entries(1)?;
-                    let key = self.key()?;
+                    let mut key = self.key()?;
+                    // PHP turns a string key that is a plain decimal integer into that integer.
+                    if let (Some(Node::Text(text)), Some(fingerprint)) =
+                        (self.arena.nodes.get(key), php_key(&self.arena.nodes, key))
+                        && fingerprint.first() == Some(&b'i')
+                    {
+                        let number = text.clone();
+                        key = self.arena.add(Node::Int(number))?;
+                    }
                     let value = self.value(depth + 1)?;
                     // A key given again replaces the earlier value in its place, as PHP does.
                     match php_key(&self.arena.nodes, key) {
@@ -1377,10 +1385,11 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                     )),
                     _ => memo.len() as u64,
                 };
+                let value = top(&stack, at)?;
                 if memo.len() >= MAX_NODES && !memo.contains_key(&key) {
                     return fail(at, "too many memo entries");
                 }
-                memo.insert(key, top(&stack, at)?);
+                memo.insert(key, value);
             }
             b'g' | b'h' | b'j' => {
                 let key = match opcode {
@@ -3223,7 +3232,7 @@ mod tests {
                 br#"a:3:{s:1:"x";i:1;s:1:"x";i:2;s:1:"1";i:3;}"#
             )
             .unwrap(),
-            "{\n  \"x\": 2,\n  \"1\": 3,\n}"
+            "{\n  \"x\": 2,\n  1: 3,\n}"
         );
         assert_eq!(
             decode(Decoder::Php, br#"a:2:{i:1;s:1:"a";s:1:"1";s:1:"b";}"#).unwrap(),
@@ -3235,6 +3244,15 @@ mod tests {
                 .matches(": ")
                 .count(),
             2
+        );
+        // The key is shown as PHP holds it: "1" as the integer 1, "01" as a string.
+        assert_eq!(
+            decode(Decoder::Php, br#"a:1:{s:1:"1";s:1:"x";}"#).unwrap(),
+            "{\n  1: \"x\",\n}"
+        );
+        assert_eq!(
+            decode(Decoder::Php, br#"a:1:{s:2:"01";i:1;}"#).unwrap(),
+            "{\n  \"01\": 1,\n}"
         );
         // A class name with a newline cannot add a line.
         let forged = decode(Decoder::Pickle, b"Vm\nVThing\\u000a  forged: 7\n\x93)R.").unwrap();
