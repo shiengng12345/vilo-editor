@@ -278,13 +278,15 @@ pub fn parse_line(line: &[u8], cut: bool) -> MonitorLine {
 }
 
 async fn open(
-    address: String,
+    host: String,
+    port: u16,
     username: Option<String>,
     password: Option<String>,
 ) -> Result<BufReader<TcpStream>> {
-    let stream = TcpStream::connect(&address)
+    // As a (host, port) pair, so an IPv6 address needs no brackets.
+    let stream = TcpStream::connect((host.as_str(), port))
         .await
-        .with_context(|| format!("Could not connect to {address} for the profiler"))?;
+        .with_context(|| format!("Could not connect to {host} port {port} for the profiler"))?;
     let mut reader = BufReader::new(stream);
     if let Some(password) = &password {
         let mut args: Vec<&[u8]> = vec![b"AUTH"];
@@ -315,7 +317,8 @@ impl RedisSession {
                 "The profiler works on a single server or one cluster node; this connection is neither."
             ),
         };
-        let address = format!("{}:{}", server.host, server.port);
+        let host = server.host.to_string();
+        let port = server.port;
         let username = self.config.username.clone();
         let password = self.config.password.clone();
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -325,7 +328,7 @@ impl RedisSession {
             async move {
                 let opened = tokio::select! {
                     _ = &mut stopped => Err(Ok("Stopped.".to_string())),
-                    opened = tokio::time::timeout(CONNECT_TIMEOUT, open(address, username, password)) => match opened {
+                    opened = tokio::time::timeout(CONNECT_TIMEOUT, open(host, port, username, password)) => match opened {
                         Ok(Ok(reader)) => Ok(reader),
                         Ok(Err(error)) => Err(Err(format!("{error:#}"))),
                         Err(_) => Err(Err("Starting MONITOR timed out.".to_string())),
@@ -689,6 +692,23 @@ mod tests {
             .await
             .expect("the connection closes when the run is dropped");
         assert_eq!(closed.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_addresses_connect() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let accepted = tokio::spawn(async move { listener.accept().await.is_ok() });
+        // The handshake fails on this silent listener; only the connection matters here.
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            open("::1".into(), port, None, None),
+        )
+        .await
+        .ok();
+        assert!(accepted.await.unwrap());
     }
 
     #[tokio::test]

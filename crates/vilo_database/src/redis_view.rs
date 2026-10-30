@@ -3881,6 +3881,8 @@ impl DatabaseView {
                                 });
                                 if open == Some(true) {
                                     this.open_profiler(window, cx);
+                                } else {
+                                    this.clear_profiler_confirm(window, cx);
                                 }
                                 cx.notify();
                             })),

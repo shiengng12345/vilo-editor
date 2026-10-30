@@ -127,15 +127,16 @@ fn time_of(line: &MonitorLine) -> String {
 
 /// What the row shows after the time, db and client.
 fn command_text(line: &MonitorLine, show_args: bool) -> String {
-    if line.raw {
-        let text = line
+    let mut text = if line.raw {
+        let raw = line
             .args
             .first()
             .map(|raw| escape_bytes(raw))
             .unwrap_or_default();
-        return format!("Not MONITOR output: {text}");
-    }
-    let mut text = slow_command(&line.args, show_args);
+        format!("Not MONITOR output: {raw}")
+    } else {
+        slow_command(&line.args, show_args)
+    };
     if line.cut {
         text.push_str(&format!("  … line cut at {} KB", MAX_LINE_BYTES / 1024));
     }
@@ -156,6 +157,16 @@ impl DatabaseView {
             if let Some(profiler) = self.profiler() {
                 profiler.confirm = Some(confirm);
             }
+        }
+    }
+
+    /// The connection name is typed for each run, never kept for a later one.
+    pub(crate) fn clear_profiler_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(confirm) = self
+            .profiler()
+            .and_then(|profiler| profiler.confirm.clone())
+        {
+            confirm.update(cx, |confirm, cx| confirm.set_text("", window, cx));
         }
     }
 
@@ -192,6 +203,12 @@ impl DatabaseView {
             return;
         }
         let Some(node) = nodes.get(profiler.node).cloned() else {
+            profiler.node = 0;
+            profiler.status = Some((
+                "That node is no longer in the cluster; choose a node again.".into(),
+                Color::Warning,
+            ));
+            cx.notify();
             return;
         };
         // The name is typed again for every run.
@@ -535,6 +552,8 @@ mod tests {
         assert!(command_text(&cut, false).ends_with("line cut at 16 KB"));
         let raw = line(&[b"-ERR \x01"], false, true);
         assert_eq!(command_text(&raw, false), "Not MONITOR output: -ERR \\x01");
+        let raw_cut = line(&[b"garbage"], true, true);
+        assert!(command_text(&raw_cut, false).ends_with("line cut at 16 KB"));
     }
 
     #[test]
