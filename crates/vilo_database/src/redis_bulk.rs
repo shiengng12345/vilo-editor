@@ -461,7 +461,6 @@ impl DatabaseView {
                             .retain(|(known, _)| *known != operation);
                         this.unlogged_writes
                             .retain(|(known, _)| *known != operation);
-                        this.write_notice = None;
                     }
                     Err(error) => {
                         if let Some(run) = run {
