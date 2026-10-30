@@ -55,6 +55,8 @@ pub struct NodeCoverage {
     /// Keys whose TYPE was not answered, so they are left out of the report.
     pub unread: u64,
     pub first_unread_error: Option<String>,
+    /// The first PTTL, MEMORY USAGE or length error, behind the unknown counts.
+    pub first_detail_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -197,7 +199,8 @@ pub fn summarize(
 
 /// How one key read went.
 enum Read {
-    Stat(KeyStat),
+    /// With the first detail that could not be read, if any.
+    Stat(KeyStat, Option<String>),
     Vanished,
     Unread(String),
 }
@@ -216,17 +219,37 @@ impl RedisSession {
             Ok(None) => return Read::Unread("TYPE gave no answer".to_string()),
             Err(error) => return Read::Unread(format!("{error:#}")),
         };
-        let ttl_ms = ttl.ok().and_then(|ttl| ttl.as_i64());
+        let mut problem = None;
+        let mut note = |what: &str, error: &anyhow::Error| {
+            problem.get_or_insert_with(|| format!("{what}: {error:#}"));
+        };
+        let ttl_ms = match ttl {
+            Ok(ttl) => ttl.as_i64(),
+            Err(error) => {
+                note("PTTL", &error);
+                None
+            }
+        };
         if kind == "none" || ttl_ms == Some(-2) {
             return Read::Vanished;
         }
-        Read::Stat(KeyStat {
-            key: key.clone(),
-            kind,
-            ttl_ms,
-            memory: memory.ok().and_then(|memory| memory.as_u64()),
-            length: None,
-        })
+        let memory = match memory {
+            Ok(memory) => memory.as_u64(),
+            Err(error) => {
+                note("MEMORY USAGE", &error);
+                None
+            }
+        };
+        Read::Stat(
+            KeyStat {
+                key: key.clone(),
+                kind,
+                ttl_ms,
+                memory,
+                length: None,
+            },
+            problem,
+        )
     }
 
     /// A batch of keys in two pipelined rounds: TYPE, PTTL and MEMORY USAGE of every key, then
@@ -235,14 +258,19 @@ impl RedisSession {
         let mut reads = futures::future::join_all(batch.iter().map(|key| self.read_key(key))).await;
         let lengths = futures::future::join_all(reads.iter().map(|read| async move {
             match read {
-                Read::Stat(stat) => self.length(&stat.key, &stat.kind).await.ok().flatten(),
+                Read::Stat(stat, _) => Some(self.length(&stat.key, &stat.kind).await),
                 _ => None,
             }
         }))
         .await;
         for (read, length) in reads.iter_mut().zip(lengths) {
-            if let Read::Stat(stat) = read {
-                stat.length = length;
+            if let (Read::Stat(stat, problem), Some(length)) = (read, length) {
+                match length {
+                    Ok(length) => stat.length = length,
+                    Err(error) => {
+                        problem.get_or_insert_with(|| format!("length: {error:#}"));
+                    }
+                }
             }
         }
         reads
@@ -274,6 +302,7 @@ impl RedisSession {
                 error: None,
                 unread: 0,
                 first_unread_error: None,
+                first_detail_error: None,
             };
             // Once stopped, the remaining primaries are listed but not asked anything.
             if stopped.is_none()
@@ -368,7 +397,12 @@ impl RedisSession {
                 for read in reads {
                     coverage.scanned += 1;
                     match read {
-                        Read::Stat(stat) => stats.push(stat),
+                        Read::Stat(stat, problem) => {
+                            if let Some(problem) = problem {
+                                coverage.first_detail_error.get_or_insert(problem);
+                            }
+                            stats.push(stat);
+                        }
                         Read::Vanished => *vanished += 1,
                         Read::Unread(error) => {
                             coverage.unread += 1;
@@ -566,6 +600,13 @@ mod tests {
         .unwrap();
         let no_ttl = limited.analyze(1_000, ":", &never).await;
         assert_eq!(no_ttl.sampled, 25);
+        assert!(
+            no_ttl.nodes[0]
+                .first_detail_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("PTTL")),
+            "the reason expiry is unknown is kept"
+        );
         assert!(
             no_ttl
                 .by_ttl

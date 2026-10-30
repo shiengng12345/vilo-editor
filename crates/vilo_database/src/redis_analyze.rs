@@ -345,9 +345,15 @@ fn render_report(analysis: &Analysis, colors: &theme::ThemeColors, cx: &App) -> 
         if let Some(error) = &node.first_unread_error {
             parts.push(format!("{} keys could not be read ({error})", node.unread));
         }
+        if let Some(error) = &node.first_detail_error {
+            parts.push(format!(
+                "some expiry, memory or length figures are unknown ({error})"
+            ));
+        }
         let color = if node.error.is_some() {
             Color::Error
-        } else if node.unread > 0 || node.total_error.is_some() {
+        } else if node.unread > 0 || node.total_error.is_some() || node.first_detail_error.is_some()
+        {
             Color::Warning
         } else {
             Color::Muted
