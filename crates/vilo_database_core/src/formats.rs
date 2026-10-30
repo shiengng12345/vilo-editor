@@ -673,6 +673,7 @@ impl Php<'_> {
             }
             b'O' => {
                 let class = String::from_utf8_lossy(&self.sized()?).to_string();
+                self.arena.charge(class.len())?;
                 self.expect(b':')?;
                 let length = self.count(b':')?;
                 self.expect(b'{')?;
@@ -694,6 +695,7 @@ impl Php<'_> {
             }
             b'C' => {
                 let class = String::from_utf8_lossy(&self.sized()?).to_string();
+                self.arena.charge(class.len())?;
                 self.expect(b':')?;
                 let length = self.count(b':')?;
                 self.expect(b'{')?;
@@ -731,8 +733,11 @@ impl Php<'_> {
                 self.expect(b':')?;
                 let text = self.sized()?;
                 self.expect(b';')?;
-                self.arena
-                    .add(Node::Text(String::from_utf8_lossy(&text).to_string()))
+                // PHP strings are bytes; a key that is not text is kept, and shown escaped.
+                self.arena.add(match String::from_utf8(text) {
+                    Ok(text) => Node::Text(text),
+                    Err(error) => Node::Bytes(error.into_bytes()),
+                })
             }
             _ => self.error("an array key must be an integer or a string"),
         }
@@ -747,7 +752,8 @@ impl Php<'_> {
         self.expect(b':')?;
         let name = self.sized()?;
         self.expect(b';')?;
-        let name = String::from_utf8_lossy(&name).to_string();
+        let name = String::from_utf8(name)
+            .unwrap_or_else(|error| crate::redis::quote_bytes(error.as_bytes()));
         Ok(
             match name
                 .strip_prefix('\0')
@@ -772,6 +778,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
     let mut memo: std::collections::HashMap<u64, Id> = Default::default();
     let mut steps = 0_usize;
     let mut items_of = std::collections::HashMap::new();
+    let mut keys_of = std::collections::HashMap::new();
     let mut at = 0;
     let fail = |at: usize, what: &str| Err(format!("not a pickle: {what} at byte {at}"));
     macro_rules! take {
@@ -1065,7 +1072,9 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 let Some(pairs) = pairs_of(&items) else {
                     return fail(at, "a dict with a key and no value");
                 };
-                push(arena, &mut stack, Node::Map(pairs))?
+                let map = arena.add(Node::Map(Vec::new()))?;
+                set_items(arena, &mut keys_of, map, pairs)?;
+                stack.push(Slot::Value(map));
             }
             b'a' | b'e' | 0x90 => {
                 let items = if opcode == b'a' {
@@ -1101,10 +1110,10 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                     Some(Node::Object { .. }) => object_items(arena, &mut items_of, target, true)?,
                     _ => target,
                 };
-                match arena.get_mut(target)? {
-                    Node::Map(map) => map.extend(pairs),
-                    _ => return fail(at, "entries set on something that is not a dict"),
+                if !matches!(arena.nodes.get(target), Some(Node::Map(_))) {
+                    return fail(at, "entries set on something that is not a dict");
                 }
+                set_items(arena, &mut keys_of, target, pairs)?;
             }
             b'c' => {
                 let module = line!();
@@ -1807,21 +1816,93 @@ fn raw_unicode_escape(bytes: &[u8]) -> Option<String> {
     let mut out = String::new();
     let mut at = 0;
     while let Some(&byte) = bytes.get(at) {
-        let width = match (byte, bytes.get(at + 1)) {
-            (b'\\', Some(b'u')) => 4,
-            (b'\\', Some(b'U')) => 8,
-            _ => 0,
-        };
-        if width == 0 {
+        if byte != b'\\' {
             out.push(char::from(byte));
             at += 1;
             continue;
         }
-        let digits = std::str::from_utf8(bytes.get(at + 2..at + 2 + width)?).ok()?;
-        out.push(char::from_u32(u32::from_str_radix(digits, 16).ok()?)?);
-        at += 2 + width;
+        // In a run of backslashes only an odd count escapes what follows; pairs stay literal.
+        let run = bytes[at..]
+            .iter()
+            .take_while(|byte| **byte == b'\\')
+            .count();
+        at += run;
+        let width = match bytes.get(at) {
+            Some(b'u') if run % 2 == 1 => 4,
+            Some(b'U') if run % 2 == 1 => 8,
+            _ => 0,
+        };
+        let literal = if width == 0 { run } else { run - 1 };
+        out.extend(std::iter::repeat_n('\\', literal));
+        if width > 0 {
+            let digits = std::str::from_utf8(bytes.get(at + 1..at + 1 + width)?).ok()?;
+            out.push(char::from_u32(u32::from_str_radix(digits, 16).ok()?)?);
+            at += 1 + width;
+        }
     }
     Some(out)
+}
+
+/// What makes two pickled dict keys the same key, as Python compares them: equal numbers are
+/// one key whatever their type (1, 1.0 and True), text and bytes by content, tuples by their
+/// items. Keys this cannot compare (objects) are never merged.
+fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
+    if depth > 16 {
+        return None;
+    }
+    let number = |text: &str| text.trim_start_matches('+').parse::<i128>().ok();
+    Some(match arena.nodes.get(id)? {
+        Node::Null => b"n".to_vec(),
+        Node::Bool(flag) => format!("i{}", i128::from(*flag)).into_bytes(),
+        Node::Int(text) => format!("i{}", number(text)?).into_bytes(),
+        Node::Float(value) if value.fract() == 0.0 && value.abs() < 1e30 => {
+            format!("i{}", *value as i128).into_bytes()
+        }
+        Node::Float(value) => format!("f{}", value.to_bits()).into_bytes(),
+        Node::Text(text) => [b"s".as_slice(), text.as_bytes()].concat(),
+        Node::Bytes(bytes) => [b"b".as_slice(), bytes].concat(),
+        Node::Tuple(items) => {
+            let mut key = b"(".to_vec();
+            for item in items {
+                let part = dict_key(arena, *item, depth + 1)?;
+                key.extend_from_slice(&part.len().to_le_bytes());
+                key.extend_from_slice(&part);
+            }
+            key
+        }
+        _ => return None,
+    })
+}
+
+/// Sets entries the way Python's dict does: a key already present keeps its place and takes
+/// the new value.
+fn set_items(
+    arena: &mut Arena,
+    keys_of: &mut std::collections::HashMap<(Id, Vec<u8>), usize>,
+    map: Id,
+    pairs: Vec<(Id, Id)>,
+) -> Result<(), String> {
+    for (key, value) in pairs {
+        let fingerprint = dict_key(arena, key, 0);
+        let Node::Map(entries) = arena.get_mut(map)? else {
+            return Err("not a pickle: entries set on something that is not a dict".into());
+        };
+        match fingerprint {
+            Some(fingerprint) => match keys_of.get(&(map, fingerprint.clone())) {
+                Some(&position) => {
+                    if let Some(entry) = entries.get_mut(position) {
+                        entry.1 = value;
+                    }
+                }
+                None => {
+                    keys_of.insert((map, fingerprint), entries.len());
+                    entries.push((key, value));
+                }
+            },
+            None => entries.push((key, value)),
+        }
+    }
+    Ok(())
 }
 
 /// Java's modified UTF-8: NUL as C0 80, characters outside the BMP as two 3-byte surrogates.
@@ -2326,6 +2407,35 @@ mod tests {
             fields.extend_from_slice(&[0x78, 0x70]);
         }
         assert!(decode(Decoder::Java, &fields).is_err());
+    }
+
+    #[test]
+    fn test_dict_and_text_semantics() {
+        // Python: {'x': 1} then d['x'] = 2 is {'x': 2}; 1, 1.0 and True are one key.
+        assert_eq!(
+            decode(Decoder::Pickle, b"}Vx\nK\x01sVx\nK\x02s.").unwrap(),
+            "{\n  \"x\": 2,\n}"
+        );
+        let numbers = decode(
+            Decoder::Pickle,
+            b"(K\x01K\x01G?\xf0\x00\x00\x00\x00\x00\x00K\x02\x88K\x03d.",
+        )
+        .unwrap();
+        assert_eq!(numbers, "{\n  1: 3,\n}", "{numbers}");
+        // raw-unicode-escape: two backslashes stay literal, one starts an escape.
+        assert_eq!(
+            raw_unicode_escape(b"\\\\u0041").as_deref(),
+            Some("\\\\u0041")
+        );
+        assert_eq!(raw_unicode_escape(b"\\\\\\u0041").as_deref(), Some("\\\\A"));
+        // PHP keys and property names are bytes; ones that are not text stay distinct.
+        let keys = decode(Decoder::Php, b"a:2:{s:1:\"\xff\";i:1;s:1:\"\xfe\";i:2;}").unwrap();
+        assert!(
+            keys.contains(r#"b"\xff""#) && keys.contains(r#"b"\xfe""#),
+            "{keys}"
+        );
+        let property = decode(Decoder::Php, b"O:1:\"A\":1:{s:1:\"\xff\";i:1;}").unwrap();
+        assert!(property.contains(r#""\xff": 1"#), "{property}");
     }
 
     #[test]
