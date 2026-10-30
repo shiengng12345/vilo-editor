@@ -300,99 +300,10 @@ pub fn to_extended_json(text: &str) -> Result<String> {
     Ok(reader.output)
 }
 
-/// The query with Compass's spacing, `{ a: 1, b: [1, 2] }`; only whitespace outside strings and
-/// regular expressions changes. `None` when it does not parse, or would not parse to the same query.
-pub fn format_query(text: &str) -> Option<String> {
-    #[derive(PartialEq)]
-    enum Token {
-        Punct(char),
-        Word(String),
-    }
-    let mut tokens = Vec::new();
-    let mut chars = text.chars().peekable();
-    while let Some(character) = chars.next() {
-        match character {
-            _ if character.is_whitespace() => {}
-            '{' | '}' | '[' | ']' | '(' | ')' | ':' | ',' => tokens.push(Token::Punct(character)),
-            _ => {
-                let opens_regex = character == '/'
-                    && matches!(
-                        tokens.last(),
-                        None | Some(Token::Punct(':' | ',' | '[' | '(' | '{'))
-                    );
-                let mut word = character.to_string();
-                if let Some(quote) = ['\'', '"']
-                    .into_iter()
-                    .find(|quote| *quote == character)
-                    .or(opens_regex.then_some('/'))
-                {
-                    let mut closed = false;
-                    while let Some(next) = chars.next() {
-                        word.push(next);
-                        if next == '\\' {
-                            word.extend(chars.next());
-                        } else if next == quote {
-                            closed = true;
-                            break;
-                        }
-                    }
-                    if !closed {
-                        return None;
-                    }
-                }
-                while let Some(next) = chars.peek() {
-                    if next.is_whitespace() || "{}[]():,".contains(*next) {
-                        break;
-                    }
-                    word.extend(chars.next());
-                }
-                tokens.push(Token::Word(word));
-            }
-        }
-    }
-    let mut formatted = String::new();
-    let mut previous: Option<&Token> = None;
-    for token in &tokens {
-        let space = match (previous, token) {
-            (None, _) => false,
-            (Some(Token::Punct('{')), Token::Punct('}')) => false,
-            (Some(Token::Punct('{')), _) | (_, Token::Punct('}')) => true,
-            (Some(Token::Punct(':' | ',')), _) => true,
-            (Some(Token::Word(_)), Token::Word(_)) => true,
-            _ => false,
-        };
-        if space {
-            formatted.push(' ');
-        }
-        match token {
-            Token::Punct(character) => formatted.push(*character),
-            Token::Word(word) => formatted.push_str(word),
-        }
-        previous = Some(token);
-    }
-    let same = parse_query(text).ok()? == parse_query(&formatted).ok()?;
-    same.then_some(formatted)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use mongodb::bson::{Regex, doc, oid::ObjectId};
-
-    #[test]
-    fn test_format_query() {
-        assert_eq!(format_query("{ _id: -1}").as_deref(), Some("{ _id: -1 }"));
-        assert_eq!(
-            format_query("{a:1,b:{c :[1,2]},name:'x , y',re:/a:b/i}").as_deref(),
-            Some("{ a: 1, b: { c: [1, 2] }, name: 'x , y', re: /a:b/i }")
-        );
-        assert_eq!(
-            format_query("{ _id: ObjectId( '5f1d7f1d7f1d7f1d7f1d7f1d' ) }").as_deref(),
-            Some("{ _id: ObjectId('5f1d7f1d7f1d7f1d7f1d7f1d') }")
-        );
-        assert_eq!(format_query("{}").as_deref(), Some("{}"));
-        assert_eq!(format_query("{ a: 'open").as_deref(), None);
-    }
 
     #[test]
     fn test_compass_syntax() {

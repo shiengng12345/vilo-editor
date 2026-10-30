@@ -29,7 +29,7 @@ use vilo_database_core::{
         ExplainSummary, FieldSummary, FindRequest, Hint, field_paths, summarize_explain,
         summarize_schema, to_display_json,
     },
-    shell::{format_query, parse_pipeline, parse_query},
+    shell::{parse_pipeline, parse_query},
 };
 
 use crate::{
@@ -289,7 +289,7 @@ pub(crate) struct MongoTab {
     fields: Rc<RefCell<Vec<String>>>,
     /// Filters the Indexes list by name or field.
     index_search: Entity<Editor>,
-    _index_search_changed: Option<gpui::Subscription>,
+    _subscriptions: Vec<gpui::Subscription>,
     /// Index names whose definition is open in the Indexes list.
     open_indexes: HashSet<String>,
     /// The sample size and its fields.
@@ -378,7 +378,7 @@ impl MongoTab {
             indexes: None,
             open_indexes: HashSet::default(),
             index_search: editor("Search indexes by name or field", "", false, window, cx),
-            _index_search_changed: None,
+            _subscriptions: Vec::new(),
             fields,
             schema: None,
             options: None,
@@ -821,6 +821,53 @@ fn compass_empty(
         .into_any_element()
 }
 
+/// Spaces a query the way Compass shows it while it is typed: `{` opens to `{ | }` and `:` and `,`
+/// get a space after them, so `{playerId:1` reads `{ playerId: 1 }`. Only characters just typed
+/// count, so deleting a space does not bring it back.
+fn space_as_typed(
+    editor: &Entity<Editor>,
+    previous_length: &std::cell::Cell<usize>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use editor::ToOffset as _;
+    let (text, cursor) = {
+        let editor = editor.read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let cursor = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot)
+            .0;
+        (editor.text(cx), cursor)
+    };
+    let grew = text
+        .len()
+        .saturating_sub(previous_length.replace(text.len()));
+    let (Some(before), Some(after)) = (text.get(..cursor), text.get(cursor..)) else {
+        return;
+    };
+    let quotes = before
+        .chars()
+        .filter(|character| matches!(character, '\'' | '"'))
+        .count();
+    if quotes % 2 == 1 {
+        return;
+    }
+    let opened_brace = grew == 2 && before.ends_with('{') && after.starts_with('}');
+    let typed_separator =
+        grew == 1 && (before.ends_with(':') || before.ends_with(',')) && !after.starts_with(' ');
+    if opened_brace {
+        editor.update(cx, |editor, cx| {
+            editor.insert("  ", window, cx);
+            editor.move_left(&editor::actions::MoveLeft, window, cx);
+        });
+    } else if typed_separator {
+        editor.update(cx, |editor, cx| editor.insert(" ", window, cx));
+    }
+}
+
 /// A tinted pill for index types and properties, coloured by what it says.
 fn compass_pill(text: String) -> gpui::Div {
     let color: gpui::Hsla = rgb(match text.split(' ').next().unwrap_or_default() {
@@ -895,11 +942,29 @@ impl DatabaseView {
         if let Some(language) = &self.query_language {
             tab.set_query_language(language, cx);
         }
-        tab._index_search_changed = Some(
+        tab._subscriptions.push(
             cx.subscribe(&tab.index_search, |_, _, _: &editor::EditorEvent, cx| {
                 cx.notify()
             }),
         );
+        for editor in [
+            &tab.filter,
+            &tab.projection,
+            &tab.sort,
+            &tab.collation,
+            &tab.hint,
+        ] {
+            let previous_length = Rc::new(std::cell::Cell::new(0));
+            tab._subscriptions.push(cx.subscribe_in(
+                editor,
+                window,
+                move |_, editor, event: &editor::EditorEvent, window, cx| {
+                    if matches!(event, editor::EditorEvent::Edited { .. }) {
+                        space_as_typed(editor, &previous_length, window, cx);
+                    }
+                },
+            ));
+        }
         if let Some(session) = self.mongo() {
             let connection = self.generation;
             let task = run(cx, async move {
@@ -2554,7 +2619,7 @@ impl DatabaseView {
             |this: &mut DatabaseView, window: &mut Window, cx: &mut Context<DatabaseView>| {
                 if let Some(tab) = this.tab_mut() {
                     tab.skip = 0;
-                    // Tidied when the query runs, not while typing, so the cursor never jumps.
+                    // Enter runs the query even while suggestions show; Tab takes a suggestion.
                     for editor in [
                         &tab.filter,
                         &tab.projection,
@@ -2562,11 +2627,10 @@ impl DatabaseView {
                         &tab.collation,
                         &tab.hint,
                     ] {
-                        let text = editor.read(cx).text(cx);
-                        if let Some(formatted) = format_query(&text)
-                            && formatted != text
-                        {
-                            editor.update(cx, |editor, cx| editor.set_text(formatted, window, cx));
+                        if editor.read(cx).has_visible_completions_menu() {
+                            editor.update(cx, |editor, cx| {
+                                editor.cancel(&editor::actions::Cancel, window, cx)
+                            });
                         }
                     }
                 }
@@ -2582,6 +2646,11 @@ impl DatabaseView {
             .on_action(
                 cx.listener(move |this, _: &menu::Confirm, window, cx| find(this, window, cx)),
             )
+            .capture_action(cx.listener(
+                move |this, _: &editor::actions::ConfirmCompletion, window, cx| {
+                    find(this, window, cx)
+                },
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -3044,8 +3113,12 @@ impl DatabaseView {
                 .size(LabelSize::Small)
                 .weight(gpui::FontWeight::SEMIBOLD);
             match width {
-                Some(width) => div().w(px(width)).flex_none().child(label),
-                None => div().flex_1().child(label),
+                Some(width) => h_flex()
+                    .w(px(width))
+                    .flex_none()
+                    .justify_center()
+                    .child(label),
+                None => h_flex().flex_1().child(label),
             }
         };
         let mut table = v_flex().child(
@@ -3071,68 +3144,72 @@ impl DatabaseView {
             }
             let open = tab.open_indexes.contains(&name);
             let toggle = name.clone();
-            table =
-                table.child(
-                    v_flex()
-                        .id(SharedString::from(format!("database-index-{name}")))
-                        .px_3()
-                        .py_2()
-                        .gap_1()
-                        .border_b_1()
-                        .border_color(colors.border_variant)
-                        .cursor_pointer()
-                        .hover(|style| style.bg(colors.element_hover))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(tab) = this.tab_mut()
-                                && !tab.open_indexes.remove(&toggle)
-                            {
-                                tab.open_indexes.insert(toggle.clone());
-                            }
-                            cx.notify();
-                        }))
-                        .child(
-                            h_flex()
-                                .gap_3()
-                                .child(
-                                    h_flex()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .gap_2()
-                                        .child(
-                                            Icon::new(if open {
-                                                IconName::ChevronDown
-                                            } else {
-                                                IconName::ChevronRight
-                                            })
-                                            .size(IconSize::Small),
-                                        )
-                                        .child(Label::new(name.clone()).buffer_font(cx).truncate()),
-                                )
-                                .child(div().w(px(120.)).flex_none().child(
-                                    h_flex().child(compass_pill(index_type(&keys).to_string())),
-                                ))
-                                .child(
-                                    h_flex()
-                                        .w(px(260.))
-                                        .flex_none()
-                                        .gap_1()
-                                        .flex_wrap()
-                                        .children(
-                                            index_properties(index).into_iter().map(compass_pill),
-                                        ),
-                                ),
-                        )
-                        .when(open, |this| {
-                            this.child(
-                                div().pl_6().child(
-                                    Label::new(to_display_json(&keys))
-                                        .size(LabelSize::Small)
-                                        .buffer_font(cx)
-                                        .color(Color::Muted),
-                                ),
+            table = table.child(
+                v_flex()
+                    .id(SharedString::from(format!("database-index-{name}")))
+                    .px_3()
+                    .py_2()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(colors.border_variant)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(tab) = this.tab_mut()
+                            && !tab.open_indexes.remove(&toggle)
+                        {
+                            tab.open_indexes.insert(toggle.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(if open {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .size(IconSize::Small),
+                                    )
+                                    .child(Label::new(name.clone()).buffer_font(cx).truncate()),
                             )
-                        }),
-                );
+                            .child(
+                                h_flex()
+                                    .w(px(120.))
+                                    .flex_none()
+                                    .justify_center()
+                                    .child(compass_pill(index_type(&keys).to_string())),
+                            )
+                            .child(
+                                h_flex()
+                                    .w(px(260.))
+                                    .flex_none()
+                                    .justify_center()
+                                    .gap_1()
+                                    .flex_wrap()
+                                    .children(
+                                        index_properties(index).into_iter().map(compass_pill),
+                                    ),
+                            ),
+                    )
+                    .when(open, |this| {
+                        this.child(
+                            div().pl_6().child(
+                                Label::new(to_display_json(&keys))
+                                    .size(LabelSize::Small)
+                                    .buffer_font(cx)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                    }),
+            );
         }
         v_flex()
             .flex_1()
