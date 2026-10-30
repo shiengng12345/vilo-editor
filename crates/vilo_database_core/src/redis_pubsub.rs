@@ -225,6 +225,8 @@ impl RedisSession {
                     // finished subscription as live or hides what it missed.
                     // A failed send here means the view is gone; the connection closes below anyway.
                     if lost > 0 {
+                        // Counted like any note, so taking it cannot drive the budget below zero.
+                        queued.fetch_add(NOTE_COST, Ordering::Relaxed);
                         sender.unbounded_send(PubSubEvent::Lost(lost)).ok();
                     }
                     sender.unbounded_send(PubSubEvent::Ended(reason)).ok();
