@@ -339,7 +339,7 @@ impl DatabaseView {
             }
             return refuse(
                 self,
-                "An earlier publish to this channel has an unknown outcome. Check whether its subscribers got it, then press I checked it.",
+                "An earlier publish to this channel is still waiting for its answer or has an unknown outcome. Check whether its subscribers got it, then press I checked it.",
                 cx,
             );
         }
@@ -377,6 +377,9 @@ impl DatabaseView {
             }
         });
         let generation = self.generation;
+        // Locked while in flight too, so a rebuilt tab cannot send the same channel again before
+        // the answer is known; a known answer unlocks it below.
+        self.unknown_writes.insert(lock.clone());
         if let Some(pubsub) = self.pubsub() {
             pubsub.publishing = true;
             pubsub.publish_result = Some((true, "Publishing…".into()));
@@ -387,6 +390,10 @@ impl DatabaseView {
             let result = task.await;
             this.update(cx, |this, cx| {
                 let mut locked = None;
+                let unknown = matches!(result, Ok((Err(WriteError::Unknown(_)), _)));
+                if !unknown {
+                    this.unknown_writes.remove(&lock);
+                }
                 let message = match result {
                     Ok((outcome, logged)) => {
                         if let Some(error) = logged {
@@ -403,7 +410,6 @@ impl DatabaseView {
                             Err(WriteError::Refused(message)) => (false, format!("Not published: {message}")),
                             Err(WriteError::Unknown(message)) => {
                                 // A publish cannot be checked by reloading anything, and is never sent again.
-                                this.unknown_writes.insert(lock.clone());
                                 locked = Some(lock.clone());
                                 (false, format!("The outcome is unknown ({message}): it may have been delivered. Vilo will not send it again; check the subscribers, then press I checked it."))
                             }

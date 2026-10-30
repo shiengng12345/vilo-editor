@@ -149,6 +149,9 @@ impl RedisSession {
         );
         let mut builder = Builder::from_config(self.config.clone());
         builder.with_connection_config(|connection| connection.max_command_attempts = 1);
+        builder.with_performance_config(|performance| {
+            performance.default_command_timeout = crate::redis::COMMAND_TIMEOUT;
+        });
         let client = builder.build()?;
         client
             .init()
@@ -174,18 +177,22 @@ impl RedisSession {
                 let mut lost = 0_u64;
                 let mut report = tokio::time::interval(LOSS_REPORT);
                 // A loss note waits, still counting, while the queue is full, so a stalled view
-                // cannot pile notes up. A failed send means the view dropped the subscription.
+                // cannot pile notes up. `false` means the view dropped the subscription.
                 let flush = |lost: &mut u64| {
                     if *lost > 0 && queued.load(Ordering::Relaxed) + NOTE_COST <= QUEUE_BYTES {
                         queued.fetch_add(NOTE_COST, Ordering::Relaxed);
-                        sender.unbounded_send(PubSubEvent::Lost(*lost)).ok();
+                        let sent = sender.unbounded_send(PubSubEvent::Lost(*lost)).is_ok();
                         *lost = 0;
+                        return sent;
                     }
+                    true
                 };
                 let ended = loop {
                     tokio::select! {
                         _ = &mut stopped => break None,
-                        _ = report.tick() => flush(&mut lost),
+                        _ = report.tick() => if !flush(&mut lost) {
+                            break None;
+                        },
                         received = messages.recv() => match received {
                             Ok(received) => {
                                 let received = message(received);
@@ -195,7 +202,9 @@ impl RedisSession {
                                     continue;
                                 }
                                 // Losses go before the message that follows them.
-                                flush(&mut lost);
+                                if !flush(&mut lost) {
+                                    break None;
+                                }
                                 queued.fetch_add(size, Ordering::Relaxed);
                                 if sender.unbounded_send(PubSubEvent::Message(received)).is_err() {
                                     break None;
@@ -214,6 +223,7 @@ impl RedisSession {
                 if let Some(reason) = ended {
                     // The last losses and the end always go out, so the view never shows a
                     // finished subscription as live or hides what it missed.
+                    // A failed send here means the view is gone; the connection closes below anyway.
                     if lost > 0 {
                         sender.unbounded_send(PubSubEvent::Lost(lost)).ok();
                     }

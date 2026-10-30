@@ -5,6 +5,9 @@ use fred::{
     prelude::{Builder, Client, ClientLike as _, Config, Server, Value},
 };
 
+/// How long any one command may take before its outcome is reported as unknown.
+pub(crate) const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Keys and values stay bytes end to end; text, hex and base64 are display choices made elsewhere.
 pub type Bytes = Vec<u8>;
 
@@ -707,6 +710,11 @@ impl RedisSession {
         builder.with_connection_config(|connection| {
             // A command whose answer was lost is reported as unknown rather than sent again.
             connection.max_command_attempts = 1;
+        });
+        // Without a deadline a reply lost on an open connection would be awaited forever; a
+        // timed-out write is reported as unknown.
+        builder.with_performance_config(|performance| {
+            performance.default_command_timeout = COMMAND_TIMEOUT;
         });
         let client = builder.build()?;
         client.init().await.context("Could not reach Redis")?;
