@@ -148,6 +148,8 @@ pub struct DatabaseView {
     form: Option<Form>,
     databases: Fetch<Vec<DatabaseInfo>>,
     collections: HashMap<String, Fetch<Vec<CollectionInfo>>>,
+    /// MongoDB or Redis: the rail on the far left picks which kind the sidebar and page show.
+    kind_view: Kind,
     /// The site whose connections the sidebar lists.
     site: Option<String>,
     /// Searches connections and collections at once, keeping each match's parents visible.
@@ -242,6 +244,7 @@ impl DatabaseView {
             form: None,
             databases: Fetch::Loaded(Vec::new()),
             collections: HashMap::default(),
+            kind_view: Kind::MongoDb,
             site: None,
             search,
             tabs: Vec::new(),
@@ -285,6 +288,7 @@ impl DatabaseView {
         let mut sites = self
             .connections
             .iter()
+            .filter(|connection| connection.kind == self.kind_view)
             .map(Connection::site_label)
             .collect::<Vec<_>>();
         sites.sort_by_key(|site| (site == UNASSIGNED_SITE, site.clone()));
@@ -457,7 +461,7 @@ impl DatabaseView {
             .and_then(|id| self.connections.iter().find(|c| &c.id == id))
             .cloned();
         self.form = Some(Form {
-            kind: existing.as_ref().map_or(Kind::MongoDb, |c| c.kind),
+            kind: existing.as_ref().map_or(self.kind_view, |c| c.kind),
             site: editor(
                 "Site, e.g. CP",
                 &existing
@@ -689,6 +693,63 @@ fn render_lines(
 }
 
 impl DatabaseView {
+    /// The first level of the module: MongoDB or Redis.
+    fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let item = |id: &'static str, kind: Kind, icon: IconName, cx: &mut Context<Self>| {
+            let selected = self.kind_view == kind;
+            h_flex()
+                .id(id)
+                .h(px(36.))
+                .px_3()
+                .gap_2()
+                .cursor_pointer()
+                .border_l_2()
+                .border_color(if selected {
+                    colors.text_accent
+                } else {
+                    gpui::transparent_black()
+                })
+                .when(selected, |this| this.bg(colors.element_selected))
+                .hover(|style| style.bg(colors.element_hover))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.kind_view = kind;
+                    this.form = None;
+                    cx.notify();
+                }))
+                .child(Icon::new(icon).size(IconSize::Small).color(if selected {
+                    Color::Default
+                } else {
+                    Color::Muted
+                }))
+                .child(Label::new(kind.label()).color(if selected {
+                    Color::Default
+                } else {
+                    Color::Muted
+                }))
+        };
+        v_flex()
+            .w(px(132.))
+            .flex_none()
+            .h_full()
+            .border_r_1()
+            .border_color(colors.border)
+            .bg(colors.panel_background)
+            .child(section("DATABASE"))
+            .child(item(
+                "database-rail-mongo",
+                Kind::MongoDb,
+                IconName::DatabaseZap,
+                cx,
+            ))
+            .child(item(
+                "database-rail-redis",
+                Kind::Redis,
+                IconName::Server,
+                cx,
+            ))
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let search = self.search.read(cx).text(cx).trim().to_lowercase();
@@ -696,7 +757,8 @@ impl DatabaseView {
         let mut tree = v_flex().gap_0p5().px_1();
         let sites = self.sites();
         let current_site = self.current_site();
-        for kind in [Kind::MongoDb, Kind::Redis] {
+        {
+            let kind = self.kind_view;
             let in_site = self
                 .connections
                 .iter()
@@ -704,14 +766,6 @@ impl DatabaseView {
                     connection.kind == kind && connection.site_label() == current_site
                 })
                 .collect::<Vec<_>>();
-            tree = tree.child(
-                div().px_2().pt_2().pb_0p5().child(
-                    Label::new(kind.label().to_uppercase())
-                        .size(LabelSize::XSmall)
-                        .weight(gpui::FontWeight::SEMIBOLD)
-                        .color(Color::Muted),
-                ),
-            );
             if in_site.is_empty() {
                 tree = tree.child(
                     div().px_3().child(
@@ -1109,8 +1163,12 @@ impl DatabaseView {
 
 impl Render for DatabaseView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let connection = self.active_connection().cloned();
-        let full_bleed = self.form.is_none() && self.session.is_some();
+        // The open connection shows only under its own kind; switching kinds keeps it connected.
+        let connection = self
+            .active_connection()
+            .filter(|connection| connection.kind == self.kind_view)
+            .cloned();
+        let full_bleed = self.form.is_none() && self.session.is_some() && connection.is_some();
         let main = match (&self.form, &connection, &self.session) {
             (Some(form), _, _) => self.render_form(form, cx),
             (None, Some(connection), Some(Session::Mongo(_))) => self.render_mongo(connection, cx),
@@ -1127,14 +1185,18 @@ impl Render for DatabaseView {
                     .color(Color::Muted),
                 )
                 .into_any_element(),
-            (None, None, _) => Label::new("Pick a connection on the left, or add one.")
-                .color(Color::Muted)
-                .into_any_element(),
+            (None, None, _) => Label::new(format!(
+                "Pick a {} connection on the left, or add one.",
+                self.kind_view.label()
+            ))
+            .color(Color::Muted)
+            .into_any_element(),
         };
         h_flex()
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
+            .child(self.render_rail(cx))
             .child(self.render_sidebar(cx))
             // Mongo and Redis pages run edge to edge like Compass and RedisInsight.
             .child(
