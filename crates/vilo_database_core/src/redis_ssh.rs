@@ -47,53 +47,60 @@ pub struct SshTunnel {
     forwards: tokio::sync::Mutex<HashMap<(String, u16), u16>>,
 }
 
+/// The options every ssh call of a tunnel shares, ending with `--` and the destination.
+fn ssh_arguments(settings: &SshSettings, control: &std::path::Path) -> Result<Vec<String>> {
+    let host = settings.host.trim();
+    let user = settings.user.trim();
+    anyhow::ensure!(!host.is_empty(), "Fill in the SSH host.");
+    // ssh would read a leading `-` as an option, such as one that runs a command.
+    for (what, value) in [("host", host), ("user", user)] {
+        anyhow::ensure!(
+            !value.starts_with('-') && !value.chars().any(char::is_whitespace),
+            "The SSH {what} cannot start with - or contain spaces."
+        );
+    }
+    let mut arguments = vec![
+        "-o".to_string(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        format!("ControlPath={}", control.display()),
+    ];
+    // No port or user given leaves them to ~/.ssh/config (or ssh's defaults).
+    if let Some(port) = settings.port {
+        arguments.extend(["-p".into(), port.to_string()]);
+    }
+    if !user.is_empty() {
+        arguments.extend(["-l".into(), user.to_string()]);
+    }
+    if let Some(key) = &settings.key_file {
+        arguments.extend(["-i".into(), key.display().to_string()]);
+        arguments.extend(["-o".into(), "IdentitiesOnly=yes".into()]);
+    }
+    if let Some(known_hosts) = &settings.known_hosts {
+        arguments.extend([
+            "-o".into(),
+            format!("UserKnownHostsFile={}", known_hosts.display()),
+        ]);
+    }
+    // Nothing after `--` is an option, whatever it looks like.
+    arguments.extend(["--".into(), host.to_string()]);
+    Ok(arguments)
+}
+
 impl SshTunnel {
     pub async fn open(settings: &SshSettings) -> Result<Arc<Self>> {
-        let host = settings.host.trim();
-        let user = settings.user.trim();
-        anyhow::ensure!(!host.is_empty(), "Fill in the SSH host.");
-        // ssh would read a leading `-` as an option, such as one that runs a command.
-        for (what, value) in [("host", host), ("user", user)] {
-            anyhow::ensure!(
-                !value.starts_with('-') && !value.chars().any(char::is_whitespace),
-                "The SSH {what} cannot start with - or contain spaces."
-            );
-        }
         // Short, as macOS limits socket paths to about 100 bytes.
         let control = PathBuf::from(format!(
             "/tmp/vilo-ssh-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
-        let mut arguments = vec![
-            "-o".to_string(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=10".into(),
-            "-o".into(),
-            "ExitOnForwardFailure=yes".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=accept-new".into(),
-            "-o".into(),
-            format!("ControlPath={}", control.display()),
-            "-p".into(),
-            settings.port.unwrap_or(22).to_string(),
-        ];
-        // An empty user is left to ~/.ssh/config.
-        if !user.is_empty() {
-            arguments.extend(["-l".into(), user.to_string()]);
-        }
-        if let Some(key) = &settings.key_file {
-            arguments.extend(["-i".into(), key.display().to_string()]);
-            arguments.extend(["-o".into(), "IdentitiesOnly=yes".into()]);
-        }
-        if let Some(known_hosts) = &settings.known_hosts {
-            arguments.extend([
-                "-o".into(),
-                format!("UserKnownHostsFile={}", known_hosts.display()),
-            ]);
-        }
-        // Nothing after `--` is an option, whatever it looks like.
-        arguments.extend(["--".into(), host.to_string()]);
+        let arguments = ssh_arguments(settings, &control)?;
         let mut master = Command::new("ssh")
             // The master stays this process, whatever ~/.ssh/config says, so closing the
             // session ends it.
@@ -176,9 +183,15 @@ impl SshTunnel {
                 return Ok(());
             }
             if started.elapsed() > READY_TIMEOUT {
+                let said = self.master_error().await;
                 bail!(
-                    "The SSH connection did not come up within {} s.",
-                    READY_TIMEOUT.as_secs()
+                    "The SSH connection did not come up within {} s{}",
+                    READY_TIMEOUT.as_secs(),
+                    if said.is_empty() {
+                        ".".to_string()
+                    } else {
+                        format!(": {said}")
+                    }
                 );
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -405,6 +418,41 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn test_what_is_not_given_is_left_to_ssh_config() {
+        let control = std::path::Path::new("/tmp/vilo-ssh-test");
+        let bare = ssh_arguments(
+            &SshSettings {
+                host: "jump".into(),
+                ..SshSettings::default()
+            },
+            control,
+        )
+        .unwrap();
+        assert!(
+            !bare
+                .iter()
+                .any(|argument| argument == "-p" || argument == "-l"),
+            "{bare:?}"
+        );
+        assert_eq!(
+            bare[bare.len() - 2..],
+            ["--".to_string(), "jump".to_string()]
+        );
+        let full = ssh_arguments(
+            &SshSettings {
+                host: "jump".into(),
+                port: Some(2222),
+                user: "vilo".into(),
+                ..SshSettings::default()
+            },
+            control,
+        )
+        .unwrap();
+        assert!(full.windows(2).any(|pair| pair == ["-p", "2222"]));
+        assert!(full.windows(2).any(|pair| pair == ["-l", "vilo"]));
     }
 
     #[tokio::test]
