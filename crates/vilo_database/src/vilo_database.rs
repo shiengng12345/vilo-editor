@@ -12,7 +12,7 @@ use gpui::{
 };
 use gpui_tokio::Tokio;
 use serde::{Deserialize, Serialize};
-use ui::{Button, ButtonStyle, IconButton, Tooltip, prelude::*};
+use ui::{Button, ButtonStyle, ContextMenu, IconButton, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
 use vilo_database_core::{
     mongo::{CollectionInfo, DatabaseInfo, MongoSession},
@@ -147,13 +147,6 @@ enum Level {
 }
 
 impl Level {
-    fn title(self) -> &'static str {
-        match self {
-            Level::Site => "SITES",
-            Level::Environment => "ENVIRONMENTS",
-        }
-    }
-
     fn noun(self) -> &'static str {
         match self {
             Level::Site => "site",
@@ -393,17 +386,10 @@ impl DatabaseView {
         })
     }
 
-    /// The user's names at this level, sorted, then Unassigned when some connection has none.
+    /// The user's names at this level, sorted.
     fn names(&self, level: Level) -> Vec<String> {
         let mut names = self.names[level as usize].clone();
         names.sort_by_key(|name| name.to_lowercase());
-        if self
-            .connections
-            .iter()
-            .any(|connection| connection.at(level).is_empty())
-        {
-            names.push(UNASSIGNED_SITE.to_string());
-        }
         names
     }
 
@@ -521,10 +507,15 @@ impl DatabaseView {
     }
 
     /// Whether the connection belongs to the kind, site and environment picked in the rail.
+    /// A connection without a site or environment shows under every one, so none is ever hidden.
     fn in_view(&self, connection: &Connection) -> bool {
         connection.kind == self.kind_view
-            && connection.label_at(Level::Site) == self.current(Level::Site)
-            && connection.label_at(Level::Environment) == self.current(Level::Environment)
+            && [Level::Site, Level::Environment].iter().all(|level| {
+                let current = self.current(*level);
+                current.is_empty()
+                    || connection.at(*level).is_empty()
+                    || connection.at(*level) == current
+            })
     }
 
     fn active_connection(&self) -> Option<&Connection> {
@@ -981,9 +972,17 @@ impl DatabaseView {
             .child(self.render_names(Level::Environment, cx))
     }
 
+    /// A column as narrow as the kind icons; it widens only while a name is typed or a warning shows.
     fn render_names(&self, level: Level, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let noun = level.noun();
+        let edit = self.name_edit.as_ref().filter(|edit| edit.level == level);
+        let message = self
+            .name_message
+            .clone()
+            .filter(|(at, _)| *at == level)
+            .map(|(_, message)| message);
+        let wide = edit.is_some() || message.is_some();
         let edit_row = |edit: &NameEdit, cx: &mut Context<Self>| {
             h_flex()
                 .px_1()
@@ -1007,38 +1006,18 @@ impl DatabaseView {
                         .on_click(cx.listener(|this, _, _, cx| this.save_name_edit(cx))),
                 )
         };
-        let edit = self.name_edit.as_ref().filter(|edit| edit.level == level);
         let current = self.current(level);
         let mut column = v_flex()
             .id(SharedString::from(format!("database-{noun}s")))
-            .w(px(120.))
+            .w(px(if wide { 140. } else { 48. }))
             .flex_none()
             .h_full()
+            .pt_2()
+            .gap_1()
             .overflow_y_scroll()
             .border_r_1()
             .border_color(colors.border)
-            .bg(colors.panel_background)
-            .child(
-                h_flex()
-                    .h(px(26.))
-                    .pl_3()
-                    .pr_1()
-                    .justify_between()
-                    .child(
-                        Label::new(level.title())
-                            .size(LabelSize::XSmall)
-                            .weight(gpui::FontWeight::SEMIBOLD)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        IconButton::new(format!("database-{noun}-add"), IconName::Plus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text(format!("Add a {noun}")))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.start_name_edit(level, None, window, cx)
-                            })),
-                    ),
-            );
+            .bg(colors.panel_background);
         for name in self.names(level) {
             if let Some(edit) = edit
                 && edit.original.as_ref() == Some(&name)
@@ -1047,89 +1026,72 @@ impl DatabaseView {
                 continue;
             }
             let selected = current == name;
-            let group = SharedString::from(format!("database-{noun}-{name}"));
-            let editable = name != UNASSIGNED_SITE;
-            let (select_name, edit_name, delete_name) = (name.clone(), name.clone(), name.clone());
+            let select_name = name.clone();
+            let row = div()
+                .id(SharedString::from(format!("database-{noun}-row-{name}")))
+                .mx_1()
+                .h(px(36.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .when(selected, |this| this.bg(colors.element_selected))
+                .hover(|style| style.bg(colors.element_hover))
+                .tooltip(Tooltip::text(format!(
+                    "{name} · right-click to rename or delete"
+                )))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.selected[level as usize] = Some(select_name.clone());
+                    this.form = None;
+                    cx.notify();
+                }))
+                .child(
+                    Label::new(name.clone())
+                        .size(LabelSize::Small)
+                        .weight(if selected {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::NORMAL
+                        })
+                        .color(if selected {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        })
+                        .truncate(),
+                );
+            let view = cx.entity().downgrade();
             column = column.child(
-                h_flex()
-                    .id(SharedString::from(format!("database-{noun}-row-{name}")))
-                    .group(group.clone())
-                    .h(px(28.))
-                    .pl_3()
-                    .pr_1()
-                    .gap_1()
-                    .cursor_pointer()
-                    .border_l_2()
-                    .border_color(if selected {
-                        colors.text_accent
-                    } else {
-                        gpui::transparent_black()
-                    })
-                    .when(selected, |this| this.bg(colors.element_selected))
-                    .hover(|style| style.bg(colors.element_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected[level as usize] = Some(select_name.clone());
-                        this.form = None;
-                        cx.notify();
-                    }))
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Label::new(name.clone())
-                                .weight(if selected {
-                                    gpui::FontWeight::SEMIBOLD
-                                } else {
-                                    gpui::FontWeight::NORMAL
-                                })
-                                .color(if selected {
-                                    Color::Default
-                                } else {
-                                    Color::Muted
-                                })
-                                .truncate(),
-                        ),
-                    )
-                    .when(editable, |this| {
-                        this.child(
-                            h_flex()
-                                .visible_on_hover(group)
-                                .child(
-                                    IconButton::new(
-                                        SharedString::from(format!(
-                                            "database-{noun}-rename-{name}"
-                                        )),
-                                        IconName::Pencil,
-                                    )
-                                    .icon_size(IconSize::XSmall)
-                                    .tooltip(Tooltip::text(format!("Rename {noun}")))
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.start_name_edit(
-                                                level,
-                                                Some(edit_name.clone()),
-                                                window,
-                                                cx,
-                                            )
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    IconButton::new(
-                                        SharedString::from(format!(
-                                            "database-{noun}-delete-{name}"
-                                        )),
-                                        IconName::Trash,
-                                    )
-                                    .icon_size(IconSize::XSmall)
-                                    .tooltip(Tooltip::text(format!("Delete {noun}")))
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.delete_name(level, delete_name.clone(), cx)
-                                        },
-                                    )),
-                                ),
-                        )
+                right_click_menu(SharedString::from(format!("database-{noun}-menu-{name}")))
+                    .trigger(move |_, _, _| row)
+                    .menu(move |window, cx| {
+                        let (view, name) = (view.clone(), name.clone());
+                        ContextMenu::build(window, cx, move |menu, _, _| {
+                            let (rename_view, rename_name) = (view.clone(), name.clone());
+                            menu.entry(format!("Rename {noun}"), None, move |window, cx| {
+                                rename_view
+                                    .update(cx, |this, cx| {
+                                        this.start_name_edit(
+                                            level,
+                                            Some(rename_name.clone()),
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })
+                            .entry(
+                                format!("Delete {noun}"),
+                                None,
+                                move |_, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.delete_name(level, name.clone(), cx)
+                                    })
+                                    .ok();
+                                },
+                            )
+                        })
                     }),
             );
         }
@@ -1138,20 +1100,26 @@ impl DatabaseView {
         {
             column = column.child(edit_row(edit, cx));
         }
-        let message = self
-            .name_message
-            .clone()
-            .filter(|(at, _)| *at == level)
-            .map(|(_, message)| message);
-        column.when_some(message, |this, message| {
-            this.child(
-                div().px_3().pt_2().child(
-                    Label::new(message)
-                        .size(LabelSize::Small)
-                        .color(Color::Warning),
+        column
+            .child(
+                div().flex().justify_center().child(
+                    IconButton::new(format!("database-{noun}-add"), IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text(format!("Add a {noun}")))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.start_name_edit(level, None, window, cx)
+                        })),
                 ),
             )
-        })
+            .when_some(message, |this, message| {
+                this.child(
+                    div().px_2().pt_1().child(
+                        Label::new(message)
+                            .size(LabelSize::Small)
+                            .color(Color::Warning),
+                    ),
+                )
+            })
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
