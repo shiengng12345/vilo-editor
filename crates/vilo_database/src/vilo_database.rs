@@ -972,44 +972,14 @@ impl DatabaseView {
             .child(self.render_names(Level::Environment, cx))
     }
 
-    /// A column as narrow as the kind icons; it widens only while a name is typed or a warning shows.
+    /// A column as narrow as the kind icons; adding and renaming happen in a form in the page.
     fn render_names(&self, level: Level, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let noun = level.noun();
-        let edit = self.name_edit.as_ref().filter(|edit| edit.level == level);
-        let message = self
-            .name_message
-            .clone()
-            .filter(|(at, _)| *at == level)
-            .map(|(_, message)| message);
-        let wide = edit.is_some() || message.is_some();
-        let edit_row = |edit: &NameEdit, cx: &mut Context<Self>| {
-            h_flex()
-                .px_1()
-                .py_0p5()
-                .gap_0p5()
-                .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.save_name_edit(cx)))
-                .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
-                    this.name_edit = None;
-                    this.name_message = None;
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(boxed(edit.editor.clone(), cx)),
-                )
-                .child(
-                    IconButton::new(format!("database-{noun}-save"), IconName::Check)
-                        .icon_size(IconSize::Small)
-                        .on_click(cx.listener(|this, _, _, cx| this.save_name_edit(cx))),
-                )
-        };
         let current = self.current(level);
         let mut column = v_flex()
             .id(SharedString::from(format!("database-{noun}s")))
-            .w(px(if wide { 140. } else { 48. }))
+            .w(px(48.))
             .flex_none()
             .h_full()
             .pt_2()
@@ -1019,12 +989,6 @@ impl DatabaseView {
             .border_color(colors.border)
             .bg(colors.panel_background);
         for name in self.names(level) {
-            if let Some(edit) = edit
-                && edit.original.as_ref() == Some(&name)
-            {
-                column = column.child(edit_row(edit, cx));
-                continue;
-            }
             let selected = current == name;
             let select_name = name.clone();
             let row = div()
@@ -1095,31 +1059,91 @@ impl DatabaseView {
                     }),
             );
         }
-        if let Some(edit) = edit
-            && edit.original.is_none()
-        {
-            column = column.child(edit_row(edit, cx));
-        }
-        column
-            .child(
-                div().flex().justify_center().child(
-                    IconButton::new(format!("database-{noun}-add"), IconName::Plus)
-                        .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text(format!("Add a {noun}")))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.start_name_edit(level, None, window, cx)
-                        })),
-                ),
-            )
-            .when_some(message, |this, message| {
+        column.child(
+            div().flex().justify_center().child(
+                IconButton::new(format!("database-{noun}-add"), IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text(format!("Add a {noun}")))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.start_name_edit(level, None, window, cx)
+                    })),
+            ),
+        )
+    }
+
+    /// Adding or renaming a site or environment, or why one could not be deleted.
+    fn render_name_form(&self, cx: &mut Context<Self>) -> AnyElement {
+        let edit = self.name_edit.as_ref();
+        let level = edit
+            .map(|edit| edit.level)
+            .or(self.name_message.as_ref().map(|(level, _)| *level))
+            .unwrap_or(Level::Site);
+        let noun = level.noun();
+        let title = match edit {
+            Some(NameEdit {
+                original: Some(original),
+                ..
+            }) => format!("Rename {noun} {original}"),
+            Some(_) => format!("Add a {noun}"),
+            None => format!("Delete {noun}"),
+        };
+        let message = self
+            .name_message
+            .as_ref()
+            .map(|(_, message)| message.clone());
+        let close = |this: &mut DatabaseView, cx: &mut Context<DatabaseView>| {
+            this.name_edit = None;
+            this.name_message = None;
+            cx.notify();
+        };
+        v_flex()
+            .id("database-name-form")
+            .max_w(px(420.))
+            .gap_3()
+            .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.save_name_edit(cx)))
+            .on_action(cx.listener(move |this, _: &menu::Cancel, _, cx| close(this, cx)))
+            .child(Headline::new(title).size(HeadlineSize::Small))
+            .when_some(edit, |this, edit| {
                 this.child(
-                    div().px_2().pt_1().child(
-                        Label::new(message)
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Label::new(match level {
+                                Level::Site => "Site name",
+                                Level::Environment => "Environment name",
+                            })
                             .size(LabelSize::Small)
-                            .color(Color::Warning),
-                    ),
+                            .color(Color::Muted),
+                        )
+                        .child(boxed(edit.editor.clone(), cx)),
                 )
             })
+            .when_some(message, |this, message| {
+                this.child(
+                    Label::new(message)
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .when(edit.is_some(), |this| {
+                        this.child(
+                            Button::new("database-name-save", "Save")
+                                .style(ButtonStyle::Filled)
+                                .on_click(cx.listener(|this, _, _, cx| this.save_name_edit(cx))),
+                        )
+                    })
+                    .child(
+                        Button::new(
+                            "database-name-cancel",
+                            if edit.is_some() { "Cancel" } else { "OK" },
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1525,8 +1549,14 @@ impl Render for DatabaseView {
             .active_connection()
             .filter(|connection| self.in_view(connection))
             .cloned();
-        let full_bleed = self.form.is_none() && self.session.is_some() && connection.is_some();
+        let full_bleed = self.form.is_none()
+            && self.name_edit.is_none()
+            && self.name_message.is_none()
+            && self.session.is_some()
+            && connection.is_some();
+        let naming = self.name_edit.is_some() || self.name_message.is_some();
         let main = match (&self.form, &connection, &self.session) {
+            _ if naming => self.render_name_form(cx),
             (Some(form), _, _) => self.render_form(form, cx),
             (None, Some(connection), Some(Session::Mongo(_))) => self.render_mongo(connection, cx),
             (None, Some(connection), Some(Session::Redis(_))) => self.render_redis(connection, cx),
