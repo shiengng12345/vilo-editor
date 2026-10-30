@@ -15,6 +15,7 @@ use gpui::{
     uniform_list,
 };
 use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
+use util::ResultExt as _;
 use vilo_database_core::redis::{
     Bytes, ClusterNode, KeyInfo, ScanNode, StreamEntry, format_reply, quote_bytes, split_command,
 };
@@ -209,6 +210,9 @@ pub(crate) struct RedisState {
     /// The database being connected to while a switch is in progress.
     switching: Option<u8>,
     pub(crate) switch_error: Option<SharedString>,
+    /// Seconds between automatic refreshes of the key list and the open key; `None` is off.
+    auto_refresh: Option<u64>,
+    _auto_refresh: Option<Task<()>>,
     pub(crate) analyze: crate::redis_analyze::AnalyzeState,
     /// A database number typed in when the menu cannot know how many there are.
     database_input: Option<Entity<editor::Editor>>,
@@ -259,6 +263,8 @@ impl RedisState {
             keyspace_error: None,
             switching: None,
             switch_error: None,
+            auto_refresh: None,
+            _auto_refresh: None,
             analyze: Default::default(),
             database_input: None,
         }
@@ -430,6 +436,101 @@ fn badge(kind: &str) -> AnyElement {
                 .color(Color::Custom(color)),
         )
         .into_any_element()
+}
+
+/// The next place in a history of `count` commands: older from the newest, newer back to empty.
+fn history_position(position: Option<usize>, count: usize, older: bool) -> Option<usize> {
+    let last = count.checked_sub(1)?;
+    match (position, older) {
+        (None, true) => Some(last),
+        (None, false) => None,
+        (Some(position), true) => Some(position.min(last).saturating_sub(1)),
+        (Some(position), false) if position < last => Some(position + 1),
+        (Some(_), false) => None,
+    }
+}
+
+/// Commands kept in the Workbench history.
+const COMMAND_HISTORY: usize = 200;
+
+fn command_history_path() -> std::path::PathBuf {
+    paths::config_dir().join("database_redis_history.json")
+}
+
+pub(crate) fn load_command_history() -> Vec<String> {
+    std::fs::read(command_history_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).log_err())
+        .unwrap_or_default()
+}
+
+/// Completes the command name (the first word) from the read commands the Workbench accepts.
+pub(crate) struct CommandCompletions;
+
+/// Command names starting with what was typed, case ignored, upper case as Redis writes them.
+fn command_candidates(typed: &str) -> Vec<String> {
+    let typed = typed.to_uppercase();
+    vilo_database_core::redis::read_commands()
+        .iter()
+        .map(|command| command.to_uppercase())
+        .filter(|command| command.starts_with(&typed))
+        .collect()
+}
+
+impl editor::CompletionProvider for CommandCompletions {
+    fn completions(
+        &self,
+        buffer: &gpui::Entity<language::Buffer>,
+        buffer_position: language::Anchor,
+        _trigger: editor::CompletionContext,
+        _window: &mut gpui::Window,
+        cx: &mut Context<editor::Editor>,
+    ) -> Task<anyhow::Result<Vec<project::CompletionResponse>>> {
+        use language::ToOffset as _;
+        let buffer = buffer.read(cx);
+        let offset = buffer_position.to_offset(buffer);
+        let before = buffer.text_for_range(0..offset).collect::<String>();
+        // Only the command name is completed; arguments are free text.
+        if before.trim_start().contains(char::is_whitespace) {
+            return Task::ready(Ok(Vec::new()));
+        }
+        let word = before.trim_start();
+        let replace_range = buffer.anchor_before(offset - word.len())..buffer_position;
+        Task::ready(Ok(vec![project::CompletionResponse {
+            completions: command_candidates(word)
+                .into_iter()
+                .map(|text| project::Completion {
+                    replace_range: replace_range.clone(),
+                    label: language::CodeLabel::plain(text.clone(), None),
+                    new_text: text,
+                    documentation: None,
+                    source: project::CompletionSource::Custom,
+                    icon_path: None,
+                    icon_color: None,
+                    match_start: None,
+                    snippet_deduplication_key: None,
+                    insert_text_mode: None,
+                    confirm: None,
+                    group: None,
+                })
+                .collect(),
+            display_options: project::CompletionDisplayOptions::default(),
+            is_incomplete: false,
+        }]))
+    }
+
+    fn is_completion_trigger(
+        &self,
+        _buffer: &gpui::Entity<language::Buffer>,
+        _position: language::Anchor,
+        text: &str,
+        _trigger_in_words: bool,
+        _cx: &mut Context<editor::Editor>,
+    ) -> bool {
+        text.chars()
+            .last()
+            .is_some_and(|character| character.is_ascii_alphabetic())
+    }
 }
 
 /// Commands that recreate the key as loaded, for pasting into redis-cli, and whether only part
@@ -763,6 +864,57 @@ impl DatabaseView {
         }
         let pattern = vilo_database_core::redis::search_pattern(&text);
         self.open_key_matching(key, pattern, None, cx);
+    }
+
+    /// Refreshes the key list and the open key every `seconds`, skipping a round while an edit is
+    /// open, a scan or database switch is running, or the open key is being searched.
+    fn set_auto_refresh(&mut self, seconds: Option<u64>, cx: &mut Context<Self>) {
+        let connection = self.generation;
+        let Some(state) = self.redis_state() else {
+            return;
+        };
+        state.auto_refresh = seconds;
+        state._auto_refresh = seconds.map(|seconds| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(seconds))
+                        .await;
+                    let alive = this
+                        .update(cx, |this, cx| {
+                            if this.generation != connection {
+                                return false;
+                            }
+                            let busy = this.redis_write.is_some() || this.admin_write.is_some();
+                            let Some(state) = this.redis_state() else {
+                                return false;
+                            };
+                            if busy || state.scanning || state.switching.is_some() {
+                                return true;
+                            }
+                            let open = match &state.detail {
+                                Some(Fetch::Loaded(detail))
+                                    if detail.pattern.is_none()
+                                        && detail.local_filter.is_none() =>
+                                {
+                                    Some(detail.key.clone())
+                                }
+                                _ => None,
+                            };
+                            this.scan(true, cx);
+                            if let Some(key) = open {
+                                this.open_key(key, cx);
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !alive {
+                        break;
+                    }
+                }
+            })
+        });
+        cx.notify();
     }
 
     pub(crate) fn close_redis_key(&mut self) {
@@ -1308,6 +1460,7 @@ impl DatabaseView {
         }
         self.workbench_input
             .update(cx, |editor, cx| editor.set_text("", window, cx));
+        self.remember_command(&line, cx);
         let connection = self.generation;
         let Some(state) = self.redis_state() else {
             return;
@@ -2157,6 +2310,36 @@ impl DatabaseView {
             .into_any_element()
     }
 
+    fn render_auto_refresh(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity().downgrade();
+        let label = match state.auto_refresh {
+            Some(seconds) => format!("Auto {seconds}s"),
+            None => "Auto off".to_string(),
+        };
+        PopoverMenu::new("database-redis-auto-refresh")
+            .trigger(
+                Button::new("database-redis-auto-refresh-button", label)
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Subtle)
+                    .tooltip(Tooltip::text(
+                        "Rescan keys and reload the open key on a timer; each round is a full SCAN, so keep it off on large production databases",
+                    )),
+            )
+            .menu(move |window, cx| {
+                let view = view.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for (label, seconds) in [("Off", None), ("Every 5 seconds", Some(5)), ("Every 10 seconds", Some(10)), ("Every 30 seconds", Some(30))] {
+                        let view = view.clone();
+                        menu = menu.entry(label, None, move |_, cx| {
+                            view.update(cx, |this, cx| this.set_auto_refresh(seconds, cx)).ok();
+                        });
+                    }
+                    menu
+                }))
+            })
+            .into_any_element()
+    }
+
     /// Value search and copying for the open key.
     fn render_value_tools(&self, detail: &Detail, cx: &mut Context<Self>) -> AnyElement {
         let searchable = matches!(detail.info.kind.as_str(), "hash" | "set" | "zset" | "list");
@@ -2401,6 +2584,7 @@ impl DatabaseView {
                                     .child(settings)
                                     .child(div().flex_1())
                                     .child(Label::new(format!("Last refresh: {last_refresh}")).size(LabelSize::Small).color(Color::Muted))
+                                    .child(self.render_auto_refresh(state, cx))
                                     .child(IconButton::new("database-redis-refresh", IconName::RotateCw).icon_size(IconSize::Small).tooltip(Tooltip::text("Refresh")).on_click(cx.listener(|this, _, _, cx| this.scan(true, cx))))
                                     .child(
                                         h_flex()
@@ -2444,6 +2628,43 @@ impl DatabaseView {
         lines
     }
 
+    /// Up and Down walk the command history; past the newest entry the input empties.
+    fn step_history(&mut self, older: bool, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        if self.command_history.is_empty() {
+            return;
+        }
+        let position = history_position(self.history_position, self.command_history.len(), older);
+        self.history_position = position;
+        let text = position
+            .and_then(|position| self.command_history.get(position))
+            .cloned()
+            .unwrap_or_default();
+        self.workbench_input
+            .update(cx, |input, cx| input.set_text(text, window, cx));
+    }
+
+    fn remember_command(&mut self, line: &str, cx: &mut Context<Self>) {
+        self.history_position = None;
+        if self.command_history.last().map(String::as_str) == Some(line) {
+            return;
+        }
+        self.command_history.push(line.to_string());
+        let excess = self.command_history.len().saturating_sub(COMMAND_HISTORY);
+        self.command_history.drain(..excess);
+        let history = self.command_history.clone();
+        cx.background_spawn(async move {
+            let path = command_history_path();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temporary = path.with_extension("json.tmp");
+            std::fs::write(&temporary, serde_json::to_vec_pretty(&history)?)?;
+            std::fs::rename(&temporary, &path)?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn render_command_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         h_flex()
@@ -2456,6 +2677,16 @@ impl DatabaseView {
             .bg(colors.editor_background)
             .on_action(
                 cx.listener(|this, _: &menu::Confirm, window, cx| this.run_workbench(window, cx)),
+            )
+            .capture_action(
+                cx.listener(|this, _: &zed_actions::editor::MoveUp, window, cx| {
+                    this.step_history(true, window, cx)
+                }),
+            )
+            .capture_action(
+                cx.listener(|this, _: &zed_actions::editor::MoveDown, window, cx| {
+                    this.step_history(false, window, cx)
+                }),
             )
             .child(Label::new(">").buffer_font(cx).color(Color::Muted))
             .child(div().flex_1().child(self.workbench_input.clone()))
@@ -2900,6 +3131,32 @@ impl DatabaseView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_history_position() {
+        assert_eq!(history_position(None, 0, true), None);
+        assert_eq!(history_position(None, 3, true), Some(2));
+        assert_eq!(history_position(Some(2), 3, true), Some(1));
+        assert_eq!(history_position(Some(0), 3, true), Some(0));
+        assert_eq!(history_position(Some(1), 3, false), Some(2));
+        assert_eq!(history_position(Some(2), 3, false), None);
+        assert_eq!(history_position(None, 3, false), None);
+    }
+
+    #[test]
+    fn test_command_candidates() {
+        let candidates = command_candidates("hge");
+        assert!(candidates.contains(&"HGET".to_string()));
+        assert!(candidates.contains(&"HGETALL".to_string()));
+        assert!(candidates.iter().all(|command| command.starts_with("HGE")));
+        // Writes are never offered.
+        assert!(
+            command_candidates("se")
+                .iter()
+                .all(|command| command != "SET")
+        );
+        assert!(command_candidates("fl").is_empty());
+    }
+
     #[test]
     fn test_rebuild_command() {
         let (text, partial) =

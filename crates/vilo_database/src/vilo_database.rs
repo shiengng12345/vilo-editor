@@ -350,6 +350,10 @@ pub struct DatabaseView {
     /// Searches the values of the open Redis key.
     value_search: Entity<Editor>,
     workbench_input: Entity<Editor>,
+    /// Workbench and CLI commands, oldest first, kept in database_redis_history.json.
+    command_history: Vec<String>,
+    /// Where Up/Down stands in `command_history` while browsing it.
+    history_position: Option<usize>,
     redis_state: Option<RedisState>,
     doc_write: Option<mongo_write::DocWrite>,
     redis_write: Option<redis_write::RedisWriteForm>,
@@ -484,13 +488,23 @@ impl DatabaseView {
             local_dates: false,
             pattern: editor("Filter by Key Name or Pattern", "", false, window, cx),
             value_search: editor("Search this key's values (Enter)", "", false, window, cx),
-            workbench_input: editor(
-                "Enter a Redis command, e.g. HGETALL user:1",
-                "",
-                false,
-                window,
-                cx,
-            ),
+            workbench_input: {
+                let input = editor(
+                    "Enter a Redis command, e.g. HGETALL user:1",
+                    "",
+                    false,
+                    window,
+                    cx,
+                );
+                input.update(cx, |input, _| {
+                    input.set_completion_provider(Some(std::rc::Rc::new(
+                        redis_view::CommandCompletions,
+                    )))
+                });
+                input
+            },
+            command_history: redis_view::load_command_history(),
+            history_position: None,
             redis_state: None,
             doc_write: None,
             redis_write: None,

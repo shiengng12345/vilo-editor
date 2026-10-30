@@ -137,6 +137,11 @@ const READ_COMMANDS: &[&str] = &[
     "CLUSTER",
 ];
 
+/// The read-only commands the Workbench and CLI accept, for completion.
+pub fn read_commands() -> &'static [&'static str] {
+    READ_COMMANDS
+}
+
 const DANGEROUS_COMMANDS: &[&str] = &[
     "KEYS",
     "FLUSHALL",
