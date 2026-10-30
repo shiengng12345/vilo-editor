@@ -257,6 +257,22 @@ impl Output {
         self.push("\"");
     }
 
+    /// A name from the data (class, global, field, label), escaped piece by piece: control
+    /// characters become \u{…}, so a name can never add lines or structure of its own.
+    fn push_name(&mut self, name: &str) {
+        let mut buffer = [0; 4];
+        for character in name.chars() {
+            if self.cut {
+                return;
+            }
+            if character.is_control() {
+                self.push(&format!("\\u{{{:x}}}", u32::from(character)));
+            } else {
+                self.push(character.encode_utf8(&mut buffer));
+            }
+        }
+    }
+
     /// Like `push_text`, with each lone surrogate shown as \u{…}.
     fn push_units(&mut self, units: &[u16]) {
         self.push("\"");
@@ -384,9 +400,11 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
         Node::List(ids) => items("[", ids, "]", out),
         Node::Tuple(ids) => items("(", ids, ")", out),
         Node::Set(ids) => items("{", ids, "}", out),
-        Node::Name(name) => out.push(&plain_name(name)),
+        Node::Name(name) => out.push_name(name),
         Node::Custom(label, bytes) => {
-            out.push(&format!("<{}: {} bytes ", plain_name(label), bytes.len()));
+            out.push("<");
+            out.push_name(label);
+            out.push(&format!(": {} bytes ", bytes.len()));
             out.push_bytes(bytes);
             out.push(">");
         }
@@ -407,7 +425,7 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
             }
         }
         Node::Object { class, fields } => {
-            out.push(&plain_name(class));
+            out.push_name(class);
             if fields.is_empty() {
                 out.push(" {}");
             } else {
@@ -415,7 +433,7 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
                 for (name, value) in fields {
                     out.push(&indent);
                     // A field name from the data never adds a line of its own.
-                    out.push(&plain_name(name));
+                    out.push_name(name);
                     out.push(": ");
                     render(arena, *value, depth + 1, path, out);
                     out.push(",\n");
@@ -741,6 +759,8 @@ impl Php<'_> {
                                 }
                             }
                             None => {
+                                // Remembered keys are held text too.
+                                self.arena.charge(fingerprint.len())?;
                                 positions.insert(fingerprint, pairs.len());
                                 pairs.push((key, value));
                             }
@@ -873,25 +893,6 @@ fn php_key(nodes: &[Node], key: Id) -> Option<Vec<u8>> {
         Node::Bytes(bytes) => [b"s".as_slice(), bytes].concat(),
         _ => return None,
     })
-}
-
-/// A name from the data (class, global, field, label) with its control characters escaped,
-/// so it can never add lines or structure of its own.
-fn plain_name(name: &str) -> std::borrow::Cow<'_, str> {
-    if !name.chars().any(char::is_control) {
-        return std::borrow::Cow::Borrowed(name);
-    }
-    std::borrow::Cow::Owned(
-        name.chars()
-            .map(|character| {
-                if character.is_control() {
-                    format!("\\u{{{:x}}}", u32::from(character))
-                } else {
-                    character.to_string()
-                }
-            })
-            .collect(),
-    )
 }
 
 /// Python pickle, read opcode by opcode. Globals are shown by name and calls as
@@ -1337,7 +1338,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 }
             }
             b'P' => {
-                let name = line!();
+                let name = name_line!();
                 push(
                     arena,
                     &mut stack,
@@ -3206,6 +3207,17 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_long_names_are_bounded() {
+        let mut persistent = b"P".to_vec();
+        persistent.extend(std::iter::repeat_n(0x01, 60_000));
+        persistent.extend_from_slice(b"\n.");
+        assert!(
+            decode(Decoder::Pickle, &persistent).is_err(),
+            "a persistent id past the name limit"
         );
     }
 
