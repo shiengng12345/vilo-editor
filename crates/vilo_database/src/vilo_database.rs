@@ -169,6 +169,12 @@ impl Level {
     }
 }
 
+#[derive(Clone, PartialEq)]
+enum Pick {
+    Kind(Kind),
+    Name(Level, String),
+}
+
 /// A site or environment being added (`original` is `None`) or renamed in the rail.
 struct NameEdit {
     level: Level,
@@ -261,6 +267,8 @@ pub struct DatabaseView {
     rail_peek: bool,
     /// Pinned columns stay in place even while a page is open.
     rail_pinned: bool,
+    /// Resting the pointer on a kind, site or environment picks it after a short pause.
+    hover_pick: Option<(Pick, Task<()>)>,
     tasks: Vec<Task<()>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
@@ -378,6 +386,7 @@ impl DatabaseView {
             redis_state: None,
             rail_peek: false,
             query_language: None,
+            hover_pick: None,
             rail_pinned: rail_pin_path().exists(),
             tasks: Vec::new(),
             _subscriptions: subscriptions,
@@ -539,6 +548,40 @@ impl DatabaseView {
             .filter(|name| names.contains(name))
             .or_else(|| names.first().cloned())
             .unwrap_or_default()
+    }
+
+    /// Picks `pick` once the pointer has rested on it; passing over on the way elsewhere picks nothing.
+    fn hover_pick(&mut self, hovered: bool, pick: Pick, cx: &mut Context<Self>) {
+        // Leaving one row and entering the next can arrive in either order; only cancel your own.
+        if !hovered {
+            if self
+                .hover_pick
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == pick)
+            {
+                self.hover_pick = None;
+            }
+            return;
+        }
+        let task = cx.spawn({
+            let pick = pick.clone();
+            async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                this.update(cx, |this, cx| {
+                    match pick {
+                        Pick::Kind(kind) => this.kind_view = kind,
+                        Pick::Name(level, name) => this.selected[level as usize] = Some(name),
+                    }
+                    this.form = None;
+                    this.hover_pick = None;
+                    cx.notify();
+                })
+                .ok();
+            }
+        });
+        self.hover_pick = Some((pick, task));
     }
 
     /// Whether the connection belongs to the kind, site and environment picked in the rail.
@@ -993,6 +1036,9 @@ impl DatabaseView {
                     .when(selected, |this| this.bg(colors.element_selected))
                     .hover(|style| style.bg(colors.element_hover))
                     .tooltip(Tooltip::text(kind.label()))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.hover_pick(*hovered, Pick::Kind(kind), cx)
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.kind_view = kind;
                         this.form = None;
@@ -1078,6 +1124,12 @@ impl DatabaseView {
                 .tooltip(Tooltip::text(format!(
                     "{name} · right-click to rename or delete"
                 )))
+                .on_hover({
+                    let name = select_name.clone();
+                    cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.hover_pick(*hovered, Pick::Name(level, name.clone()), cx)
+                    })
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.selected[level as usize] = Some(select_name.clone());
                     this.form = None;

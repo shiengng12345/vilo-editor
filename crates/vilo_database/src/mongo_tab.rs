@@ -29,7 +29,7 @@ use vilo_database_core::{
         ExplainSummary, FieldSummary, FindRequest, Hint, field_paths, summarize_explain,
         summarize_schema, to_display_json,
     },
-    shell::{parse_pipeline, parse_query},
+    shell::{format_query, parse_pipeline, parse_query},
 };
 
 use crate::{
@@ -2525,12 +2525,28 @@ impl DatabaseView {
             .query_editors()
             .iter()
             .all(|editor| editor.read(cx).text(cx).trim().is_empty());
-        let find = |this: &mut DatabaseView, cx: &mut Context<DatabaseView>| {
-            if let Some(tab) = this.tab_mut() {
-                tab.skip = 0;
-            }
-            this.find(cx);
-        };
+        let find =
+            |this: &mut DatabaseView, window: &mut Window, cx: &mut Context<DatabaseView>| {
+                if let Some(tab) = this.tab_mut() {
+                    tab.skip = 0;
+                    // Tidied when the query runs, not while typing, so the cursor never jumps.
+                    for editor in [
+                        &tab.filter,
+                        &tab.projection,
+                        &tab.sort,
+                        &tab.collation,
+                        &tab.hint,
+                    ] {
+                        let text = editor.read(cx).text(cx);
+                        if let Some(formatted) = format_query(&text)
+                            && formatted != text
+                        {
+                            editor.update(cx, |editor, cx| editor.set_text(formatted, window, cx));
+                        }
+                    }
+                }
+                this.find(cx);
+            };
         v_flex()
             .p_3()
             .gap_2()
@@ -2538,7 +2554,9 @@ impl DatabaseView {
             .border_1()
             .border_color(colors.border_variant)
             .bg(colors.surface_background)
-            .on_action(cx.listener(move |this, _: &menu::Confirm, _, cx| find(this, cx)))
+            .on_action(
+                cx.listener(move |this, _: &menu::Confirm, window, cx| find(this, window, cx)),
+            )
             .child(
                 h_flex()
                     .gap_2()
@@ -2575,8 +2593,9 @@ impl DatabaseView {
                             ),
                     )
                     .child(
-                        compass_primary("database-find", "Find", None, false)
-                            .on_click(cx.listener(move |this, _, _, cx| find(this, cx))),
+                        compass_primary("database-find", "Find", None, false).on_click(
+                            cx.listener(move |this, _, window, cx| find(this, window, cx)),
+                        ),
                     )
                     .child(
                         Button::new("database-options", "Options")
