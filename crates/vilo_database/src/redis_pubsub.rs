@@ -498,7 +498,7 @@ impl DatabaseView {
                     Ok((outcome, logged)) => {
                         if let Some(error) = logged {
                             this.unlogged_writes.push((
-                                operation,
+                                operation.clone(),
                                 format!("{summary} · its result is not in the log: {error}"),
                             ));
                         }
