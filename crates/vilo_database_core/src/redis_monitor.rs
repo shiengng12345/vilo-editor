@@ -282,8 +282,9 @@ trait Connection: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Connection for T {}
 
-/// TLS settings and the name the server's certificate is checked against.
-type Tls = (Arc<rustls::ClientConfig>, String);
+/// TLS settings, the node's own name for the handshake, and the connected host to fall back to
+/// when rustls does not take the node's name (certificates are checked against that host anyway).
+type Tls = (Arc<rustls::ClientConfig>, String, String);
 
 async fn open(
     host: String,
@@ -298,9 +299,10 @@ async fn open(
         .with_context(|| format!("Could not connect to {host} port {port} for the profiler"))?;
     let stream: Box<dyn Connection> = match tls {
         None => Box::new(stream),
-        Some((config, name)) => {
-            let name = rustls::pki_types::ServerName::try_from(name.clone())
-                .with_context(|| format!("{name} is not a valid TLS server name"))?;
+        Some((config, node, connected)) => {
+            let name = rustls::pki_types::ServerName::try_from(node.clone())
+                .or_else(|_| rustls::pki_types::ServerName::try_from(connected.clone()))
+                .with_context(|| format!("{node} is not a valid TLS server name"))?;
             Box::new(
                 tokio_rustls::TlsConnector::from(config)
                     .connect(name, stream)
@@ -343,10 +345,9 @@ impl RedisSession {
         let port = server.port;
         // The node's own name for the handshake; the certificate is checked against the
         // connected host by the session's verifier.
-        let tls = self
-            .tls
-            .clone()
-            .map(|config| (config, host.trim_matches(['[', ']']).to_string()));
+        let tls = self.tls.clone().map(|(config, connected)| {
+            (config, host.trim_matches(['[', ']']).to_string(), connected)
+        });
         let username = self.config.username.clone();
         let password = self.config.password.clone();
         let shared = Arc::new(Mutex::new(Shared::default()));

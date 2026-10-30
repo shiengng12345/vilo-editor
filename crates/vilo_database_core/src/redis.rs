@@ -17,8 +17,9 @@ pub struct RedisSession {
     pub(crate) client: Client,
     /// Kept so Pub/Sub can open its own connection with the same settings.
     pub(crate) config: Config,
-    /// The TLS settings of a `rediss` connection, for the connections Vilo opens itself (MONITOR).
-    pub(crate) tls: Option<Arc<rustls::ClientConfig>>,
+    /// The TLS settings of a `rediss` connection and the host certificates are checked against,
+    /// for the connections Vilo opens itself (MONITOR).
+    pub(crate) tls: Option<(Arc<rustls::ClientConfig>, String)>,
     /// Something the user should know about how the session was set up.
     notice: Option<String>,
     clustered: bool,
@@ -805,17 +806,18 @@ impl RedisSession {
                 hostnames: fred::types::config::TlsHostMapping::None,
             });
         }
+        let tls_pair = tls_config.clone().map(|config| (config, host.clone()));
         let selects = database
             .or(config.database)
             .is_some_and(|database| database > 0);
-        let session = match Self::open(config.clone(), database, tls_config.clone()).await {
+        let session = match Self::open(config.clone(), database, tls_pair.clone()).await {
             Ok(session) => session,
             // A cluster node refuses SELECT; asked once more without it, the node says whether it
             // is one, whatever words its refusal used.
             Err(error) if selects => {
                 let mut plain = config;
                 plain.database = None;
-                if let Ok(probe) = Self::open(plain, None, tls_config.clone()).await {
+                if let Ok(probe) = Self::open(plain, None, tls_pair.clone()).await {
                     let cluster = probe.is_cluster_node().await.unwrap_or(false);
                     probe.quit().await.ok();
                     anyhow::ensure!(
@@ -861,7 +863,7 @@ impl RedisSession {
         if tls_config.is_some() {
             unbracket_tls_names(&mut cluster);
         }
-        Self::open(cluster, None, tls_config).await
+        Self::open(cluster, None, tls_pair).await
     }
 
     /// Whether the server this single connection reached runs in cluster mode.
@@ -877,7 +879,7 @@ impl RedisSession {
     async fn open(
         mut config: Config,
         database: Option<u8>,
-        tls: Option<Arc<rustls::ClientConfig>>,
+        tls: Option<(Arc<rustls::ClientConfig>, String)>,
     ) -> Result<Self> {
         let clustered = config.server.is_clustered();
         if let Some(database) = database {

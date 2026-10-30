@@ -242,6 +242,10 @@ pub fn client_config(settings: &RedisTls, host: &str) -> Result<ClientConfig> {
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedName { inner, name }))
     } else {
+        // Not needed with the check off, but a path the user gave is still read, so a typo shows.
+        if let Some(path) = &settings.ca_file {
+            certificates(path, "CA certificate")?;
+        }
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AnyServer(provider)))
@@ -322,6 +326,14 @@ mod tests {
         assert!(
             format!("{:#}", client_config(&missing, "localhost").unwrap_err())
                 .contains("Could not read")
+        );
+        let unchecked_typo = RedisTls {
+            verify: false,
+            ..missing.clone()
+        };
+        assert!(
+            client_config(&unchecked_typo, "localhost").is_err(),
+            "a CA path given with the check off is still read"
         );
         assert!(
             client_config(&RedisTls::default(), "localhost").is_ok(),
