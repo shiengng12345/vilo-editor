@@ -384,9 +384,9 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
         Node::List(ids) => items("[", ids, "]", out),
         Node::Tuple(ids) => items("(", ids, ")", out),
         Node::Set(ids) => items("{", ids, "}", out),
-        Node::Name(name) => out.push(name),
+        Node::Name(name) => out.push(&plain_name(name)),
         Node::Custom(label, bytes) => {
-            out.push(&format!("<{label}: {} bytes ", bytes.len()));
+            out.push(&format!("<{}: {} bytes ", plain_name(label), bytes.len()));
             out.push_bytes(bytes);
             out.push(">");
         }
@@ -407,7 +407,7 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
             }
         }
         Node::Object { class, fields } => {
-            out.push(class);
+            out.push(&plain_name(class));
             if fields.is_empty() {
                 out.push(" {}");
             } else {
@@ -415,7 +415,7 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
                 for (name, value) in fields {
                     out.push(&indent);
                     // A field name from the data never adds a line of its own.
-                    out.push(&name.replace(|character: char| character.is_control(), "?"));
+                    out.push(&plain_name(name));
                     out.push(": ");
                     render(arena, *value, depth + 1, path, out);
                     out.push(",\n");
@@ -725,12 +725,28 @@ impl Php<'_> {
                 let length = self.count(b':')?;
                 self.expect(b'{')?;
                 let id = self.remember(Node::Map(Vec::new()))?;
-                let mut pairs = Vec::new();
+                let mut pairs: Vec<(Id, Id)> = Vec::new();
+                let mut positions: std::collections::HashMap<Vec<u8>, usize> =
+                    std::collections::HashMap::new();
                 for _ in 0..length {
                     self.arena.entries(1)?;
                     let key = self.key()?;
                     let value = self.value(depth + 1)?;
-                    pairs.push((key, value));
+                    // A key given again replaces the earlier value in its place, as PHP does.
+                    match php_key(&self.arena.nodes, key) {
+                        Some(fingerprint) => match positions.get(&fingerprint) {
+                            Some(&position) => {
+                                if let Some(pair) = pairs.get_mut(position) {
+                                    pair.1 = value;
+                                }
+                            }
+                            None => {
+                                positions.insert(fingerprint, pairs.len());
+                                pairs.push((key, value));
+                            }
+                        },
+                        None => pairs.push((key, value)),
+                    }
                 }
                 self.expect(b'}')?;
                 self.arena.replace(id, Node::Map(pairs))?;
@@ -836,6 +852,46 @@ impl Php<'_> {
             None => quoted(&name),
         })
     }
+}
+
+/// A PHP array key as PHP compares them: a string that is a plain decimal integer is that
+/// integer ("1" is 1, "01" stays a string).
+fn php_key(nodes: &[Node], key: Id) -> Option<Vec<u8>> {
+    let integer = |text: &str| {
+        let plain = text == "0"
+            || text
+                .strip_prefix('-')
+                .unwrap_or(text)
+                .strip_prefix(|character: char| ('1'..='9').contains(&character))
+                .is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()));
+        plain && text.parse::<i64>().is_ok()
+    };
+    Some(match nodes.get(key)? {
+        Node::Int(text) => [b"i".as_slice(), text.as_bytes()].concat(),
+        Node::Text(text) if integer(text) => [b"i".as_slice(), text.as_bytes()].concat(),
+        Node::Text(text) => [b"s".as_slice(), text.as_bytes()].concat(),
+        Node::Bytes(bytes) => [b"s".as_slice(), bytes].concat(),
+        _ => return None,
+    })
+}
+
+/// A name from the data (class, global, field, label) with its control characters escaped,
+/// so it can never add lines or structure of its own.
+fn plain_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if !name.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    std::borrow::Cow::Owned(
+        name.chars()
+            .map(|character| {
+                if character.is_control() {
+                    format!("\\u{{{:x}}}", u32::from(character))
+                } else {
+                    character.to_string()
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Python pickle, read opcode by opcode. Globals are shown by name and calls as
@@ -3097,6 +3153,34 @@ mod tests {
             text.contains("Child external data") && !text.contains("Parent external"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn test_php_keys_and_plain_names() {
+        // php 8.3 unserialize: {"x" => 2, 1 => 3}, {1 => "b"}, {"01" => 1, 1 => 2}.
+        assert_eq!(
+            decode(
+                Decoder::Php,
+                br#"a:3:{s:1:"x";i:1;s:1:"x";i:2;s:1:"1";i:3;}"#
+            )
+            .unwrap(),
+            "{\n  \"x\": 2,\n  \"1\": 3,\n}"
+        );
+        assert_eq!(
+            decode(Decoder::Php, br#"a:2:{i:1;s:1:"a";s:1:"1";s:1:"b";}"#).unwrap(),
+            "{\n  1: \"b\",\n}"
+        );
+        assert_eq!(
+            decode(Decoder::Php, br#"a:2:{s:2:"01";i:1;i:1;i:2;}"#)
+                .unwrap()
+                .matches(": ")
+                .count(),
+            2
+        );
+        // A class name with a newline cannot add a line.
+        let forged = decode(Decoder::Pickle, b"Vm\nVThing\\u000a  forged: 7\n\x93)R.").unwrap();
+        assert!(!forged.contains("\n  forged"), "{forged}");
+        assert!(forged.contains(r#"Thing\u{a}  forged: 7"#), "{forged}");
     }
 
     #[test]
