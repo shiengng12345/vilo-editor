@@ -63,26 +63,40 @@ fn fields_text(content: &Content) -> (bool, String) {
         Content::Missing(reason) => (true, reason.clone()),
         Content::Fields(fields) => {
             let mut text = String::new();
+            let mut characters = 0;
             for field in fields {
-                if text.chars().count() >= ROW_CHARACTERS {
+                if characters >= ROW_CHARACTERS {
                     break;
                 }
+                let mut part = String::new();
                 if !text.is_empty() {
-                    text.push_str("  ·  ");
+                    part.push_str("  ·  ");
                 }
-                text.push_str(&escape_bytes(&field.name));
-                text.push_str(": ");
+                part.push_str(&escape_bytes(&field.name));
+                part.push_str(": ");
                 // No character takes more than four bytes, so this prefix fills the row.
                 let shown = field.value.len().min(ROW_CHARACTERS * 4);
-                text.push_str(&escape_bytes(&field.value[..shown]));
-                if field.size > field.value.len() {
-                    text.push_str(&format!(" … cut, {} bytes in all", field.size));
-                }
+                part.push_str(&escape_bytes(&field.value[..shown]));
+                characters += part.chars().count();
+                text.push_str(&part);
             }
-            let cut = text.chars().count() > ROW_CHARACTERS;
-            let mut text = text.chars().take(ROW_CHARACTERS).collect::<String>();
-            if cut {
+            let mut text = if characters > ROW_CHARACTERS {
+                let mut text = text.chars().take(ROW_CHARACTERS).collect::<String>();
                 text.push_str(" …");
+                text
+            } else {
+                text
+            };
+            // Said after the row is shortened, so the note itself is never cut off.
+            let cut = fields
+                .iter()
+                .filter(|field| field.size > field.value.len())
+                .count();
+            if cut > 0 {
+                text.push_str(&format!(
+                    "  [values over {} KB are cut ({cut}); open the key to see them in full]",
+                    MAX_VALUE_BYTES / 1024
+                ));
             }
             (false, text)
         }
@@ -185,12 +199,24 @@ impl DatabaseView {
                     .as_ref()
                     .ok()
                     .and_then(|(names, _)| names.first().cloned());
+                let listed = result.is_ok();
                 search.indexes = Some(result.map_err(|error| format!("{error:#}").into()));
                 let keep = search.index.as_ref().is_some_and(|index| {
                     matches!(&search.indexes, Some(Ok((names, _))) if names.contains(index))
                 });
-                if !keep && let Some(first) = first {
-                    this.choose_search_index(first, cx);
+                if listed && !keep {
+                    // The chosen index is gone: nothing about it, or still on its way, is shown.
+                    search.index = None;
+                    search.info = None;
+                    search.page = None;
+                    search.rows.clear();
+                    search.shown = None;
+                    search.running = false;
+                    search.info_attempt += 1;
+                    search.search_attempt += 1;
+                    if let Some(first) = first {
+                        this.choose_search_index(first, cx);
+                    }
                 }
                 cx.notify();
             })
@@ -435,10 +461,14 @@ impl DatabaseView {
                     format!("No results on this page · {} found", page.total)
                 } else {
                     format!(
-                        "{}–{} of {}",
+                        "{}–{} of {} for {}",
                         offset + 1,
                         offset + page.hits.len() as u64,
-                        page.total
+                        page.total,
+                        search
+                            .shown
+                            .as_ref()
+                            .map_or(String::new(), |shown| shown.query.clone())
                     )
                 };
                 Some((summary, Color::Default))
@@ -633,7 +663,10 @@ mod tests {
         assert_eq!(text, "n: 1  ·  title: red\\x0aapple");
 
         let (_, text) = fields_text(&Content::Fields(vec![field("body", b"abc", 70_000)]));
-        assert_eq!(text, "body: abc … cut, 70000 bytes in all");
+        assert_eq!(
+            text,
+            "body: abc  [values over 64 KB are cut (1); open the key to see them in full]"
+        );
 
         let long = vec![b'x'; 2000];
         let (_, text) = fields_text(&Content::Fields(vec![
@@ -642,6 +675,12 @@ mod tests {
         ]));
         assert_eq!(text.chars().count(), ROW_CHARACTERS + 2);
         assert!(text.ends_with(" …") && !text.contains("never"));
+
+        let (_, text) = fields_text(&Content::Fields(vec![field("a", &long, 70_000)]));
+        assert!(
+            text.ends_with("…  [values over 64 KB are cut (1); open the key to see them in full]"),
+            "the note survives shortening: {text}"
+        );
 
         let (missing, text) = fields_text(&Content::Missing("gone".into()));
         assert!(missing);
