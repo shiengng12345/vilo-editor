@@ -24,6 +24,12 @@ const MAX_OUTPUT: usize = 1_000_000;
 /// Entries all containers of one input may hold together, references included, so a few memo
 /// references cannot stand for unbounded work.
 const MAX_ENTRIES: usize = 1_000_000;
+/// Bytes of text all values of one input may hold together; class and field names copied into
+/// each object count too, so a long name shared by many objects cannot multiply memory.
+const MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Reading steps for one Java input, never given back when a guess is rolled back, so nested
+/// guesses cannot multiply the work.
+const MAX_STEPS: usize = 2_000_000;
 /// Bytes a pickle global's name may have; names are built by joining others, so unbounded
 /// joining could grow a tiny input into a huge allocation.
 const MAX_NAME: usize = 4096;
@@ -62,10 +68,43 @@ enum Node {
 struct Arena {
     nodes: Vec<Node>,
     entries: usize,
+    bytes: usize,
+}
+
+fn text_size(node: &Node) -> usize {
+    match node {
+        Node::Text(text) | Node::Int(text) | Node::Name(text) => text.len(),
+        Node::Bytes(bytes) => bytes.len(),
+        Node::Custom(label, bytes) => label.len() + bytes.len(),
+        Node::Object { class, fields } => {
+            class.len() + fields.iter().map(|(name, _)| name.len()).sum::<usize>()
+        }
+        _ => 0,
+    }
 }
 
 impl Arena {
+    /// Counts text about to be held against `MAX_BYTES`; called before copying it.
+    fn charge(&mut self, bytes: usize) -> Result<(), String> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes > MAX_BYTES {
+            return Err(format!(
+                "more than {} MB of text; not read further",
+                MAX_BYTES / (1024 * 1024)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Replaces a placeholder with the value it became, counting its text.
+    fn replace(&mut self, id: Id, node: Node) -> Result<(), String> {
+        self.charge(text_size(&node))?;
+        *self.get_mut(id)? = node;
+        Ok(())
+    }
+
     fn add(&mut self, node: Node) -> Result<Id, String> {
+        self.charge(text_size(&node))?;
         if self.nodes.len() >= MAX_NODES {
             return Err(format!("more than {MAX_NODES} values; not read further"));
         }
@@ -107,6 +146,7 @@ pub fn decode(decoder: Decoder, bytes: &[u8]) -> Result<String, String> {
             at: 0,
             arena: &mut arena,
             handles: Vec::new(),
+            steps: 0,
         }
         .read_all()?,
         Decoder::Float32Vector => return floats(bytes, 4),
@@ -580,7 +620,7 @@ impl Php<'_> {
                     pairs.push((key, value));
                 }
                 self.expect(b'}')?;
-                *self.arena.get_mut(id)? = Node::Map(pairs);
+                self.arena.replace(id, Node::Map(pairs))?;
                 Ok(id)
             }
             b'O' => {
@@ -599,7 +639,7 @@ impl Php<'_> {
                     fields.push((name, value));
                 }
                 self.expect(b'}')?;
-                *self.arena.get_mut(id)? = Node::Object { class, fields };
+                self.arena.replace(id, Node::Object { class, fields })?;
                 Ok(id)
             }
             b'C' => {
@@ -1120,6 +1160,7 @@ struct Java<'a> {
     arena: &'a mut Arena,
     /// What each handle (numbered from 0x7E0000) stands for: a value or a class description.
     handles: Vec<Handle>,
+    steps: usize,
 }
 
 #[derive(Clone)]
@@ -1130,6 +1171,8 @@ enum Handle {
 
 struct ClassDesc {
     name: String,
+    /// Text copied into every object of this class: its name and its field names.
+    copied: usize,
     /// Classes above this one, which bounds the hierarchy however it was reached.
     ancestors: usize,
     flags: u8,
@@ -1243,8 +1286,11 @@ impl Java<'_> {
                 self.annotations(depth + 1)?;
                 let parent = self.class_desc(depth + 1)?;
                 let ancestors = self.ancestors(&parent)?;
+                let copied =
+                    name.len() + fields.iter().map(|(_, field)| field.len()).sum::<usize>();
                 let class = std::rc::Rc::new(ClassDesc {
                     name,
+                    copied,
                     ancestors,
                     flags,
                     fields,
@@ -1268,8 +1314,10 @@ impl Java<'_> {
                 self.annotations(depth + 1)?;
                 let parent = self.class_desc(depth + 1)?;
                 let ancestors = self.ancestors(&parent)?;
+                let name = format!("proxy for {}", names.join(", "));
                 let class = std::rc::Rc::new(ClassDesc {
-                    name: format!("proxy for {}", names.join(", ")),
+                    copied: name.len(),
+                    name,
                     ancestors,
                     flags: SC_SERIALIZABLE,
                     fields: Vec::new(),
@@ -1331,6 +1379,8 @@ impl Java<'_> {
         depth: usize,
     ) -> Result<Vec<(String, Id)>, String> {
         let mut fields = Vec::new();
+        self.arena
+            .charge(class.fields.iter().map(|(_, name)| name.len()).sum())?;
         for (code, name) in &class.fields {
             let value = if *code == b'L' || *code == b'[' {
                 self.content(depth + 1)?
@@ -1346,6 +1396,10 @@ impl Java<'_> {
     fn content(&mut self, depth: usize) -> Result<Id, String> {
         if depth > MAX_DEPTH {
             return self.error("nested too deeply");
+        }
+        self.steps += 1;
+        if self.steps > MAX_STEPS {
+            return self.error("too much to read");
         }
         let code = self.u8()?;
         match code {
@@ -1423,7 +1477,7 @@ impl Java<'_> {
                         self.arena.add(node)?
                     });
                 }
-                *self.arena.get_mut(id)? = Node::List(items);
+                self.arena.replace(id, Node::List(items))?;
                 Ok(id)
             }
             0x73 => {
@@ -1431,6 +1485,8 @@ impl Java<'_> {
                 let Some(class) = class else {
                     return self.error("an object without a class");
                 };
+                // The class's text is copied into this object (and each placeholder); counted first.
+                self.arena.charge(class.copied)?;
                 let id = self.arena.add(Node::Object {
                     class: class.name.clone(),
                     fields: Vec::new(),
@@ -1491,16 +1547,28 @@ impl Java<'_> {
                             (Vec::new(), self.annotations(depth + 1)?)
                         }
                     };
+                    // Fields read from a class with its own writeObject rest on the assumption that
+                    // it called defaultWriteObject first; that is said, not asserted.
+                    if !defaults.is_empty() {
+                        let note = self.arena.add(Node::Name(
+                            "<read assuming its writeObject called defaultWriteObject first>"
+                                .into(),
+                        ))?;
+                        fields.push((format!("{} fields", class.name), note));
+                    }
                     fields.extend(defaults);
                     if !items.is_empty() {
                         let custom = self.arena.add(Node::List(items))?;
                         fields.push((format!("{} custom data", class.name), custom));
                     }
                 }
-                *self.arena.get_mut(id)? = Node::Object {
-                    class: class.name.clone(),
-                    fields,
-                };
+                self.arena.replace(
+                    id,
+                    Node::Object {
+                        class: class.name.clone(),
+                        fields,
+                    },
+                )?;
                 Ok(id)
             }
             0x77 => {
@@ -1933,6 +2001,37 @@ mod tests {
         assert!(!text.contains("x: "), "{text}");
         assert!(
             text.contains("may or may not hold them") && text.contains(r#"\x00*"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_shared_class_text_is_counted() {
+        // One class with a 60,000-byte name, then many objects of it by reference.
+        let mut bytes = b"\xac\xed\x00\x05\x73\x72".to_vec();
+        bytes.extend_from_slice(&60_000_u16.to_be_bytes());
+        bytes.extend(std::iter::repeat_n(b'N', 60_000));
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(&[0x02, 0x00, 0x00, 0x78, 0x70]);
+        for _ in 0..5_000 {
+            bytes.extend_from_slice(&[0x73, 0x71, 0x00, 0x7e, 0x00, 0x00]);
+        }
+        assert!(
+            decode(Decoder::Java, &bytes).is_err(),
+            "copies of the name are counted"
+        );
+        // A class with one Object field whose writeObject wrote only a string of its own:
+        // whatever is shown says it rests on an assumption.
+        let mut own = b"\xac\xed\x00\x05\x73\x72\x00\x01A".to_vec();
+        own.extend_from_slice(&[0; 8]);
+        own.extend_from_slice(&[0x03, 0x00, 0x01, b'L', 0x00, 0x01, b'x', 0x74, 0x00, 0x12]);
+        own.extend_from_slice(b"Ljava/lang/Object;");
+        own.extend_from_slice(&[0x78, 0x70, 0x74, 0x00, 0x06]);
+        own.extend_from_slice(b"custom");
+        own.push(0x78);
+        let text = decode(Decoder::Java, &own).unwrap();
+        assert!(
+            text.contains("assuming its writeObject called defaultWriteObject"),
             "{text}"
         );
     }

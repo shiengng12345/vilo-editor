@@ -772,7 +772,19 @@ fn formatted(bytes: &[u8], format: Format) -> String {
         Format::Unicode => text(),
         // Read for its structure only; a value in another form says why and shows as text.
         Format::Decoded(decoder) => vilo_database_core::formats::decode(decoder, bytes)
-            .unwrap_or_else(|error| format!("({error})\n{}", text())),
+            .unwrap_or_else(|error| {
+                // The text after the reason is bounded like a decoded value.
+                const SHOWN: usize = 1_000_000;
+                let shown = &bytes[..bytes.len().min(SHOWN)];
+                let text =
+                    String::from_utf8(shown.to_vec()).unwrap_or_else(|_| escape_bytes(shown));
+                let rest = if bytes.len() > SHOWN {
+                    format!("\n… cut at {} KB", SHOWN / 1000)
+                } else {
+                    String::new()
+                };
+                format!("({error})\n{text}{rest}")
+            }),
     }
 }
 
@@ -4062,6 +4074,12 @@ mod tests {
         assert!(
             formatted(b"plain", Format::Decoded(Decoder::Java)).ends_with(")\nplain"),
             "a value in another form says why, then shows as text"
+        );
+        let huge = vec![b'a'; 3_000_000];
+        let shown = formatted(&huge, Format::Decoded(Decoder::Java));
+        assert!(
+            shown.len() < 1_100_000 && shown.ends_with("KB"),
+            "the fallback text is bounded"
         );
         assert_eq!(describe_ttl(-1), "No limit");
         assert_eq!(describe_ttl(90_000), "1 min");
