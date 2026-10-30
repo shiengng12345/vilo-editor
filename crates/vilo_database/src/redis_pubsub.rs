@@ -332,6 +332,14 @@ impl DatabaseView {
         if channel.is_empty() {
             return refuse(self, "Name the channel.", cx);
         }
+        // Until the write log was read, an unsettled publish from before a restart is not known.
+        if !self.write_log_checked {
+            return refuse(
+                self,
+                "Vilo has not finished checking the write log for unsettled writes, so it does not publish yet. If the log could not be read, its banner says why.",
+                cx,
+            );
+        }
         if mongo_write::guarded(&connection) && typed.trim() != connection.name.trim() {
             return refuse(self, "Type the connection name exactly to confirm.", cx);
         }

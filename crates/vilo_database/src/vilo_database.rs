@@ -370,6 +370,8 @@ pub struct DatabaseView {
     /// Channels with a publish that is still awaiting its answer or ended unknown, by lock key:
     /// the operation that holds the lock, and whether its outcome is unknown (else pending).
     publish_locks: HashMap<String, (String, bool)>,
+    /// The write log was read since start, so locks of unsettled publishes are restored.
+    write_log_checked: bool,
     write_notice: Option<SharedString>,
     /// Writes from earlier runs whose result never reached the write log.
     dangling_writes: Vec<(String, String)>,
@@ -539,6 +541,7 @@ impl DatabaseView {
             session_writes: Default::default(),
             unknown_writes: Default::default(),
             publish_locks: Default::default(),
+            write_log_checked: false,
             write_notice: None,
             dangling_writes: Vec::new(),
             unlogged_writes: Vec::new(),
@@ -1966,6 +1969,7 @@ impl DatabaseView {
                             .into_iter()
                             .map(|(operation, summary, ..)| (operation, summary))
                             .collect();
+                        this.write_log_checked = true;
                         this.audit_problem = None;
                     }
                     Err(error) => this.audit_problem = Some(
