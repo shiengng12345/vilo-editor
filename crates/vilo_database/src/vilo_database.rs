@@ -12,7 +12,7 @@ use gpui::{
 };
 use gpui_tokio::Tokio;
 use serde::{Deserialize, Serialize};
-use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
+use ui::{Button, ButtonStyle, IconButton, Tooltip, prelude::*};
 use util::ResultExt as _;
 use vilo_database_core::{
     mongo::{CollectionInfo, DatabaseInfo, MongoSession},
@@ -122,6 +122,44 @@ enum Session {
     Redis(Arc<RedisSession>),
 }
 
+struct SiteEdit {
+    kind: Kind,
+    original: Option<String>,
+    editor: Entity<Editor>,
+}
+
+fn sites_path() -> PathBuf {
+    paths::config_dir().join("database_sites.json")
+}
+
+fn write_sites(sites: Vec<String>, cx: &mut App) {
+    cx.background_spawn(async move {
+        let path = sites_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&sites)?)?;
+        std::fs::rename(&temporary, &path)?;
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
+/// Checks a site name typed in the rail against the others (case is ignored).
+fn check_site_name(name: &str, others: &[String]) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Type a site name.");
+    }
+    if name.eq_ignore_ascii_case(UNASSIGNED_SITE) {
+        return Err("That name is reserved.");
+    }
+    if others.iter().any(|other| other.eq_ignore_ascii_case(name)) {
+        return Err("That site already exists.");
+    }
+    Ok(())
+}
+
 struct Form {
     editing: Option<String>,
     kind: Kind,
@@ -152,6 +190,11 @@ pub struct DatabaseView {
     kind_view: Kind,
     /// The site whose connections the sidebar lists.
     site: Option<String>,
+    /// Sites the user keeps (CP, BP …), shared by MongoDB and Redis; saved in `database_sites.json`.
+    site_list: Vec<String>,
+    /// A site being added (`original` is `None`) or renamed, under one kind in the rail.
+    site_edit: Option<SiteEdit>,
+    site_message: Option<SharedString>,
     /// Searches connections and collections at once, keeping each match's parents visible.
     search: Entity<Editor>,
     tabs: Vec<MongoTab>,
@@ -222,6 +265,17 @@ impl DatabaseView {
             .into_iter()
             .filter_map(|entry| serde_json::from_value::<Connection>(entry).log_err())
             .collect::<Vec<_>>();
+        // Saved sites, plus any a connection names that the list does not have yet.
+        let mut site_list: Vec<String> = std::fs::read(sites_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).log_err())
+            .unwrap_or_default();
+        for connection in &connections {
+            let site = connection.site.trim();
+            if !site.is_empty() && !site_list.iter().any(|known| known == site) {
+                site_list.push(site.to_string());
+            }
+        }
         let search = editor("Search connections and collections", "", false, window, cx);
         let subscriptions = vec![
             cx.subscribe(&search, |this, _, _: &editor::EditorEvent, cx| {
@@ -246,6 +300,9 @@ impl DatabaseView {
             collections: HashMap::default(),
             kind_view: Kind::MongoDb,
             site: None,
+            site_list,
+            site_edit: None,
+            site_message: None,
             search,
             tabs: Vec::new(),
             active_tab: None,
@@ -283,17 +340,122 @@ impl DatabaseView {
         })
     }
 
-    /// Every site that has a connection, sorted, with unassigned ones last.
+    /// The user's sites, sorted, then Unassigned when some connection has no site.
     fn sites(&self) -> Vec<String> {
-        let mut sites = self
+        let mut sites = self.site_list.clone();
+        sites.sort_by_key(|site| site.to_lowercase());
+        if self
             .connections
             .iter()
-            .filter(|connection| connection.kind == self.kind_view)
-            .map(Connection::site_label)
-            .collect::<Vec<_>>();
-        sites.sort_by_key(|site| (site == UNASSIGNED_SITE, site.clone()));
-        sites.dedup();
+            .any(|connection| connection.site.trim().is_empty())
+        {
+            sites.push(UNASSIGNED_SITE.to_string());
+        }
         sites
+    }
+
+    fn persist_sites(&self, cx: &mut Context<Self>) {
+        write_sites(self.site_list.clone(), cx);
+    }
+
+    fn start_site_edit(
+        &mut self,
+        kind: Kind,
+        original: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = editor(
+            "Site name, e.g. CP",
+            original.as_deref().unwrap_or_default(),
+            false,
+            window,
+            cx,
+        );
+        window.focus(&editor.focus_handle(cx), cx);
+        self.site_edit = Some(SiteEdit {
+            kind,
+            original,
+            editor,
+        });
+        self.site_message = None;
+        cx.notify();
+    }
+
+    fn save_site_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = &self.site_edit else {
+            return;
+        };
+        let name = edit.editor.read(cx).text(cx).trim().to_string();
+        let original = edit.original.clone();
+        let others = self
+            .site_list
+            .iter()
+            .filter(|site| Some(*site) != original.as_ref())
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(message) = check_site_name(&name, &others) {
+            self.site_message = Some(message.into());
+            cx.notify();
+            return;
+        }
+        match original {
+            Some(old) => {
+                for site in &mut self.site_list {
+                    if *site == old {
+                        *site = name.clone();
+                    }
+                }
+                // Connections move with their site.
+                let mut moved = false;
+                for connection in &mut self.connections {
+                    if connection.site.trim() == old {
+                        connection.site = name.clone();
+                        moved = true;
+                    }
+                }
+                if moved {
+                    self.persist(cx).detach_and_log_err(cx);
+                }
+                if self.site.as_deref() == Some(old.as_str()) {
+                    self.site = Some(name);
+                }
+            }
+            None => {
+                self.site = Some(name.clone());
+                self.site_list.push(name);
+            }
+        }
+        self.site_edit = None;
+        self.site_message = None;
+        self.persist_sites(cx);
+        cx.notify();
+    }
+
+    fn delete_site(&mut self, site: String, cx: &mut Context<Self>) {
+        let used = self
+            .connections
+            .iter()
+            .filter(|connection| connection.site.trim() == site)
+            .count();
+        if used > 0 {
+            self.site_message = Some(
+                format!(
+                    "{site} has {used} connection{}; move or delete them first.",
+                    if used == 1 { "" } else { "s" }
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+        self.site_list.retain(|known| *known != site);
+        if self.site.as_deref() == Some(site.as_str()) {
+            self.site = None;
+        }
+        self.site_message = None;
+        self.persist_sites(cx);
+        cx.notify();
     }
 
     fn current_site(&self) -> String {
@@ -552,6 +714,10 @@ impl DatabaseView {
             site: site.clone(),
             environment,
         };
+        if !self.site_list.contains(&site) {
+            self.site_list.push(site.clone());
+            write_sites(self.site_list.clone(), cx);
+        }
         self.site = Some(site);
         form.checking = true;
         form.message = Some("Connecting…".into());
@@ -693,61 +859,180 @@ fn render_lines(
 }
 
 impl DatabaseView {
-    /// The first level of the module: MongoDB or Redis.
+    /// The first level of the module: MongoDB and Redis, each with the user's sites under it.
     fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let item = |id: &'static str, kind: Kind, icon: IconName, cx: &mut Context<Self>| {
-            let selected = self.kind_view == kind;
-            h_flex()
-                .id(id)
-                .h(px(36.))
-                .px_3()
-                .gap_2()
-                .cursor_pointer()
-                .border_l_2()
-                .border_color(if selected {
-                    colors.text_accent
-                } else {
-                    gpui::transparent_black()
-                })
-                .when(selected, |this| this.bg(colors.element_selected))
-                .hover(|style| style.bg(colors.element_hover))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.kind_view = kind;
-                    this.form = None;
-                    cx.notify();
-                }))
-                .child(Icon::new(icon).size(IconSize::Small).color(if selected {
-                    Color::Default
-                } else {
-                    Color::Muted
-                }))
-                .child(Label::new(kind.label()).color(if selected {
-                    Color::Default
-                } else {
-                    Color::Muted
-                }))
-        };
-        v_flex()
-            .w(px(132.))
+        let sites = self.sites();
+        let current_site = self.current_site();
+        let mut rail = v_flex()
+            .id("database-rail")
+            .w(px(176.))
             .flex_none()
             .h_full()
+            .overflow_y_scroll()
             .border_r_1()
             .border_color(colors.border)
             .bg(colors.panel_background)
-            .child(section("DATABASE"))
-            .child(item(
-                "database-rail-mongo",
-                Kind::MongoDb,
-                IconName::DatabaseZap,
-                cx,
-            ))
-            .child(item(
-                "database-rail-redis",
-                Kind::Redis,
-                IconName::Server,
-                cx,
-            ))
+            .child(section("DATABASE"));
+        let edit_row = |edit: &SiteEdit, cx: &mut Context<Self>| {
+            h_flex()
+                .pl_6()
+                .pr_1()
+                .py_0p5()
+                .gap_1()
+                .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.save_site_edit(cx)))
+                .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
+                    this.site_edit = None;
+                    this.site_message = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(boxed(edit.editor.clone(), cx)),
+                )
+                .child(
+                    IconButton::new("database-site-save", IconName::Check)
+                        .icon_size(IconSize::Small)
+                        .on_click(cx.listener(|this, _, _, cx| this.save_site_edit(cx))),
+                )
+        };
+        for (kind, icon) in [
+            (Kind::MongoDb, IconName::DatabaseZap),
+            (Kind::Redis, IconName::Server),
+        ] {
+            let kind_id = kind.label();
+            rail = rail.child(
+                h_flex()
+                    .h(px(30.))
+                    .px_3()
+                    .gap_2()
+                    .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                    .child(Label::new(kind.label()).weight(gpui::FontWeight::SEMIBOLD))
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("database-site-add-{kind_id}")),
+                            IconName::Plus,
+                        )
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Add a site"))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.start_site_edit(kind, None, window, cx),
+                        )),
+                    ),
+            );
+            for site in &sites {
+                if let Some(edit) = &self.site_edit
+                    && edit.kind == kind
+                    && edit.original.as_ref() == Some(site)
+                {
+                    rail = rail.child(edit_row(edit, cx));
+                    continue;
+                }
+                let selected = self.kind_view == kind && current_site == *site;
+                let group = SharedString::from(format!("database-site-{kind_id}-{site}"));
+                let editable = site != UNASSIGNED_SITE;
+                let (select_site, edit_site, delete_site) =
+                    (site.clone(), site.clone(), site.clone());
+                rail = rail.child(
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "database-site-row-{kind_id}-{site}"
+                        )))
+                        .group(group.clone())
+                        .h(px(28.))
+                        .pl_8()
+                        .pr_1()
+                        .gap_1()
+                        .cursor_pointer()
+                        .border_l_2()
+                        .border_color(if selected {
+                            colors.text_accent
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .when(selected, |this| this.bg(colors.element_selected))
+                        .hover(|style| style.bg(colors.element_hover))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.kind_view = kind;
+                            this.site = Some(select_site.clone());
+                            this.form = None;
+                            cx.notify();
+                        }))
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Label::new(site.clone())
+                                    .color(if selected {
+                                        Color::Default
+                                    } else {
+                                        Color::Muted
+                                    })
+                                    .truncate(),
+                            ),
+                        )
+                        .when(editable, |this| {
+                            this.child(
+                                h_flex()
+                                    .visible_on_hover(group)
+                                    .child(
+                                        IconButton::new(
+                                            SharedString::from(format!(
+                                                "database-site-rename-{kind_id}-{site}"
+                                            )),
+                                            IconName::Pencil,
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .tooltip(Tooltip::text("Rename site"))
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.start_site_edit(
+                                                    kind,
+                                                    Some(edit_site.clone()),
+                                                    window,
+                                                    cx,
+                                                )
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        IconButton::new(
+                                            SharedString::from(format!(
+                                                "database-site-delete-{kind_id}-{site}"
+                                            )),
+                                            IconName::Trash,
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .tooltip(Tooltip::text("Delete site"))
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.delete_site(delete_site.clone(), cx)
+                                            }),
+                                        ),
+                                    ),
+                            )
+                        }),
+                );
+            }
+            if let Some(edit) = &self.site_edit
+                && edit.kind == kind
+                && edit.original.is_none()
+            {
+                rail = rail.child(edit_row(edit, cx));
+            }
+        }
+        rail.when_some(self.site_message.clone(), |this, message| {
+            this.child(
+                div().px_3().pt_2().child(
+                    Label::new(message)
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                ),
+            )
+        })
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -755,7 +1040,6 @@ impl DatabaseView {
         let search = self.search.read(cx).text(cx).trim().to_lowercase();
         let matches = |name: &str| search.is_empty() || name.to_lowercase().contains(&search);
         let mut tree = v_flex().gap_0p5().px_1();
-        let sites = self.sites();
         let current_site = self.current_site();
         {
             let kind = self.kind_view;
@@ -979,39 +1263,6 @@ impl DatabaseView {
                 }
             }
         }
-        let view = cx.entity().downgrade();
-        let site_menu = PopoverMenu::new("database-site")
-            .trigger(
-                Button::new(
-                    "database-site-button",
-                    if current_site.is_empty() {
-                        "No site".to_string()
-                    } else {
-                        current_site
-                    },
-                )
-                .style(ButtonStyle::Outlined)
-                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
-            )
-            .menu(move |window, cx| {
-                let sites = sites.clone();
-                let view = view.clone();
-                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    for site in &sites {
-                        let view = view.clone();
-                        let site = site.clone();
-                        menu = menu.entry(site.clone(), None, move |_, cx| {
-                            let site = site.clone();
-                            view.update(cx, |this, cx| {
-                                this.site = Some(site);
-                                cx.notify();
-                            })
-                            .ok();
-                        });
-                    }
-                    menu
-                }))
-            });
         v_flex()
             .w(px(300.))
             .flex_none()
@@ -1020,8 +1271,19 @@ impl DatabaseView {
             .border_color(colors.border)
             .bg(colors.panel_background)
             .child(
-                section("SITE")
-                    .child(div().flex_1().pl_2().child(site_menu))
+                h_flex()
+                    .h(px(26.))
+                    .pl_3()
+                    .pr_1()
+                    .child(
+                        Label::new(
+                            format!("{} · {current_site}", self.kind_view.label()).to_uppercase(),
+                        )
+                        .size(LabelSize::XSmall)
+                        .weight(gpui::FontWeight::SEMIBOLD)
+                        .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
                     .child(
                         h_flex()
                             .when(matches!(self.session, Some(Session::Mongo(_))), |this| {
@@ -1207,5 +1469,19 @@ impl Render for DatabaseView {
                     .when(!full_bleed, |this| this.p_4())
                     .child(main),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_site_names_are_checked() {
+        let sites = vec!["CP".to_string(), "BP".to_string()];
+        assert_eq!(check_site_name("NP", &sites), Ok(()));
+        assert!(check_site_name("", &sites).is_err());
+        assert!(check_site_name("cp", &sites).is_err());
+        assert!(check_site_name("unassigned", &sites).is_err());
     }
 }
