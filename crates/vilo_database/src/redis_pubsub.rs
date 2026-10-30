@@ -262,6 +262,10 @@ impl DatabaseView {
                                 if !alive {
                                     return;
                                 }
+                                // Lets the window draw and take input between batches of a busy channel.
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(10))
+                                    .await;
                             }
                             // The stream ended without saying why; never show it as still live.
                             this.update(cx, |this, cx| {
@@ -332,16 +336,26 @@ impl DatabaseView {
             return refuse(self, "Type the connection name exactly to confirm.", cx);
         }
         let lock = lock_key(&connection.id, &channel);
-        if self.unknown_writes.contains(&lock) {
-            // The tab may have been rebuilt since; offer the confirmation again.
-            if let Some(pubsub) = self.pubsub() {
-                pubsub.publish_locked = Some(lock);
+        match self.publish_locks.get(&lock) {
+            Some((_, false)) => {
+                return refuse(
+                    self,
+                    "An earlier publish to this channel is still waiting for its answer; it times out as unknown after 30 seconds.",
+                    cx,
+                );
             }
-            return refuse(
-                self,
-                "An earlier publish to this channel is still waiting for its answer or has an unknown outcome. Check whether its subscribers got it, then press I checked it.",
-                cx,
-            );
+            Some((_, true)) => {
+                // The tab may have been rebuilt since; offer the confirmation again.
+                if let Some(pubsub) = self.pubsub() {
+                    pubsub.publish_locked = Some(lock);
+                }
+                return refuse(
+                    self,
+                    "An earlier publish to this channel has an unknown outcome. Check whether its subscribers got it, then press I checked it.",
+                    cx,
+                );
+            }
+            None => {}
         }
         let operation = uuid::Uuid::new_v4().simple().to_string();
         let kind = if sharded { "SPUBLISH" } else { "PUBLISH" };
@@ -378,8 +392,9 @@ impl DatabaseView {
         });
         let generation = self.generation;
         // Locked while in flight too, so a rebuilt tab cannot send the same channel again before
-        // the answer is known; a known answer unlocks it below.
-        self.unknown_writes.insert(lock.clone());
+        // the answer is known; only this operation's own answer changes its lock.
+        self.publish_locks
+            .insert(lock.clone(), (operation.clone(), false));
         if let Some(pubsub) = self.pubsub() {
             pubsub.publishing = true;
             pubsub.publish_result = Some((true, "Publishing…".into()));
@@ -391,8 +406,16 @@ impl DatabaseView {
             this.update(cx, |this, cx| {
                 let mut locked = None;
                 let unknown = matches!(result, Ok((Err(WriteError::Unknown(_)), _)));
-                if !unknown {
-                    this.unknown_writes.remove(&lock);
+                let owned = this
+                    .publish_locks
+                    .get(&lock)
+                    .is_some_and(|(owner, _)| *owner == operation);
+                if owned {
+                    if unknown {
+                        this.publish_locks.insert(lock.clone(), (operation.clone(), true));
+                    } else {
+                        this.publish_locks.remove(&lock);
+                    }
                 }
                 let message = match result {
                     Ok((outcome, logged)) => {
@@ -439,8 +462,14 @@ impl DatabaseView {
             pubsub.publish_result = None;
             pubsub.publish_locked.take()
         });
-        if let Some(lock) = locked {
-            self.unknown_writes.remove(&lock);
+        // Only an outcome already known to be unknown can be acknowledged, never a pending one.
+        if let Some(lock) = locked
+            && self
+                .publish_locks
+                .get(&lock)
+                .is_some_and(|(_, unknown)| *unknown)
+        {
+            self.publish_locks.remove(&lock);
         }
         cx.notify();
     }

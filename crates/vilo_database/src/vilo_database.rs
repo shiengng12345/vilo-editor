@@ -367,6 +367,9 @@ pub struct DatabaseView {
     session_writes: collections::HashSet<String>,
     /// Documents whose last write has an unknown outcome; writing to them waits for a refresh.
     unknown_writes: collections::HashSet<String>,
+    /// Channels with a publish that is still awaiting its answer or ended unknown, by lock key:
+    /// the operation that holds the lock, and whether its outcome is unknown (else pending).
+    publish_locks: HashMap<String, (String, bool)>,
     write_notice: Option<SharedString>,
     /// Writes from earlier runs whose result never reached the write log.
     dangling_writes: Vec<(String, String)>,
@@ -535,6 +538,7 @@ impl DatabaseView {
             admin_write: None,
             session_writes: Default::default(),
             unknown_writes: Default::default(),
+            publish_locks: Default::default(),
             write_notice: None,
             dangling_writes: Vec::new(),
             unlogged_writes: Vec::new(),
