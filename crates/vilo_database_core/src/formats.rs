@@ -843,7 +843,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
     let mut memo: std::collections::HashMap<u64, Id> = Default::default();
     let mut steps = 0_usize;
     let mut items_of = std::collections::HashMap::new();
-    let mut keys_of = std::collections::HashMap::new();
+    let mut keys_of = Keys::default();
     let mut at = 0;
     let fail = |at: usize, what: &str| Err(format!("not a pickle: {what} at byte {at}"));
     macro_rules! take {
@@ -1992,7 +1992,27 @@ fn raw_unicode_escape(bytes: &[u8]) -> Option<Node> {
 /// What makes two pickled dict keys the same key, as Python compares them: equal numbers are
 /// one key whatever their type (1, 1.0 and True), text and bytes by content, tuples by their
 /// items. Keys this cannot compare (objects) are never merged.
-fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
+fn fingerprint(
+    arena: &Arena,
+    cache: &mut std::collections::HashMap<Id, Option<Vec<u8>>>,
+    id: Id,
+    depth: usize,
+) -> Option<Vec<u8>> {
+    if let Some(known) = cache.get(&id) {
+        return known.clone();
+    }
+    // A key too large or deep to compare by value is still the same key as itself.
+    let found = Some(dict_key(arena, cache, id, depth).unwrap_or_else(|| identity(id)));
+    cache.insert(id, found.clone());
+    found
+}
+
+fn dict_key(
+    arena: &Arena,
+    cache: &mut std::collections::HashMap<Id, Option<Vec<u8>>>,
+    id: Id,
+    depth: usize,
+) -> Option<Vec<u8>> {
     /// Keys larger than this are shown as they are but not compared with others; comparing
     /// nested shared tuples could otherwise take unbounded memory.
     const MAX_KEY: usize = 4096;
@@ -2005,8 +2025,9 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
         // Integers are kept in their plain form when read, so the text is the number.
         Node::Int(text) if text.len() > MAX_KEY => return None,
         Node::Int(text) => [b"i".as_slice(), text.as_bytes()].concat(),
-        Node::Float(value) if value.fract() == 0.0 && value.abs() < 1e30 => {
-            format!("i{}", *value as i128).into_bytes()
+        // An integer-valued float equals that integer, however large.
+        Node::Float(value) if float_integer(*value).is_some() => {
+            [b"i".as_slice(), float_integer(*value)?.as_bytes()].concat()
         }
         // NaN equals no other NaN, but Python finds a key by identity first, so the same NaN
         // object reused through the memo is one key.
@@ -2027,7 +2048,7 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
         Node::Tuple(items) => {
             let mut key = b"(".to_vec();
             for item in items {
-                let part = dict_key(arena, *item, depth + 1)?;
+                let part = fingerprint(arena, cache, *item, depth + 1)?;
                 key.extend_from_slice(&part.len().to_le_bytes());
                 key.extend_from_slice(&part);
                 if key.len() > MAX_KEY {
@@ -2038,10 +2059,17 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
         }
         // A frozenset equals one with the same members, in any order.
         Node::Set(members) => {
-            let mut parts = members
-                .iter()
-                .map(|member| dict_key(arena, *member, depth + 1))
-                .collect::<Option<Vec<_>>>()?;
+            // Stops as soon as the members' fingerprints are past the limit.
+            let mut parts = Vec::new();
+            let mut size = 0_usize;
+            for member in members {
+                let part = fingerprint(arena, cache, *member, depth + 1)?;
+                size += part.len() + 8;
+                if size > MAX_KEY {
+                    return None;
+                }
+                parts.push(part);
+            }
             parts.sort();
             let mut key = b"{".to_vec();
             for part in parts {
@@ -2058,21 +2086,52 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
     })
 }
 
+/// A finite float with no fractional part as its exact integer text (`None` otherwise).
+fn float_integer(value: f64) -> Option<String> {
+    if !value.is_finite() || value.fract() != 0.0 {
+        return None;
+    }
+    if value.abs() < 1e18 {
+        return Some((value as i64).to_string());
+    }
+    // value = mantissa · 2^exponent with exponent ≥ 0 here, built as little-endian bytes.
+    let bits = value.to_bits();
+    let exponent = usize::try_from(((bits >> 52) & 0x7ff) as i64 - 1075).ok()?;
+    let mantissa = (bits & ((1 << 52) - 1)) | (1 << 52);
+    let mut bytes = vec![0_u8; (53 + exponent) / 8 + 2];
+    for bit in 0..53 {
+        if mantissa >> bit & 1 == 1 {
+            let at = bit + exponent;
+            *bytes.get_mut(at / 8)? |= 1 << (at % 8);
+        }
+    }
+    let magnitude = decimal(&bytes)?;
+    Some(if value < 0.0 {
+        format!("-{magnitude}")
+    } else {
+        magnitude
+    })
+}
+
 fn identity(id: Id) -> Vec<u8> {
     std::iter::once(b'#').chain(id.to_le_bytes()).collect()
 }
 
+/// What dict and set entries are compared by: each container's fingerprints and where they
+/// are, and each value's fingerprint once worked out (values used as keys do not change), so a
+/// key reused through the memo is not worked out again.
+#[derive(Default)]
+struct Keys {
+    positions: std::collections::HashMap<(Id, Vec<u8>), usize>,
+    fingerprints: std::collections::HashMap<Id, Option<Vec<u8>>>,
+}
+
 /// Adds members the way Python's set does: one equal to a member already there is dropped.
-fn add_to_set(
-    arena: &mut Arena,
-    keys_of: &mut std::collections::HashMap<(Id, Vec<u8>), usize>,
-    set: Id,
-    items: Vec<Id>,
-) -> Result<(), String> {
+fn add_to_set(arena: &mut Arena, keys: &mut Keys, set: Id, items: Vec<Id>) -> Result<(), String> {
     for item in items {
-        let fingerprint = dict_key(arena, item, 0);
+        let fingerprint = fingerprint(arena, &mut keys.fingerprints, item, 0);
         if let Some(fingerprint) = &fingerprint {
-            if keys_of.contains_key(&(set, fingerprint.clone())) {
+            if keys.positions.contains_key(&(set, fingerprint.clone())) {
                 continue;
             }
             arena.charge(fingerprint.len())?;
@@ -2081,7 +2140,7 @@ fn add_to_set(
             return Err("not a pickle: items added to something that is not a set".into());
         };
         if let Some(fingerprint) = fingerprint {
-            keys_of.insert((set, fingerprint), members.len());
+            keys.positions.insert((set, fingerprint), members.len());
         }
         members.push(item);
     }
@@ -2141,12 +2200,12 @@ fn decimal(bytes: &[u8]) -> Option<String> {
 /// the new value.
 fn set_items(
     arena: &mut Arena,
-    keys_of: &mut std::collections::HashMap<(Id, Vec<u8>), usize>,
+    keys: &mut Keys,
     map: Id,
     pairs: Vec<(Id, Id)>,
 ) -> Result<(), String> {
     for (key, value) in pairs {
-        let fingerprint = dict_key(arena, key, 0);
+        let fingerprint = fingerprint(arena, &mut keys.fingerprints, key, 0);
         // Remembered fingerprints are held text too.
         if let Some(fingerprint) = &fingerprint {
             arena.charge(fingerprint.len())?;
@@ -2155,14 +2214,14 @@ fn set_items(
             return Err("not a pickle: entries set on something that is not a dict".into());
         };
         match fingerprint {
-            Some(fingerprint) => match keys_of.get(&(map, fingerprint.clone())) {
+            Some(fingerprint) => match keys.positions.get(&(map, fingerprint.clone())) {
                 Some(&position) => {
                     if let Some(entry) = entries.get_mut(position) {
                         entry.1 = value;
                     }
                 }
                 None => {
-                    keys_of.insert((map, fingerprint), entries.len());
+                    keys.positions.insert((map, fingerprint), entries.len());
                     entries.push((key, value));
                 }
             },
@@ -2911,6 +2970,50 @@ mod tests {
             protected.contains(r#""\xff" (protected): 1"#),
             "{protected}"
         );
+    }
+
+    #[test]
+    fn test_float_keys_and_cached_fingerprints() {
+        assert_eq!(
+            float_integer(2f64.powi(100)).as_deref(),
+            Some("1267650600228229401496703205376")
+        );
+        assert_eq!(float_integer(-0.0).as_deref(), Some("0"));
+        assert_eq!(float_integer(0.5), None);
+        // {2**100: 1} then the float 2.0**100 set to 2: one key, as python3 keeps it.
+        let mut both = b"\x80\x04}\x94\x8a\x0d".to_vec();
+        both.extend_from_slice(&hex("00000000000000000000000010"));
+        both.extend_from_slice(b"K\x01sG");
+        both.extend_from_slice(&2f64.powi(100).to_be_bytes());
+        both.extend_from_slice(b"K\x02s.");
+        assert_eq!(
+            decode(Decoder::Pickle, &both)
+                .unwrap()
+                .matches(": ")
+                .count(),
+            1
+        );
+        // A large frozenset key, memoized and reused many times, is worked out once.
+        let mut reused = b"\x80\x04}\x94(".to_vec();
+        for index in 0..50_000_i32 {
+            reused.push(b'J');
+            reused.extend_from_slice(&index.to_le_bytes());
+        }
+        reused.extend_from_slice(b"\x91\x940");
+        for value in 0..20_000_i32 {
+            reused.extend_from_slice(b"h\x01J");
+            reused.extend_from_slice(&value.to_le_bytes());
+            reused.push(b's');
+        }
+        reused.push(b'.');
+        let started = std::time::Instant::now();
+        let text = decode(Decoder::Pickle, &reused).unwrap();
+        assert_eq!(
+            text.matches("}: ").count(),
+            1,
+            "the reused key is one key, as in Python"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
