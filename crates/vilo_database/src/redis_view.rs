@@ -177,6 +177,13 @@ pub(crate) struct RedisState {
     generation: u64,
     _stats: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
+    /// From CONFIG GET databases; `None` when the server does not allow CONFIG.
+    database_count: Option<u32>,
+    /// Databases with keys, from INFO keyspace.
+    keyspace: Vec<(u32, u64)>,
+    /// The database being connected to while a switch is in progress.
+    switching: Option<u8>,
+    switch_error: Option<SharedString>,
 }
 
 impl RedisState {
@@ -214,6 +221,10 @@ impl RedisState {
             generation: 0,
             _stats: None,
             _tasks: Vec::new(),
+            database_count: None,
+            keyspace: Vec::new(),
+            switching: None,
+            switch_error: None,
         }
     }
 
@@ -511,6 +522,105 @@ fn info_value<'a>(info: &'a str, field: &str) -> Option<&'a str> {
 impl DatabaseView {
     fn redis_state(&mut self) -> Option<&mut RedisState> {
         self.redis_state.as_mut()
+    }
+
+    pub(crate) fn load_redis_databases(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.redis() else {
+            return;
+        };
+        if session.is_clustered() {
+            return;
+        }
+        let connection = self.generation;
+        let task = run(cx, async move {
+            let count = session.database_count().await;
+            Ok((count, session.keyspace().await.unwrap_or_default()))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok((count, keyspace)) = task.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if this.generation != connection {
+                    return;
+                }
+                if let Some(state) = this.redis_state() {
+                    state.database_count = count;
+                    state.keyspace = keyspace;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// SELECT is per connection, so a switch is a new session on the other database; the old one
+    /// stays until the new one is up, and everything read or pending on the old one is dropped.
+    fn switch_redis_database(&mut self, database: u8, cx: &mut Context<Self>) {
+        let Some(connection) = self.active_connection().cloned() else {
+            return;
+        };
+        if self
+            .redis_write
+            .as_ref()
+            .is_some_and(|form| form.sending_now())
+        {
+            return;
+        }
+        let Some(state) = self.redis_state() else {
+            return;
+        };
+        state.switching = Some(database);
+        state.switch_error = None;
+        let generation = self.generation;
+        let read = cx.read_credentials(&connection.credential_url());
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let (_, uri) = read
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("No connection string saved."))?;
+                let uri = String::from_utf8(uri)?;
+                let task = cx.update(|cx| {
+                    run(cx, async move {
+                        vilo_database_core::redis::RedisSession::connect_to_database(
+                            &uri,
+                            Some(database),
+                        )
+                        .await
+                    })
+                });
+                task.await
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(session) => {
+                        this.generation += 1;
+                        this.session = Some(crate::Session::Redis(Arc::new(session)));
+                        this.redis_write = None;
+                        this.redis_state = Some(RedisState::new());
+                        this.start_redis_stats(cx);
+                        this.scan(true, cx);
+                        this.load_redis_databases(cx);
+                    }
+                    Err(error) => {
+                        if let Some(state) = this.redis_state() {
+                            state.switching = None;
+                            state.switch_error =
+                                Some(format!("Could not switch to db{database}: {error:#}").into());
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     pub(crate) fn close_redis_key(&mut self) {
@@ -1830,6 +1940,87 @@ impl DatabaseView {
             .into_any_element()
     }
 
+    fn render_database_picker(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
+        let Some(session) = self.redis() else {
+            return div().into_any_element();
+        };
+        let current = session.database();
+        if session.is_clustered() {
+            return Label::new("db0").into_any_element();
+        }
+        let label = match state.switching {
+            Some(database) => format!("db{database}…"),
+            None => format!("db{current}"),
+        };
+        // Without CONFIG the count is unknown; the usual 16 are offered, plus any with keys.
+        let count = state
+            .database_count
+            .unwrap_or(16)
+            .max(
+                state
+                    .keyspace
+                    .iter()
+                    .map(|(database, _)| database + 1)
+                    .max()
+                    .unwrap_or(0),
+            )
+            .min(256);
+        let keyspace = state.keyspace.clone();
+        let view = cx.entity().downgrade();
+        h_flex()
+            .gap_1()
+            .child(
+                PopoverMenu::new("database-redis-db")
+                    .trigger(
+                        Button::new("database-redis-db-button", label)
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Subtle)
+                            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                            .tooltip(Tooltip::text("Logical database")),
+                    )
+                    .menu(move |window, cx| {
+                        let (view, keyspace) = (view.clone(), keyspace.clone());
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for database in 0..count {
+                                let Ok(database) = u8::try_from(database) else {
+                                    break;
+                                };
+                                let keys = keyspace
+                                    .iter()
+                                    .find(|(known, _)| *known == u32::from(database))
+                                    .map(|(_, keys)| *keys);
+                                let label = match keys {
+                                    Some(keys) => {
+                                        format!("db{database} · {} keys", group_thousands(keys))
+                                    }
+                                    None => format!("db{database}"),
+                                };
+                                let view = view.clone();
+                                menu = menu.toggleable_entry(
+                                    label,
+                                    database == current,
+                                    ui::IconPosition::Start,
+                                    None,
+                                    move |_, cx| {
+                                        view.update(cx, |this, cx| {
+                                            if database != current {
+                                                this.switch_redis_database(database, cx);
+                                            }
+                                        })
+                                        .ok();
+                                    },
+                                );
+                            }
+                            menu
+                        }))
+                    }),
+            )
+            .when_some(state.switch_error.clone(), |this, error| {
+                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
+            .into_any_element()
+    }
+
     pub(crate) fn render_redis(
         &self,
         connection: &Connection,
@@ -1917,7 +2108,7 @@ impl DatabaseView {
                         }),
                     )
                     .child(div().w(px(8.)))
-                    .child(Label::new("db0"))
+                    .child(self.render_database_picker(state, cx))
                     .child(
                         IconButton::new("database-redis-info-button", IconName::Info)
                             .icon_size(IconSize::Small)

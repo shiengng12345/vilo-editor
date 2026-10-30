@@ -105,20 +105,26 @@ impl RedisWriteForm {
     }
 }
 
-fn lock_key(connection: &str, key: &[u8]) -> String {
-    format!("{connection}/redis/{}", quote_bytes(key))
+fn lock_key(connection: &str, database: u8, key: &[u8]) -> String {
+    format!("{connection}/redis/db{database}/{}", quote_bytes(key))
 }
 
 impl DatabaseView {
     pub(crate) fn redis_writes_locked(&self, key: &[u8]) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|connection| self.unknown_writes.contains(&lock_key(connection, key)))
+        self.active.as_ref().is_some_and(|connection| {
+            self.unknown_writes
+                .contains(&lock_key(connection, self.redis_database(), key))
+        })
+    }
+
+    fn redis_database(&self) -> u8 {
+        self.redis().map_or(0, |session| session.database())
     }
 
     pub(crate) fn clear_redis_lock(&mut self, key: &[u8]) {
         if let Some(connection) = &self.active {
-            self.unknown_writes.remove(&lock_key(connection, key));
+            self.unknown_writes
+                .remove(&lock_key(connection, self.redis_database(), key));
         }
     }
 
@@ -319,6 +325,7 @@ impl DatabaseView {
         let Some(session) = self.redis() else {
             return;
         };
+        let database = session.database();
         let Some(connection) = self.active_connection().cloned() else {
             return;
         };
@@ -352,6 +359,7 @@ impl DatabaseView {
             "name": connection.name,
             "site": connection.site,
             "environment": connection.environment,
+            "db": database,
             "key": quote_bytes(planned.key()),
             "kind": planned.name(),
             "phase": "intent",
@@ -410,7 +418,8 @@ impl DatabaseView {
                     }
                     Ok(Err(WriteError::Unknown(message))) => {
                         if let Some(connection) = &this.active {
-                            this.unknown_writes.insert(lock_key(connection, &key));
+                            this.unknown_writes
+                                .insert(lock_key(connection, database, &key));
                         }
                         this.write_notice = Some(
                             format!("The outcome of the last write is unknown ({message}). Refresh the key to check it before writing again.")

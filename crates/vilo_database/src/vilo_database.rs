@@ -759,6 +759,7 @@ impl DatabaseView {
                             this.redis_state = Some(RedisState::new());
                             this.start_redis_stats(cx);
                             this.scan(true, cx);
+                            this.load_redis_databases(cx);
                         }
                     }
                     Err(error) => this.status = Some(format!("{error:#}").into()),

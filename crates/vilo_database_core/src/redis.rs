@@ -11,6 +11,8 @@ pub type Bytes = Vec<u8>;
 pub struct RedisSession {
     client: Client,
     clustered: bool,
+    /// The logical database every connection of this session selects, also after a reconnect.
+    database: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -334,6 +336,22 @@ pub fn split_command(line: &str) -> Result<Vec<Bytes>> {
 }
 
 /// Text for bytes in redis-cli's quoted style: printable ASCII as is, everything else escaped.
+/// `db3:keys=12,expires=1,avg_ttl=0` lines from INFO keyspace, as (3, 12).
+pub fn parse_keyspace(info: &str) -> Vec<(u32, u64)> {
+    info.lines()
+        .filter_map(|line| {
+            let (name, fields) = line.trim().split_once(':')?;
+            let database = name.strip_prefix("db")?.parse().ok()?;
+            let keys = fields
+                .split(',')
+                .find_map(|field| field.strip_prefix("keys="))?
+                .parse()
+                .ok()?;
+            Some((database, keys))
+        })
+        .collect()
+}
+
 pub fn quote_bytes(bytes: &[u8]) -> String {
     let mut text = String::from("\"");
     for byte in bytes {
@@ -441,8 +459,21 @@ fn pairs(value: Value) -> Vec<(Value, Value)> {
 
 impl RedisSession {
     pub async fn connect(url: &str) -> Result<Self> {
-        let config = Config::from_url(url).context("The Redis URL is not valid")?;
+        Self::connect_to_database(url, None).await
+    }
+
+    /// Connects with `database` in place of the URL's; a cluster only has database 0.
+    pub async fn connect_to_database(url: &str, database: Option<u8>) -> Result<Self> {
+        let mut config = Config::from_url(url).context("The Redis URL is not valid")?;
         let clustered = config.server.is_clustered();
+        if let Some(database) = database {
+            anyhow::ensure!(
+                !clustered || database == 0,
+                "A Redis cluster only has database 0"
+            );
+            config.database = Some(database);
+        }
+        let selected = config.database.unwrap_or(0);
         let mut builder = Builder::from_config(config);
         builder.with_connection_config(|connection| {
             // A command whose answer was lost is reported as unknown rather than sent again.
@@ -450,7 +481,37 @@ impl RedisSession {
         });
         let client = builder.build()?;
         client.init().await.context("Could not reach Redis")?;
-        Ok(Self { client, clustered })
+        Ok(Self {
+            client,
+            clustered,
+            database: selected,
+        })
+    }
+
+    pub fn database(&self) -> u8 {
+        self.database
+    }
+
+    pub fn is_clustered(&self) -> bool {
+        self.clustered
+    }
+
+    /// How many logical databases the server has, or `None` when CONFIG is not allowed (common on
+    /// managed Redis).
+    pub async fn database_count(&self) -> Option<u32> {
+        let reply = self
+            .call("CONFIG", vec!["GET".into(), "databases".into()])
+            .await
+            .ok()?;
+        pairs(reply)
+            .into_iter()
+            .find_map(|(_, value)| value.as_string()?.parse::<u32>().ok())
+    }
+
+    /// Databases holding keys, from INFO keyspace, as (database, keys).
+    pub async fn keyspace(&self) -> Result<Vec<(u32, u64)>> {
+        let reply = self.call("INFO", vec!["keyspace".into()]).await?;
+        Ok(parse_keyspace(&reply.as_string().unwrap_or_default()))
     }
 
     /// The servers a full SCAN must walk: each cluster primary, or the single server.
@@ -601,13 +662,17 @@ impl RedisSession {
 
     /// One hash field's value, or `None` when the field or the key is missing.
     pub async fn hash_get(&self, key: &[u8], field: &[u8]) -> Result<Option<Bytes>> {
-        let value = self.call("HGET", vec![bytes_arg(key), bytes_arg(field)]).await?;
+        let value = self
+            .call("HGET", vec![bytes_arg(key), bytes_arg(field)])
+            .await?;
         Ok(value.as_bytes().map(<[u8]>::to_vec))
     }
 
     /// One sorted-set member's score as the server writes it, or `None` when it is missing.
     pub async fn zset_score(&self, key: &[u8], member: &[u8]) -> Result<Option<String>> {
-        let value = self.call("ZSCORE", vec![bytes_arg(key), bytes_arg(member)]).await?;
+        let value = self
+            .call("ZSCORE", vec![bytes_arg(key), bytes_arg(member)])
+            .await?;
         Ok(value
             .as_string()
             .or_else(|| value.as_f64().map(|score| score.to_string())))
@@ -1219,6 +1284,53 @@ mod tests {
     }
 
     /// Runs against a real server: `VILO_TEST_REDIS=redis://127.0.0.1:57379 cargo test -p vilo_database_core`.
+    #[test]
+    fn test_parse_keyspace() {
+        let info = "# Keyspace\r\ndb0:keys=3331,expires=12,avg_ttl=0\r\ndb5:keys=7,expires=0,avg_ttl=0\r\n";
+        assert_eq!(parse_keyspace(info), vec![(0, 3331), (5, 7)]);
+        assert!(parse_keyspace("# Keyspace\r\n").is_empty());
+    }
+
+    async fn databases_are_separate(url: &str) {
+        let first = RedisSession::connect_to_database(url, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(first.database(), 1);
+        first
+            .call(
+                "SET",
+                vec![
+                    "vilo_test:db".into(),
+                    "one".into(),
+                    "PX".into(),
+                    Value::from(60_000_i64),
+                ],
+            )
+            .await
+            .unwrap();
+        let zero = RedisSession::connect_to_database(url, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(zero.get_string(b"vilo_test:db").await.unwrap(), None);
+        assert_eq!(
+            first.get_string(b"vilo_test:db").await.unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(zero.database_count().await, Some(16));
+        assert!(
+            first
+                .keyspace()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(database, keys)| *database == 1 && *keys >= 1)
+        );
+        first
+            .call("DEL", vec!["vilo_test:db".into()])
+            .await
+            .unwrap();
+    }
+
     async fn writes_are_guarded(session: &RedisSession) {
         let key = b"vilo_test:w".to_vec();
         session
@@ -1365,6 +1477,7 @@ mod tests {
         };
         let session = RedisSession::connect(&url).await.unwrap();
         writes_are_guarded(&session).await;
+        databases_are_separate(&url).await;
         let key = b"vilo_test:\x00\xff\xe4\xb8\xad".to_vec();
         let value = b"\x01\x02 not utf-8 \xff".to_vec();
         session
