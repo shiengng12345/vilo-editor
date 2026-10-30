@@ -290,13 +290,16 @@ async fn open(
     host: String,
     port: u16,
     tls: Option<Tls>,
+    tunnel: Option<Arc<crate::redis_ssh::SshTunnel>>,
     username: Option<String>,
     password: Option<String>,
 ) -> Result<BufReader<Box<dyn Connection>>> {
-    // As a (host, port) pair, so an IPv6 address needs no brackets.
-    let stream = TcpStream::connect((host.as_str(), port))
-        .await
-        .with_context(|| format!("Could not connect to {host} port {port} for the profiler"))?;
+    let stream = match &tunnel {
+        Some(tunnel) => TcpStream::connect(tunnel.forward(&host, port).await?).await,
+        // As a (host, port) pair, so an IPv6 address needs no brackets.
+        None => TcpStream::connect((host.as_str(), port)).await,
+    }
+    .with_context(|| format!("Could not connect to {host} port {port} for the profiler"))?;
     let stream: Box<dyn Connection> = match tls {
         None => Box::new(stream),
         Some((config, node, connected)) => {
@@ -348,6 +351,7 @@ impl RedisSession {
         let tls = self.tls.clone().map(|(config, connected)| {
             (config, host.trim_matches(['[', ']']).to_string(), connected)
         });
+        let tunnel = self.tunnel.clone();
         let username = self.config.username.clone();
         let password = self.config.password.clone();
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -357,7 +361,7 @@ impl RedisSession {
             async move {
                 let opened = tokio::select! {
                     _ = &mut stopped => Err(Ok("Stopped.".to_string())),
-                    opened = tokio::time::timeout(CONNECT_TIMEOUT, open(host, port, tls, username, password)) => match opened {
+                    opened = tokio::time::timeout(CONNECT_TIMEOUT, open(host, port, tls, tunnel, username, password)) => match opened {
                         Ok(Ok(reader)) => Ok(reader),
                         Ok(Err(error)) => Err(Err(format!("{error:#}"))),
                         Err(_) => Err(Err("Starting MONITOR timed out.".to_string())),
@@ -733,7 +737,7 @@ mod tests {
         // The handshake fails on this silent listener; only the connection matters here.
         tokio::time::timeout(
             Duration::from_millis(500),
-            open("::1".into(), port, None, None, None),
+            open("::1".into(), port, None, None, None, None),
         )
         .await
         .ok();

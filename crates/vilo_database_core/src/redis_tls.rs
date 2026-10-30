@@ -437,7 +437,7 @@ mod tests {
         let (Some(dir), Ok(url)) = (test_files(), std::env::var("VILO_TEST_REDIS_TLS")) else {
             return;
         };
-        let session = RedisSession::connect_with(&url, Some(3), Some(&mutual(&dir)))
+        let session = RedisSession::connect_with(&url, Some(3), Some(&mutual(&dir)), None)
             .await
             .unwrap();
         assert!(!session.is_clustered());
@@ -472,7 +472,7 @@ mod tests {
             ..mutual(&dir)
         };
         assert!(
-            RedisSession::connect_with(&url, None, Some(&without_client))
+            RedisSession::connect_with(&url, None, Some(&without_client), None)
                 .await
                 .is_err(),
             "the server requires a client certificate"
@@ -482,7 +482,7 @@ mod tests {
             ..mutual(&dir)
         };
         assert!(
-            RedisSession::connect_with(&url, None, Some(&other_ca))
+            RedisSession::connect_with(&url, None, Some(&other_ca), None)
                 .await
                 .is_err(),
             "a server certificate from another CA is refused"
@@ -493,14 +493,14 @@ mod tests {
             ..mutual(&dir)
         };
         assert!(
-            RedisSession::connect_with(&url, None, Some(&unchecked))
+            RedisSession::connect_with(&url, None, Some(&unchecked), None)
                 .await
                 .is_ok(),
             "with the check off, any server certificate is accepted"
         );
         // Any letter case still gets Vilo's TLS, the profiler's connection included.
         let shouting = url.replacen("rediss://", "REDISS://", 1);
-        let loud = RedisSession::connect_with(&shouting, None, Some(&mutual(&dir)))
+        let loud = RedisSession::connect_with(&shouting, None, Some(&mutual(&dir)), None)
             .await
             .unwrap();
         let monitor = loud.monitor(&loud.scan_nodes().remove(0), 5).await.unwrap();
@@ -517,7 +517,7 @@ mod tests {
         assert!(started, "MONITOR over TLS for {shouting}");
         drop(monitor);
         let plain = url.replacen("rediss://", "redis://", 1);
-        let error = RedisSession::connect_with(&plain, None, Some(&mutual(&dir)))
+        let error = RedisSession::connect_with(&plain, None, Some(&mutual(&dir)), None)
             .await
             .err()
             .expect("TLS settings without TLS");
@@ -535,7 +535,7 @@ mod tests {
             return;
         };
         // A plain rediss:// URL to one node: the session finds the cluster and every primary.
-        let session = RedisSession::connect_with(&url, None, Some(&mutual(&dir)))
+        let session = RedisSession::connect_with(&url, None, Some(&mutual(&dir)), None)
             .await
             .unwrap();
         assert!(session.is_clustered());

@@ -153,6 +153,9 @@ impl RedisSession {
             performance.default_command_timeout = crate::redis::COMMAND_TIMEOUT;
         });
         let client = builder.build()?;
+        if let Some(tunnel) = &self.tunnel {
+            crate::redis::through(&client, tunnel).await;
+        }
         client
             .init()
             .await

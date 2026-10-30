@@ -98,6 +98,9 @@ struct Connection {
     /// certificate is checked. None uses the system's roots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     redis_tls: Option<vilo_database_core::redis_tls::RedisTls>,
+    /// A jump host the Redis connection goes through; signs in with a key or the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redis_ssh: Option<vilo_database_core::redis_ssh::SshSettings>,
 }
 
 impl Connection {
@@ -262,9 +265,37 @@ struct RedisFields {
     cert_file: Entity<Editor>,
     key_file: Entity<Editor>,
     verify: bool,
+    ssh: bool,
+    ssh_host: Entity<Editor>,
+    ssh_port: Entity<Editor>,
+    ssh_user: Entity<Editor>,
+    ssh_key: Entity<Editor>,
 }
 
 impl RedisFields {
+    /// The SSH settings as typed, or why they cannot be used.
+    fn ssh_settings(&self, cx: &App) -> Result<vilo_database_core::redis_ssh::SshSettings> {
+        let text = |editor: &Entity<Editor>| editor.read(cx).text(cx).trim().to_string();
+        let port = text(&self.ssh_port);
+        let key = text(&self.ssh_key);
+        let settings = vilo_database_core::redis_ssh::SshSettings {
+            host: text(&self.ssh_host),
+            port: if port.is_empty() {
+                None
+            } else {
+                Some(port.parse().context("SSH port must be a number")?)
+            },
+            user: text(&self.ssh_user),
+            key_file: (!key.is_empty()).then(|| PathBuf::from(key)),
+            known_hosts: None,
+        };
+        anyhow::ensure!(
+            !settings.host.is_empty() && !settings.user.is_empty(),
+            "Fill in the SSH host and user."
+        );
+        Ok(settings)
+    }
+
     /// The TLS settings as typed; empty paths are left out.
     fn tls_settings(&self, cx: &App) -> vilo_database_core::redis_tls::RedisTls {
         let path = |editor: &Entity<Editor>| {
@@ -521,10 +552,11 @@ async fn connect(connection: &Connection, uri: String, cx: &AsyncApp) -> Result<
                 .redis_tls
                 .clone()
                 .filter(|_| vilo_database_core::redis_tls::tls_scheme(&uri));
+            let ssh = connection.redis_ssh.clone();
             cx.update(|cx| {
                 run(cx, async move {
                     Ok(Session::Redis(Arc::new(
-                        RedisSession::connect_with(&uri, None, tls.as_ref()).await?,
+                        RedisSession::connect_with(&uri, None, tls.as_ref(), ssh.as_ref()).await?,
                     )))
                 })
             })
@@ -1045,6 +1077,7 @@ impl DatabaseView {
             .as_ref()
             .and_then(|id| self.connections.iter().find(|c| &c.id == id))
             .cloned();
+        let saved_ssh = existing.as_ref().and_then(|c| c.redis_ssh.as_ref());
         let tls_path = |path: fn(&vilo_database_core::redis_tls::RedisTls) -> &Option<PathBuf>| {
             existing
                 .as_ref()
@@ -1128,6 +1161,41 @@ impl DatabaseView {
                         .as_ref()
                         .and_then(|c| c.redis_tls.as_ref())
                         .is_none_or(|tls| tls.verify),
+                    ssh: saved_ssh.is_some(),
+                    ssh_host: editor(
+                        "Jump host, as ssh knows it",
+                        &saved_ssh.map(|ssh| ssh.host.clone()).unwrap_or_default(),
+                        false,
+                        window,
+                        cx,
+                    ),
+                    ssh_port: editor(
+                        "22",
+                        &saved_ssh
+                            .and_then(|ssh| ssh.port)
+                            .map(|port| port.to_string())
+                            .unwrap_or_default(),
+                        false,
+                        window,
+                        cx,
+                    ),
+                    ssh_user: editor(
+                        "User on the jump host",
+                        &saved_ssh.map(|ssh| ssh.user.clone()).unwrap_or_default(),
+                        false,
+                        window,
+                        cx,
+                    ),
+                    ssh_key: editor(
+                        "Private key file; empty uses the agent and ~/.ssh/config",
+                        &saved_ssh
+                            .and_then(|ssh| ssh.key_file.as_ref())
+                            .map(|key| key.display().to_string())
+                            .unwrap_or_default(),
+                        false,
+                        window,
+                        cx,
+                    ),
                     tls: false,
                     mode: String::new(),
                     query: String::new(),
@@ -1262,6 +1330,19 @@ impl DatabaseView {
             cx.notify();
             return;
         }
+        // The SSH fields are filled when the form opens, so they always hold what applies.
+        let redis_ssh = match &form.redis {
+            Some(redis) if redis.ssh => match redis.ssh_settings(cx) {
+                Ok(settings) => Some(settings),
+                Err(error) => {
+                    form.message = Some(format!("{error:#}").into());
+                    cx.notify();
+                    return;
+                }
+            },
+            Some(_) => None,
+            None => existing.as_ref().and_then(|c| c.redis_ssh.clone()),
+        };
         let connection = Connection {
             id: existing.as_ref().map_or_else(
                 || uuid::Uuid::new_v4().simple().to_string(),
@@ -1273,6 +1354,7 @@ impl DatabaseView {
             environment: environment.clone(),
             // A new address starts with writes off again.
             allow_writes: uri.is_empty() && existing.as_ref().is_some_and(|c| c.allow_writes),
+            redis_ssh,
             // Fields that never loaded keep the saved settings.
             redis_tls: match &form.redis {
                 Some(redis) if redis.tls && !uri.is_empty() => Some(redis.tls_settings(cx)),
@@ -2062,6 +2144,29 @@ impl DatabaseView {
                                 .child(div().flex_1().child(input("Sentinel username", &redis.sentinel_username, cx)))
                                 .child(div().flex_1().child(input("Sentinel password", &redis.sentinel_password, cx))),
                         )
+                    })
+                    .child(
+                        Button::new("database-redis-ssh", "Through SSH")
+                            .style(if redis.ssh { ButtonStyle::Filled } else { ButtonStyle::Outlined })
+                            .start_icon(Icon::new(if redis.ssh { IconName::Check } else { IconName::Circle }).size(IconSize::XSmall))
+                            .toggle_state(redis.ssh)
+                            .tooltip(Tooltip::text("Host and port above are the server as the jump host reaches it; signs in with a key or the agent, never a password prompt"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(redis) = this.form.as_mut().and_then(|form| form.redis.as_mut()) {
+                                    redis.ssh = !redis.ssh;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .when(redis.ssh, |this| {
+                        this.child(
+                            h_flex()
+                                .gap_3()
+                                .child(div().flex_1().child(input("SSH host", &redis.ssh_host, cx)))
+                                .child(div().w(px(100.)).child(input("SSH port", &redis.ssh_port, cx)))
+                                .child(div().flex_1().child(input("SSH user", &redis.ssh_user, cx))),
+                        )
+                        .child(input("SSH private key", &redis.ssh_key, cx))
                     })
                     .when(redis.tls, |this| {
                         this.child(input("CA certificate", &redis.ca_file, cx))

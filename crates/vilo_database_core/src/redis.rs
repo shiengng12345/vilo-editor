@@ -20,6 +20,8 @@ pub struct RedisSession {
     /// The TLS settings of a `rediss` connection and the host certificates are checked against,
     /// for the connections Vilo opens itself (MONITOR).
     pub(crate) tls: Option<(Arc<rustls::ClientConfig>, String)>,
+    /// The SSH tunnel every connection of this session goes through, kept open with it.
+    pub(crate) tunnel: Option<Arc<crate::redis_ssh::SshTunnel>>,
     /// Something the user should know about how the session was set up.
     notice: Option<String>,
     clustered: bool,
@@ -670,6 +672,15 @@ pub(crate) fn cluster_hash(name: &str, args: &[Value]) -> fred::types::ClusterHa
     }
 }
 
+/// Sends every connection `client` makes through `tunnel`.
+pub(crate) async fn through(client: &Client, tunnel: &Arc<crate::redis_ssh::SshTunnel>) {
+    client
+        .set_resolver(Arc::new(crate::redis_ssh::ThroughTunnel(Arc::downgrade(
+            tunnel,
+        ))))
+        .await;
+}
+
 /// The database in a connection string's path, if it names one.
 fn url_database(url: &str) -> Result<Option<u8>> {
     let url = url::Url::parse(url).context("The Redis URL is not valid")?;
@@ -764,7 +775,7 @@ impl RedisSession {
 
     /// Connects with `database` in place of the URL's; a cluster only has database 0.
     pub async fn connect_to_database(url: &str, database: Option<u8>) -> Result<Self> {
-        Self::connect_with(url, database, None).await
+        Self::connect_with(url, database, None, None).await
     }
 
     /// Connects with `database` in place of the URL's and, for a `rediss` URL, these TLS settings
@@ -774,6 +785,7 @@ impl RedisSession {
         url: &str,
         database: Option<u8>,
         tls: Option<&crate::redis_tls::RedisTls>,
+        ssh: Option<&crate::redis_ssh::SshSettings>,
     ) -> Result<Self> {
         // Parsed without its TLS scheme: fred would build its own TLS settings for `rediss`,
         // which needs a process-wide crypto provider; Vilo's own settings are set below.
@@ -812,17 +824,23 @@ impl RedisSession {
             });
         }
         let tls_pair = tls_config.clone().map(|config| (config, host.clone()));
+        let tunnel = match ssh {
+            Some(settings) => Some(crate::redis_ssh::SshTunnel::open(settings).await?),
+            None => None,
+        };
         let selects = database
             .or(config.database)
             .is_some_and(|database| database > 0);
-        let session = match Self::open(config.clone(), database, tls_pair.clone()).await {
+        let session = match Self::open(config.clone(), database, tls_pair.clone(), tunnel.clone())
+            .await
+        {
             Ok(session) => session,
             // A cluster node refuses SELECT; asked once more without it, the node says whether it
             // is one, whatever words its refusal used.
             Err(error) if selects => {
                 let mut plain = config;
                 plain.database = None;
-                if let Ok(probe) = Self::open(plain, None, tls_pair.clone()).await {
+                if let Ok(probe) = Self::open(plain, None, tls_pair.clone(), tunnel.clone()).await {
                     let cluster = probe.is_cluster_node().await.unwrap_or(false);
                     probe.quit().await.ok();
                     anyhow::ensure!(
@@ -868,7 +886,7 @@ impl RedisSession {
         if tls_config.is_some() {
             unbracket_tls_names(&mut cluster);
         }
-        Self::open(cluster, None, tls_pair).await
+        Self::open(cluster, None, tls_pair, tunnel).await
     }
 
     /// Whether the server this single connection reached runs in cluster mode.
@@ -885,6 +903,7 @@ impl RedisSession {
         mut config: Config,
         database: Option<u8>,
         tls: Option<(Arc<rustls::ClientConfig>, String)>,
+        tunnel: Option<Arc<crate::redis_ssh::SshTunnel>>,
     ) -> Result<Self> {
         let clustered = config.server.is_clustered();
         if let Some(database) = database {
@@ -906,11 +925,15 @@ impl RedisSession {
             performance.default_command_timeout = COMMAND_TIMEOUT;
         });
         let client = builder.build()?;
+        if let Some(tunnel) = &tunnel {
+            through(&client, tunnel).await;
+        }
         client.init().await.context("Could not reach Redis")?;
         Ok(Self {
             client,
             config,
             tls,
+            tunnel,
             notice: None,
             clustered,
             database: selected,

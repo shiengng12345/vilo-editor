@@ -989,12 +989,14 @@ impl DatabaseView {
                     .redis_tls
                     .clone()
                     .filter(|_| vilo_database_core::redis_tls::tls_scheme(&uri));
+                let ssh = connection.redis_ssh.clone();
                 let task = cx.update(|cx| {
                     run(cx, async move {
                         vilo_database_core::redis::RedisSession::connect_with(
                             &uri,
                             Some(database),
                             tls.as_ref(),
+                            ssh.as_ref(),
                         )
                         .await
                     })
