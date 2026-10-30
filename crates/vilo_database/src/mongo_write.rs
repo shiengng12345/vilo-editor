@@ -106,10 +106,10 @@ fn audit_path() -> std::path::PathBuf {
 /// The kind given to a damaged log line.
 pub(crate) const DAMAGED: &str = "damaged";
 
-/// A stable name for a damaged line (FNV-1a of its text), so acknowledging it holds across
+/// A stable name for a damaged line (FNV-1a of its bytes), so acknowledging it holds across
 /// restarts.
-fn damaged_id(line: &str) -> String {
-    let hash = line.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+fn damaged_id(line: &[u8]) -> String {
+    let hash = line.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     });
     format!("damaged:{hash:016x}")
@@ -118,22 +118,31 @@ fn damaged_id(line: &str) -> String {
 /// Unsettled writes: operation, a summary to show, the kind, and the lock a publish holds.
 pub(crate) type Dangling = (String, String, String, Option<String>);
 
-pub(crate) fn dangling_writes(log: &str) -> Vec<Dangling> {
+/// The log is read as bytes and judged line by line, so one line cut inside a character does
+/// not make the rest unreadable.
+pub(crate) fn dangling_writes(log: &[u8]) -> Vec<Dangling> {
     let mut open: Vec<Dangling> = Vec::new();
-    for line in log.lines() {
-        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+    for line in log.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let parsed = std::str::from_utf8(line)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+        let Some(entry) = parsed else {
             // A damaged line may have been an unsettled write, so it is checked like one.
-            if !line.trim().is_empty() {
-                open.push((
-                    damaged_id(line),
-                    format!(
-                        "A line of the write log could not be read; it may have been a write: {}",
-                        line.chars().take(120).collect::<String>()
-                    ),
-                    DAMAGED.to_string(),
-                    None,
-                ));
-            }
+            open.push((
+                damaged_id(line),
+                format!(
+                    "A line of the write log could not be read; it may have been a write: {}",
+                    String::from_utf8_lossy(line)
+                        .chars()
+                        .take(120)
+                        .collect::<String>()
+                ),
+                DAMAGED.to_string(),
+                None,
+            ));
             continue;
         };
         let Some(operation) = entry.get("operation").and_then(|value| value.as_str()) else {
@@ -211,9 +220,8 @@ pub(crate) fn read_dangling_writes() -> Result<Vec<Dangling>> {
     // Shared, so no entry is half written while it is read.
     file.lock_shared()
         .context("Vilo could not lock the write log")?;
-    let mut log = String::new();
-    std::io::Read::read_to_string(&mut file, &mut log)
-        .context("Vilo could not read the write log")?;
+    let mut log = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut log).context("Vilo could not read the write log")?;
     Ok(dangling_writes(&log))
 }
 
@@ -234,23 +242,37 @@ pub(crate) fn acknowledge_writes(operations: &[String]) -> Result<()> {
 static AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn audit(line: serde_json::Value) -> Result<()> {
-    let path = audit_path();
+    append_entry(&audit_path(), &line.to_string())
+}
+
+/// Appends one entry as a whole line. A last line left without its newline (an interrupted
+/// write) is ended first, so the new entry never joins it.
+fn append_entry(path: &std::path::Path, line: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).append(true).read(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    // The whole entry goes out in one write.
-    let entry = format!("{line}\n");
     let _guard = AUDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut file = options
-        .open(&path)
+        .open(path)
         .context("Vilo could not open the write log")?;
     file.lock().context("Vilo could not lock the write log")?;
+    let unterminated = if file.metadata()?.len() > 0 {
+        use std::io::{Read as _, Seek as _};
+        file.seek(std::io::SeekFrom::End(-1))?;
+        let mut last = [0_u8];
+        file.read_exact(&mut last)?;
+        last[0] != b'\n'
+    } else {
+        false
+    };
+    // The whole entry goes out in one write.
+    let entry = format!("{}{line}\n", if unterminated { "\n" } else { "" });
     file.write_all(entry.as_bytes())
         .context("Vilo could not write to the write log")?;
     file.sync_data()
@@ -741,6 +763,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_damaged_tail_and_bytes() {
+        let folder = std::env::temp_dir().join(format!("vilo-audit-{}", std::process::id()));
+        std::fs::remove_dir_all(&folder).ok();
+        let path = folder.join("audit.log");
+        std::fs::create_dir_all(&folder).unwrap();
+        // An interrupted write: a JSON prefix cut inside a multi-byte character, no newline.
+        let mut cut = br#"{"operation":"p","phase":"intent","name":""#.to_vec();
+        cut.extend_from_slice(&"中".as_bytes()[..2]);
+        std::fs::write(&path, &cut).unwrap();
+        let damaged = dangling_writes(&std::fs::read(&path).unwrap());
+        assert_eq!(damaged.len(), 1);
+        assert_eq!(
+            damaged[0].2, DAMAGED,
+            "a line that is not UTF-8 is still reported"
+        );
+        let acknowledged =
+            serde_json::json!({ "operation": damaged[0].0, "phase": "acknowledged" });
+        append_entry(&path, &acknowledged.to_string()).unwrap();
+        assert!(
+            dangling_writes(&std::fs::read(&path).unwrap()).is_empty(),
+            "the acknowledgement starts its own line and settles the damaged one"
+        );
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
     fn test_dangling_writes() {
         let log = [
             r#"{"operation":"a","phase":"intent","kind":"updateOne","target":"db.c","time":"t1","name":"QAT","environment":"QAT"}"#,
@@ -760,7 +808,7 @@ mod tests {
             r#"{"operation":"g","phase":"result","result":"unknown"}"#,
         ]
         .join("\n");
-        let dangling = dangling_writes(&log);
+        let dangling = dangling_writes(log.as_bytes());
         assert_eq!(
             dangling
                 .iter()
@@ -792,7 +840,7 @@ mod tests {
             serde_json::json!({ "operation": damaged.0, "phase": "acknowledged" })
         );
         assert!(
-            dangling_writes(&acknowledged)
+            dangling_writes(acknowledged.as_bytes())
                 .iter()
                 .all(|(_, _, kind, _)| kind != DAMAGED),
             "acknowledging a damaged line settles it"
