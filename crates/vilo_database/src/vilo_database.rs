@@ -1098,7 +1098,6 @@ impl DatabaseView {
         };
         v_flex()
             .id("database-name-form")
-            .max_w(px(420.))
             .gap_3()
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.save_name_edit(cx)))
             .on_action(cx.listener(move |this, _: &menu::Cancel, _, cx| close(this, cx)))
@@ -1549,14 +1548,9 @@ impl Render for DatabaseView {
             .active_connection()
             .filter(|connection| self.in_view(connection))
             .cloned();
-        let full_bleed = self.form.is_none()
-            && self.name_edit.is_none()
-            && self.name_message.is_none()
-            && self.session.is_some()
-            && connection.is_some();
+        let full_bleed = self.form.is_none() && self.session.is_some() && connection.is_some();
         let naming = self.name_edit.is_some() || self.name_message.is_some();
         let main = match (&self.form, &connection, &self.session) {
-            _ if naming => self.render_name_form(cx),
             (Some(form), _, _) => self.render_form(form, cx),
             (None, Some(connection), Some(Session::Mongo(_))) => self.render_mongo(connection, cx),
             (None, Some(connection), Some(Session::Redis(_))) => self.render_redis(connection, cx),
@@ -1579,10 +1573,12 @@ impl Render for DatabaseView {
             .color(Color::Muted)
             .into_any_element(),
         };
+        let colors = cx.theme().colors().clone();
         h_flex()
             .track_focus(&self.focus_handle)
+            .relative()
             .size_full()
-            .bg(cx.theme().colors().editor_background)
+            .bg(colors.editor_background)
             .child(self.render_rail(cx))
             .child(self.render_sidebar(cx))
             // Mongo and Redis pages run edge to edge like Compass and RedisInsight.
@@ -1594,6 +1590,38 @@ impl Render for DatabaseView {
                     .when(!full_bleed, |this| this.p_4())
                     .child(main),
             )
+            .when(naming, |this| {
+                this.child(
+                    div()
+                        .id("database-name-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.4))
+                        .occlude()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.name_edit = None;
+                            this.name_message = None;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .id("database-name-dialog")
+                                .w(px(380.))
+                                .p_4()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(colors.elevated_surface_background)
+                                .shadow_lg()
+                                // Clicks inside the dialog must not reach the backdrop, which closes it.
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(self.render_name_form(cx)),
+                        ),
+                )
+            })
     }
 }
 
