@@ -123,7 +123,6 @@ enum Session {
 }
 
 struct SiteEdit {
-    kind: Kind,
     original: Option<String>,
     editor: Entity<Editor>,
 }
@@ -360,7 +359,6 @@ impl DatabaseView {
 
     fn start_site_edit(
         &mut self,
-        kind: Kind,
         original: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -373,11 +371,7 @@ impl DatabaseView {
             cx,
         );
         window.focus(&editor.focus_handle(cx), cx);
-        self.site_edit = Some(SiteEdit {
-            kind,
-            original,
-            editor,
-        });
+        self.site_edit = Some(SiteEdit { original, editor });
         self.site_message = None;
         cx.notify();
     }
@@ -805,15 +799,6 @@ impl Focusable for DatabaseView {
     }
 }
 
-fn section(title: &'static str) -> gpui::Div {
-    h_flex().h(px(26.)).pl_3().pr_1().justify_between().child(
-        Label::new(title)
-            .size(LabelSize::XSmall)
-            .weight(gpui::FontWeight::SEMIBOLD)
-            .color(Color::Muted),
-    )
-}
-
 fn boxed(child: impl IntoElement, cx: &App) -> gpui::Div {
     let colors = cx.theme().colors();
     div()
@@ -869,26 +854,57 @@ fn render_lines(
 
 impl DatabaseView {
     /// The first level of the module: MongoDB and Redis, each with the user's sites under it.
+    /// MongoDB and Redis as icons, then the sites both share, then (in the sidebar) the site's connections.
     fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let sites = self.sites();
-        let current_site = self.current_site();
-        let mut rail = v_flex()
-            .id("database-rail")
-            .w(px(176.))
+        let mut kinds = v_flex()
+            .w(px(48.))
             .flex_none()
             .h_full()
-            .overflow_y_scroll()
+            .pt_2()
+            .gap_1()
+            .items_center()
             .border_r_1()
             .border_color(colors.border)
-            .bg(colors.panel_background)
-            .child(section("DATABASE"));
+            .bg(colors.panel_background);
+        for (kind, icon, color) in [
+            (Kind::MongoDb, "icons/vilo/mongodb.svg", 0x00ED64),
+            (Kind::Redis, "icons/vilo/redis.svg", 0xFF4438),
+        ] {
+            let selected = self.kind_view == kind;
+            kinds = kinds.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "database-kind-{}",
+                        kind.label()
+                    )))
+                    .size(px(36.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(selected, |this| this.bg(colors.element_selected))
+                    .hover(|style| style.bg(colors.element_hover))
+                    .tooltip(Tooltip::text(kind.label()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.kind_view = kind;
+                        this.form = None;
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::from_path(icon)
+                            .size(IconSize::Medium)
+                            .color(Color::Custom(gpui::rgb(color).into())),
+                    ),
+            );
+        }
+
         let edit_row = |edit: &SiteEdit, cx: &mut Context<Self>| {
             h_flex()
-                .pl_6()
-                .pr_1()
+                .px_1()
                 .py_0p5()
-                .gap_1()
+                .gap_0p5()
                 .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.save_site_edit(cx)))
                 .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
                     this.site_edit = None;
@@ -907,133 +923,132 @@ impl DatabaseView {
                         .on_click(cx.listener(|this, _, _, cx| this.save_site_edit(cx))),
                 )
         };
-        for (kind, icon) in [
-            (Kind::MongoDb, IconName::DatabaseZap),
-            (Kind::Redis, IconName::Server),
-        ] {
-            let kind_id = kind.label();
-            rail = rail.child(
+        let current_site = self.current_site();
+        let mut sites = v_flex()
+            .id("database-sites")
+            .w(px(132.))
+            .flex_none()
+            .h_full()
+            .overflow_y_scroll()
+            .border_r_1()
+            .border_color(colors.border)
+            .bg(colors.panel_background)
+            .child(
                 h_flex()
-                    .h(px(30.))
-                    .px_3()
-                    .gap_2()
-                    .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
-                    .child(Label::new(kind.label()).weight(gpui::FontWeight::SEMIBOLD))
-                    .child(div().flex_1())
+                    .h(px(26.))
+                    .pl_3()
+                    .pr_1()
+                    .justify_between()
                     .child(
-                        IconButton::new(
-                            SharedString::from(format!("database-site-add-{kind_id}")),
-                            IconName::Plus,
-                        )
-                        .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text("Add a site"))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| this.start_site_edit(kind, None, window, cx),
-                        )),
+                        Label::new("SITES")
+                            .size(LabelSize::XSmall)
+                            .weight(gpui::FontWeight::SEMIBOLD)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        IconButton::new("database-site-add", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Add a site"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_site_edit(None, window, cx)
+                            })),
                     ),
             );
-            for site in &sites {
-                if let Some(edit) = &self.site_edit
-                    && edit.kind == kind
-                    && edit.original.as_ref() == Some(site)
-                {
-                    rail = rail.child(edit_row(edit, cx));
-                    continue;
-                }
-                let selected = self.kind_view == kind && current_site == *site;
-                let group = SharedString::from(format!("database-site-{kind_id}-{site}"));
-                let editable = site != UNASSIGNED_SITE;
-                let (select_site, edit_site, delete_site) =
-                    (site.clone(), site.clone(), site.clone());
-                rail = rail.child(
-                    h_flex()
-                        .id(SharedString::from(format!(
-                            "database-site-row-{kind_id}-{site}"
-                        )))
-                        .group(group.clone())
-                        .h(px(28.))
-                        .pl_8()
-                        .pr_1()
-                        .gap_1()
-                        .cursor_pointer()
-                        .border_l_2()
-                        .border_color(if selected {
-                            colors.text_accent
-                        } else {
-                            gpui::transparent_black()
-                        })
-                        .when(selected, |this| this.bg(colors.element_selected))
-                        .hover(|style| style.bg(colors.element_hover))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.kind_view = kind;
-                            this.site = Some(select_site.clone());
-                            this.form = None;
-                            cx.notify();
-                        }))
-                        .child(
-                            div().flex_1().min_w_0().child(
-                                Label::new(site.clone())
-                                    .color(if selected {
-                                        Color::Default
-                                    } else {
-                                        Color::Muted
-                                    })
-                                    .truncate(),
-                            ),
-                        )
-                        .when(editable, |this| {
-                            this.child(
-                                h_flex()
-                                    .visible_on_hover(group)
-                                    .child(
-                                        IconButton::new(
-                                            SharedString::from(format!(
-                                                "database-site-rename-{kind_id}-{site}"
-                                            )),
-                                            IconName::Pencil,
-                                        )
-                                        .icon_size(IconSize::XSmall)
-                                        .tooltip(Tooltip::text("Rename site"))
-                                        .on_click(
-                                            cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.start_site_edit(
-                                                    kind,
-                                                    Some(edit_site.clone()),
-                                                    window,
-                                                    cx,
-                                                )
-                                            }),
-                                        ),
-                                    )
-                                    .child(
-                                        IconButton::new(
-                                            SharedString::from(format!(
-                                                "database-site-delete-{kind_id}-{site}"
-                                            )),
-                                            IconName::Trash,
-                                        )
-                                        .icon_size(IconSize::XSmall)
-                                        .tooltip(Tooltip::text("Delete site"))
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.delete_site(delete_site.clone(), cx)
-                                            }),
-                                        ),
-                                    ),
-                            )
-                        }),
-                );
-            }
+        for site in self.sites() {
             if let Some(edit) = &self.site_edit
-                && edit.kind == kind
-                && edit.original.is_none()
+                && edit.original.as_ref() == Some(&site)
             {
-                rail = rail.child(edit_row(edit, cx));
+                sites = sites.child(edit_row(edit, cx));
+                continue;
             }
+            let selected = current_site == site;
+            let group = SharedString::from(format!("database-site-{site}"));
+            let editable = site != UNASSIGNED_SITE;
+            let (select_site, edit_site, delete_site) = (site.clone(), site.clone(), site.clone());
+            sites = sites.child(
+                h_flex()
+                    .id(SharedString::from(format!("database-site-row-{site}")))
+                    .group(group.clone())
+                    .h(px(28.))
+                    .pl_3()
+                    .pr_1()
+                    .gap_1()
+                    .cursor_pointer()
+                    .border_l_2()
+                    .border_color(if selected {
+                        colors.text_accent
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .when(selected, |this| this.bg(colors.element_selected))
+                    .hover(|style| style.bg(colors.element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.site = Some(select_site.clone());
+                        this.form = None;
+                        cx.notify();
+                    }))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(site.clone())
+                                .weight(if selected {
+                                    gpui::FontWeight::SEMIBOLD
+                                } else {
+                                    gpui::FontWeight::NORMAL
+                                })
+                                .color(if selected {
+                                    Color::Default
+                                } else {
+                                    Color::Muted
+                                })
+                                .truncate(),
+                        ),
+                    )
+                    .when(editable, |this| {
+                        this.child(
+                            h_flex()
+                                .visible_on_hover(group)
+                                .child(
+                                    IconButton::new(
+                                        SharedString::from(format!("database-site-rename-{site}")),
+                                        IconName::Pencil,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text("Rename site"))
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.start_site_edit(
+                                                Some(edit_site.clone()),
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    IconButton::new(
+                                        SharedString::from(format!("database-site-delete-{site}")),
+                                        IconName::Trash,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text("Delete site"))
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.delete_site(delete_site.clone(), cx)
+                                        },
+                                    )),
+                                ),
+                        )
+                    }),
+            );
         }
-        rail.when_some(self.site_message.clone(), |this, message| {
+        if let Some(edit) = &self.site_edit
+            && edit.original.is_none()
+        {
+            sites = sites.child(edit_row(edit, cx));
+        }
+        let sites = sites.when_some(self.site_message.clone(), |this, message| {
             this.child(
                 div().px_3().pt_2().child(
                     Label::new(message)
@@ -1041,7 +1056,8 @@ impl DatabaseView {
                         .color(Color::Warning),
                 ),
             )
-        })
+        });
+        h_flex().h_full().child(kinds).child(sites)
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
