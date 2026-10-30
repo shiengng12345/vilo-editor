@@ -89,12 +89,29 @@ impl Connection {
         format!("vilo-database://{}", self.id)
     }
 
-    fn site_label(&self) -> String {
-        if self.site.trim().is_empty() {
-            UNASSIGNED_SITE.to_string()
-        } else {
-            self.site.trim().to_string()
+    fn at(&self, level: Level) -> &str {
+        match level {
+            Level::Site => self.site.trim(),
+            Level::Environment => self.environment.trim(),
         }
+    }
+
+    fn label_at(&self, level: Level) -> String {
+        match self.at(level) {
+            "" => UNASSIGNED_SITE.to_string(),
+            name => name.to_string(),
+        }
+    }
+
+    fn set_at(&mut self, level: Level, name: String) {
+        match level {
+            Level::Site => self.site = name,
+            Level::Environment => self.environment = name,
+        }
+    }
+
+    fn site_label(&self) -> String {
+        self.label_at(Level::Site)
     }
 
     fn production(&self) -> bool {
@@ -122,39 +139,74 @@ enum Session {
     Redis(Arc<RedisSession>),
 }
 
-struct SiteEdit {
+/// The two lists the rail keeps after the kind: sites (CP, BP …) and environments (QAT, UAT …).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Level {
+    Site = 0,
+    Environment = 1,
+}
+
+impl Level {
+    fn title(self) -> &'static str {
+        match self {
+            Level::Site => "SITES",
+            Level::Environment => "ENVIRONMENTS",
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Level::Site => "site",
+            Level::Environment => "environment",
+        }
+    }
+
+    fn placeholder(self) -> &'static str {
+        match self {
+            Level::Site => "e.g. CP",
+            Level::Environment => "e.g. QAT",
+        }
+    }
+
+    fn path(self) -> PathBuf {
+        paths::config_dir().join(match self {
+            Level::Site => "database_sites.json",
+            Level::Environment => "database_environments.json",
+        })
+    }
+}
+
+/// A site or environment being added (`original` is `None`) or renamed in the rail.
+struct NameEdit {
+    level: Level,
     original: Option<String>,
     editor: Entity<Editor>,
 }
 
-fn sites_path() -> PathBuf {
-    paths::config_dir().join("database_sites.json")
-}
-
-fn write_sites(sites: Vec<String>, cx: &mut App) {
+fn write_names(level: Level, names: Vec<String>, cx: &mut App) {
     cx.background_spawn(async move {
-        let path = sites_path();
+        let path = level.path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, serde_json::to_vec_pretty(&sites)?)?;
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&names)?)?;
         std::fs::rename(&temporary, &path)?;
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
 }
 
-/// Checks a site name typed in the rail against the others (case is ignored).
-fn check_site_name(name: &str, others: &[String]) -> Result<(), &'static str> {
+/// Checks a name typed in the rail against the others in its list (case is ignored).
+fn check_name(name: &str, others: &[String]) -> Result<(), &'static str> {
     if name.is_empty() {
-        return Err("Type a site name.");
+        return Err("Type a name.");
     }
     if name.eq_ignore_ascii_case(UNASSIGNED_SITE) {
         return Err("That name is reserved.");
     }
     if others.iter().any(|other| other.eq_ignore_ascii_case(name)) {
-        return Err("That site already exists.");
+        return Err("That name already exists.");
     }
     Ok(())
 }
@@ -187,13 +239,12 @@ pub struct DatabaseView {
     collections: HashMap<String, Fetch<Vec<CollectionInfo>>>,
     /// MongoDB or Redis: the rail on the far left picks which kind the sidebar and page show.
     kind_view: Kind,
-    /// The site whose connections the sidebar lists.
-    site: Option<String>,
-    /// Sites the user keeps (CP, BP …), shared by MongoDB and Redis; saved in `database_sites.json`.
-    site_list: Vec<String>,
-    /// A site being added (`original` is `None`) or renamed, under one kind in the rail.
-    site_edit: Option<SiteEdit>,
-    site_message: Option<SharedString>,
+    /// The site and environment whose connections the sidebar lists, by `Level`.
+    selected: [Option<String>; 2],
+    /// Sites and environments the user keeps, shared by MongoDB and Redis, by `Level`.
+    names: [Vec<String>; 2],
+    name_edit: Option<NameEdit>,
+    name_message: Option<(Level, SharedString)>,
     /// Searches connections and collections at once, keeping each match's parents visible.
     search: Entity<Editor>,
     tabs: Vec<MongoTab>,
@@ -264,17 +315,20 @@ impl DatabaseView {
             .into_iter()
             .filter_map(|entry| serde_json::from_value::<Connection>(entry).log_err())
             .collect::<Vec<_>>();
-        // Saved sites, plus any a connection names that the list does not have yet.
-        let mut site_list: Vec<String> = std::fs::read(sites_path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).log_err())
-            .unwrap_or_default();
-        for connection in &connections {
-            let site = connection.site.trim();
-            if !site.is_empty() && !site_list.iter().any(|known| known == site) {
-                site_list.push(site.to_string());
+        // Saved names, plus any a connection uses that the list does not have yet.
+        let names = [Level::Site, Level::Environment].map(|level| {
+            let mut names: Vec<String> = std::fs::read(level.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).log_err())
+                .unwrap_or_default();
+            for connection in &connections {
+                let name = connection.at(level);
+                if !name.is_empty() && !names.iter().any(|known| known == name) {
+                    names.push(name.to_string());
+                }
             }
-        }
+            names
+        });
         let search = editor("Search connections and collections", "", false, window, cx);
         let subscriptions = vec![
             cx.subscribe(&search, |this, _, _: &editor::EditorEvent, cx| {
@@ -298,10 +352,10 @@ impl DatabaseView {
             databases: Fetch::Loaded(Vec::new()),
             collections: HashMap::default(),
             kind_view: Kind::MongoDb,
-            site: None,
-            site_list,
-            site_edit: None,
-            site_message: None,
+            selected: [None, None],
+            names,
+            name_edit: None,
+            name_message: None,
             search,
             tabs: Vec::new(),
             active_tab: None,
@@ -339,126 +393,138 @@ impl DatabaseView {
         })
     }
 
-    /// The user's sites, sorted, then Unassigned when some connection has no site.
-    fn sites(&self) -> Vec<String> {
-        let mut sites = self.site_list.clone();
-        sites.sort_by_key(|site| site.to_lowercase());
+    /// The user's names at this level, sorted, then Unassigned when some connection has none.
+    fn names(&self, level: Level) -> Vec<String> {
+        let mut names = self.names[level as usize].clone();
+        names.sort_by_key(|name| name.to_lowercase());
         if self
             .connections
             .iter()
-            .any(|connection| connection.site.trim().is_empty())
+            .any(|connection| connection.at(level).is_empty())
         {
-            sites.push(UNASSIGNED_SITE.to_string());
+            names.push(UNASSIGNED_SITE.to_string());
         }
-        sites
+        names
     }
 
-    fn persist_sites(&self, cx: &mut Context<Self>) {
-        write_sites(self.site_list.clone(), cx);
-    }
-
-    fn start_site_edit(
+    fn start_name_edit(
         &mut self,
+        level: Level,
         original: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let editor = editor(
-            "Site name, e.g. CP",
+            level.placeholder(),
             original.as_deref().unwrap_or_default(),
             false,
             window,
             cx,
         );
         window.focus(&editor.focus_handle(cx), cx);
-        self.site_edit = Some(SiteEdit { original, editor });
-        self.site_message = None;
+        self.name_edit = Some(NameEdit {
+            level,
+            original,
+            editor,
+        });
+        self.name_message = None;
         cx.notify();
     }
 
-    fn save_site_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = &self.site_edit else {
+    fn save_name_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = &self.name_edit else {
             return;
         };
+        let level = edit.level;
         let name = edit.editor.read(cx).text(cx).trim().to_string();
         let original = edit.original.clone();
-        let others = self
-            .site_list
+        let list = &mut self.names[level as usize];
+        let others = list
             .iter()
-            .filter(|site| Some(*site) != original.as_ref())
+            .filter(|known| Some(*known) != original.as_ref())
             .cloned()
             .collect::<Vec<_>>();
-        if let Err(message) = check_site_name(&name, &others) {
-            self.site_message = Some(message.into());
+        if let Err(message) = check_name(&name, &others) {
+            self.name_message = Some((level, message.into()));
             cx.notify();
             return;
         }
         match original {
             Some(old) => {
-                for site in &mut self.site_list {
-                    if *site == old {
-                        *site = name.clone();
+                for known in list.iter_mut() {
+                    if *known == old {
+                        *known = name.clone();
                     }
                 }
-                // Connections move with their site.
+                // Connections move with the renamed site or environment.
                 let mut moved = false;
                 for connection in &mut self.connections {
-                    if connection.site.trim() == old {
-                        connection.site = name.clone();
+                    if connection.at(level) == old {
+                        connection.set_at(level, name.clone());
                         moved = true;
                     }
                 }
                 if moved {
                     self.persist(cx).detach_and_log_err(cx);
                 }
-                if self.site.as_deref() == Some(old.as_str()) {
-                    self.site = Some(name);
+                let selected = &mut self.selected[level as usize];
+                if selected.as_deref() == Some(old.as_str()) {
+                    *selected = Some(name);
                 }
             }
             None => {
-                self.site = Some(name.clone());
-                self.site_list.push(name);
+                list.push(name.clone());
+                self.selected[level as usize] = Some(name);
             }
         }
-        self.site_edit = None;
-        self.site_message = None;
-        self.persist_sites(cx);
+        self.name_edit = None;
+        self.name_message = None;
+        write_names(level, self.names[level as usize].clone(), cx);
         cx.notify();
     }
 
-    fn delete_site(&mut self, site: String, cx: &mut Context<Self>) {
+    fn delete_name(&mut self, level: Level, name: String, cx: &mut Context<Self>) {
         let used = self
             .connections
             .iter()
-            .filter(|connection| connection.site.trim() == site)
+            .filter(|connection| connection.at(level) == name)
             .count();
         if used > 0 {
-            self.site_message = Some(
+            self.name_message = Some((
+                level,
                 format!(
-                    "{site} has {used} connection{}; move or delete them first.",
+                    "{name} has {used} connection{}; move or delete them first.",
                     if used == 1 { "" } else { "s" }
                 )
                 .into(),
-            );
+            ));
             cx.notify();
             return;
         }
-        self.site_list.retain(|known| *known != site);
-        if self.site.as_deref() == Some(site.as_str()) {
-            self.site = None;
+        self.names[level as usize].retain(|known| *known != name);
+        let selected = &mut self.selected[level as usize];
+        if selected.as_deref() == Some(name.as_str()) {
+            *selected = None;
         }
-        self.site_message = None;
-        self.persist_sites(cx);
+        self.name_message = None;
+        write_names(level, self.names[level as usize].clone(), cx);
         cx.notify();
     }
 
-    fn current_site(&self) -> String {
-        let sites = self.sites();
-        self.site
+    fn current(&self, level: Level) -> String {
+        let names = self.names(level);
+        self.selected[level as usize]
             .clone()
-            .filter(|site| sites.contains(site))
-            .or_else(|| sites.first().cloned())
+            .filter(|name| names.contains(name))
+            .or_else(|| names.first().cloned())
             .unwrap_or_default()
+    }
+
+    /// Whether the connection belongs to the kind, site and environment picked in the rail.
+    fn in_view(&self, connection: &Connection) -> bool {
+        connection.kind == self.kind_view
+            && connection.label_at(Level::Site) == self.current(Level::Site)
+            && connection.label_at(Level::Environment) == self.current(Level::Environment)
     }
 
     fn active_connection(&self) -> Option<&Connection> {
@@ -628,7 +694,9 @@ impl DatabaseView {
                 &existing
                     .as_ref()
                     .map(|c| c.site.clone())
-                    .or_else(|| self.site.clone().filter(|site| site != UNASSIGNED_SITE))
+                    .or_else(|| {
+                        Some(self.current(Level::Site)).filter(|site| site != UNASSIGNED_SITE)
+                    })
                     .unwrap_or_default(),
                 false,
                 window,
@@ -649,6 +717,10 @@ impl DatabaseView {
                 &existing
                     .as_ref()
                     .map(|c| c.environment.clone())
+                    .or_else(|| {
+                        Some(self.current(Level::Environment))
+                            .filter(|environment| environment != UNASSIGNED_SITE)
+                    })
                     .unwrap_or_default(),
                 false,
                 window,
@@ -711,13 +783,15 @@ impl DatabaseView {
             name,
             kind: form.kind,
             site: site.clone(),
-            environment,
+            environment: environment.clone(),
         };
-        if !self.site_list.contains(&site) {
-            self.site_list.push(site.clone());
-            write_sites(self.site_list.clone(), cx);
+        for (level, name) in [(Level::Site, site), (Level::Environment, environment)] {
+            if !self.names[level as usize].contains(&name) {
+                self.names[level as usize].push(name.clone());
+                write_names(level, self.names[level as usize].clone(), cx);
+            }
+            self.selected[level as usize] = Some(name);
         }
-        self.site = Some(site);
         form.checking = true;
         form.message = Some("Connecting…".into());
         form._task = Some(cx.spawn(async move |this, cx| {
@@ -900,15 +974,25 @@ impl DatabaseView {
             );
         }
 
-        let edit_row = |edit: &SiteEdit, cx: &mut Context<Self>| {
+        h_flex()
+            .h_full()
+            .child(kinds)
+            .child(self.render_names(Level::Site, cx))
+            .child(self.render_names(Level::Environment, cx))
+    }
+
+    fn render_names(&self, level: Level, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let noun = level.noun();
+        let edit_row = |edit: &NameEdit, cx: &mut Context<Self>| {
             h_flex()
                 .px_1()
                 .py_0p5()
                 .gap_0p5()
-                .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.save_site_edit(cx)))
+                .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.save_name_edit(cx)))
                 .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
-                    this.site_edit = None;
-                    this.site_message = None;
+                    this.name_edit = None;
+                    this.name_message = None;
                     cx.notify();
                 }))
                 .child(
@@ -918,15 +1002,16 @@ impl DatabaseView {
                         .child(boxed(edit.editor.clone(), cx)),
                 )
                 .child(
-                    IconButton::new("database-site-save", IconName::Check)
+                    IconButton::new(format!("database-{noun}-save"), IconName::Check)
                         .icon_size(IconSize::Small)
-                        .on_click(cx.listener(|this, _, _, cx| this.save_site_edit(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.save_name_edit(cx))),
                 )
         };
-        let current_site = self.current_site();
-        let mut sites = v_flex()
-            .id("database-sites")
-            .w(px(132.))
+        let edit = self.name_edit.as_ref().filter(|edit| edit.level == level);
+        let current = self.current(level);
+        let mut column = v_flex()
+            .id(SharedString::from(format!("database-{noun}s")))
+            .w(px(120.))
             .flex_none()
             .h_full()
             .overflow_y_scroll()
@@ -940,34 +1025,34 @@ impl DatabaseView {
                     .pr_1()
                     .justify_between()
                     .child(
-                        Label::new("SITES")
+                        Label::new(level.title())
                             .size(LabelSize::XSmall)
                             .weight(gpui::FontWeight::SEMIBOLD)
                             .color(Color::Muted),
                     )
                     .child(
-                        IconButton::new("database-site-add", IconName::Plus)
+                        IconButton::new(format!("database-{noun}-add"), IconName::Plus)
                             .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Add a site"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.start_site_edit(None, window, cx)
+                            .tooltip(Tooltip::text(format!("Add a {noun}")))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.start_name_edit(level, None, window, cx)
                             })),
                     ),
             );
-        for site in self.sites() {
-            if let Some(edit) = &self.site_edit
-                && edit.original.as_ref() == Some(&site)
+        for name in self.names(level) {
+            if let Some(edit) = edit
+                && edit.original.as_ref() == Some(&name)
             {
-                sites = sites.child(edit_row(edit, cx));
+                column = column.child(edit_row(edit, cx));
                 continue;
             }
-            let selected = current_site == site;
-            let group = SharedString::from(format!("database-site-{site}"));
-            let editable = site != UNASSIGNED_SITE;
-            let (select_site, edit_site, delete_site) = (site.clone(), site.clone(), site.clone());
-            sites = sites.child(
+            let selected = current == name;
+            let group = SharedString::from(format!("database-{noun}-{name}"));
+            let editable = name != UNASSIGNED_SITE;
+            let (select_name, edit_name, delete_name) = (name.clone(), name.clone(), name.clone());
+            column = column.child(
                 h_flex()
-                    .id(SharedString::from(format!("database-site-row-{site}")))
+                    .id(SharedString::from(format!("database-{noun}-row-{name}")))
                     .group(group.clone())
                     .h(px(28.))
                     .pl_3()
@@ -983,13 +1068,13 @@ impl DatabaseView {
                     .when(selected, |this| this.bg(colors.element_selected))
                     .hover(|style| style.bg(colors.element_hover))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.site = Some(select_site.clone());
+                        this.selected[level as usize] = Some(select_name.clone());
                         this.form = None;
                         cx.notify();
                     }))
                     .child(
                         div().flex_1().min_w_0().child(
-                            Label::new(site.clone())
+                            Label::new(name.clone())
                                 .weight(if selected {
                                     gpui::FontWeight::SEMIBOLD
                                 } else {
@@ -1009,16 +1094,19 @@ impl DatabaseView {
                                 .visible_on_hover(group)
                                 .child(
                                     IconButton::new(
-                                        SharedString::from(format!("database-site-rename-{site}")),
+                                        SharedString::from(format!(
+                                            "database-{noun}-rename-{name}"
+                                        )),
                                         IconName::Pencil,
                                     )
                                     .icon_size(IconSize::XSmall)
-                                    .tooltip(Tooltip::text("Rename site"))
+                                    .tooltip(Tooltip::text(format!("Rename {noun}")))
                                     .on_click(cx.listener(
                                         move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.start_site_edit(
-                                                Some(edit_site.clone()),
+                                            this.start_name_edit(
+                                                level,
+                                                Some(edit_name.clone()),
                                                 window,
                                                 cx,
                                             )
@@ -1027,15 +1115,17 @@ impl DatabaseView {
                                 )
                                 .child(
                                     IconButton::new(
-                                        SharedString::from(format!("database-site-delete-{site}")),
+                                        SharedString::from(format!(
+                                            "database-{noun}-delete-{name}"
+                                        )),
                                         IconName::Trash,
                                     )
                                     .icon_size(IconSize::XSmall)
-                                    .tooltip(Tooltip::text("Delete site"))
+                                    .tooltip(Tooltip::text(format!("Delete {noun}")))
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
                                             cx.stop_propagation();
-                                            this.delete_site(delete_site.clone(), cx)
+                                            this.delete_name(level, delete_name.clone(), cx)
                                         },
                                     )),
                                 ),
@@ -1043,12 +1133,17 @@ impl DatabaseView {
                     }),
             );
         }
-        if let Some(edit) = &self.site_edit
+        if let Some(edit) = edit
             && edit.original.is_none()
         {
-            sites = sites.child(edit_row(edit, cx));
+            column = column.child(edit_row(edit, cx));
         }
-        let sites = sites.when_some(self.site_message.clone(), |this, message| {
+        let message = self
+            .name_message
+            .clone()
+            .filter(|(at, _)| *at == level)
+            .map(|(_, message)| message);
+        column.when_some(message, |this, message| {
             this.child(
                 div().px_3().pt_2().child(
                     Label::new(message)
@@ -1056,8 +1151,7 @@ impl DatabaseView {
                         .color(Color::Warning),
                 ),
             )
-        });
-        h_flex().h_full().child(kinds).child(sites)
+        })
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1065,20 +1159,22 @@ impl DatabaseView {
         let search = self.search.read(cx).text(cx).trim().to_lowercase();
         let matches = |name: &str| search.is_empty() || name.to_lowercase().contains(&search);
         let mut tree = v_flex().gap_0p5().px_1();
-        let current_site = self.current_site();
+        let place = format!(
+            "{} {}",
+            self.current(Level::Site),
+            self.current(Level::Environment)
+        );
         {
             let kind = self.kind_view;
             let in_site = self
                 .connections
                 .iter()
-                .filter(|connection| {
-                    connection.kind == kind && connection.site_label() == current_site
-                })
+                .filter(|connection| self.in_view(connection))
                 .collect::<Vec<_>>();
             if in_site.is_empty() {
                 tree = tree.child(
                     div().px_3().child(
-                        Label::new(format!("No {} connections in {current_site}", kind.label()))
+                        Label::new(format!("No {} connections in {place}", kind.label()))
                             .size(LabelSize::Small)
                             .color(Color::Disabled),
                     ),
@@ -1302,7 +1398,13 @@ impl DatabaseView {
                     .pr_1()
                     .child(
                         Label::new(
-                            format!("{} · {current_site}", self.kind_view.label()).to_uppercase(),
+                            format!(
+                                "{} · {} · {}",
+                                self.kind_view.label(),
+                                self.current(Level::Site),
+                                self.current(Level::Environment)
+                            )
+                            .to_uppercase(),
                         )
                         .size(LabelSize::XSmall)
                         .weight(gpui::FontWeight::SEMIBOLD)
@@ -1451,12 +1553,9 @@ impl DatabaseView {
 impl Render for DatabaseView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The open connection shows only under its own kind and site; switching keeps it connected.
-        let current_site = self.current_site();
         let connection = self
             .active_connection()
-            .filter(|connection| {
-                connection.kind == self.kind_view && connection.site_label() == current_site
-            })
+            .filter(|connection| self.in_view(connection))
             .cloned();
         let full_bleed = self.form.is_none() && self.session.is_some() && connection.is_some();
         let main = match (&self.form, &connection, &self.session) {
@@ -1507,9 +1606,9 @@ mod tests {
     #[test]
     fn test_site_names_are_checked() {
         let sites = vec!["CP".to_string(), "BP".to_string()];
-        assert_eq!(check_site_name("NP", &sites), Ok(()));
-        assert!(check_site_name("", &sites).is_err());
-        assert!(check_site_name("cp", &sites).is_err());
-        assert!(check_site_name("unassigned", &sites).is_err());
+        assert_eq!(check_name("NP", &sites), Ok(()));
+        assert!(check_name("", &sites).is_err());
+        assert!(check_name("cp", &sites).is_err());
+        assert!(check_name("unassigned", &sites).is_err());
     }
 }
