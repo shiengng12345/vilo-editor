@@ -54,6 +54,16 @@ impl AnalyzeState {
     pub(crate) fn tab(&self) -> AnalyzeTab {
         self.tab
     }
+
+    /// Leaving Database Analysis stops a report still running, so it does not keep scanning
+    /// the server unseen.
+    pub(crate) fn leave_database_analysis(&mut self) {
+        if self._analysis.take().is_some() {
+            self.analysis = None;
+            self.analysis_message =
+                Some("The last report was stopped when you left Database Analysis.".into());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -287,7 +297,7 @@ fn top_keys(title: &str, keys: &[KeyStat], cx: &App) -> AnyElement {
                 )
                 .child(
                     div().w(px(90.)).flex_none().child(
-                        Label::new(describe_ttl(stat.ttl_ms))
+                        Label::new(stat.ttl_ms.map_or("?".to_string(), describe_ttl))
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     ),
@@ -306,8 +316,23 @@ fn render_report(analysis: &Analysis, colors: &theme::ThemeColors, cx: &App) -> 
             .filter(|total| *total > 0)
             .map(|total| format!(" ({}%)", node.scanned * 100 / total))
             .unwrap_or_default();
+        let unread = node
+            .first_unread_error
+            .as_ref()
+            .map(|error| format!("; {} keys could not be read ({error})", node.unread))
+            .unwrap_or_default();
         let (text, color) = match &node.error {
-            Some(error) => (format!("{}: stopped, {error}", node.label), Color::Error),
+            Some(error) => (
+                format!("{}: stopped, {error}{unread}", node.label),
+                Color::Error,
+            ),
+            None if node.unread > 0 => (
+                format!(
+                    "{}: sampled {} of {total}{share}{unread}",
+                    node.label, node.scanned
+                ),
+                Color::Warning,
+            ),
             None if node.finished => (
                 format!(
                     "{}: every key visited, {} of {total}",
@@ -336,6 +361,26 @@ fn render_report(analysis: &Analysis, colors: &theme::ThemeColors, cx: &App) -> 
                 .children(coverage)
                 .when_some(analysis.stopped.clone(), |this, stopped| {
                     this.child(Label::new(stopped).size(LabelSize::Small).color(Color::Warning))
+                })
+                .when(analysis.vanished > 0, |this| {
+                    this.child(
+                        Label::new(format!(
+                            "{} keys were deleted or expired while the scan ran.",
+                            analysis.vanished
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                })
+                .when(analysis.length_unknown > 0, |this| {
+                    this.child(
+                        Label::new(format!(
+                            "The length of {} keys is unknown; they are left out of the length ranking.",
+                            analysis.length_unknown
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                    )
                 })
                 .when(analysis.memory_unknown > 0, |this| {
                     this.child(
@@ -523,6 +568,9 @@ impl DatabaseView {
         let Some(analyze) = self.analyze() else {
             return;
         };
+        if tab != AnalyzeTab::Database {
+            analyze.leave_database_analysis();
+        }
         analyze.tab = tab;
         let (load_slowlog, load_clients) = (analyze.slowlog.is_none(), analyze.clients.is_none());
         if analyze.analysis_confirm.is_none() {

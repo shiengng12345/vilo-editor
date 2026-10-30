@@ -625,7 +625,7 @@ pub fn search_pattern(text: &str) -> Option<Vec<u8>> {
     }
 }
 
-fn bytes_arg(bytes: &[u8]) -> Value {
+pub(crate) fn bytes_arg(bytes: &[u8]) -> Value {
     Value::Bytes(bytes.to_vec().into())
 }
 

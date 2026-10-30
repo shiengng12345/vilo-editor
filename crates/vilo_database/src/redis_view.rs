@@ -3460,6 +3460,9 @@ impl DatabaseView {
                     this.cursor_pointer()
                         .on_click(cx.listener(move |this, _, window, cx| {
                             let analyze = this.redis_state().map(|state| {
+                                if target != RedisTab::Analyze {
+                                    state.analyze.leave_database_analysis();
+                                }
                                 state.tab = target;
                                 state.analyze.tab()
                             });

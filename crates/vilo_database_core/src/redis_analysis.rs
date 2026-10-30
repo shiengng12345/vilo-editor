@@ -3,11 +3,12 @@
 //! describe the keys scanned, and the largest keys are the largest of those, not of the database.
 
 use std::{
+    collections::HashSet,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
-use crate::redis::{Bytes, RedisSession};
+use crate::redis::{Bytes, RedisSession, ScanNode, bytes_arg};
 
 /// The sample sizes offered per node.
 pub const KEYS_PER_NODE_CHOICES: [u64; 3] = [1_000, 10_000, 50_000];
@@ -25,8 +26,8 @@ const TOP: usize = 15;
 pub struct KeyStat {
     pub key: Bytes,
     pub kind: String,
-    /// -1 for no expiry.
-    pub ttl_ms: i64,
+    /// -1 for no expiry; `None` when PTTL was not answered.
+    pub ttl_ms: Option<i64>,
     /// `None` when MEMORY USAGE is not allowed or not answered.
     pub memory: Option<u64>,
     pub length: Option<u64>,
@@ -48,6 +49,9 @@ pub struct NodeCoverage {
     /// The node's SCAN came back to cursor 0, so every key it held was visited once.
     pub finished: bool,
     pub error: Option<String>,
+    /// Keys whose TYPE was not answered, so they are left out of the report.
+    pub unread: u64,
+    pub first_unread_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +61,9 @@ pub struct Analysis {
     pub memory: u64,
     /// Keys whose memory is unknown, so the memory figures leave them out.
     pub memory_unknown: u64,
+    pub length_unknown: u64,
+    /// Keys deleted or expired between SCAN and reading them.
+    pub vanished: u64,
     pub by_type: Vec<Bucket>,
     pub by_ttl: Vec<Bucket>,
     pub namespaces: Vec<Bucket>,
@@ -68,8 +75,11 @@ pub struct Analysis {
 }
 
 /// RedisInsight's expiry groups, for "memory likely to be freed over time".
-fn ttl_bucket(ttl_ms: i64) -> &'static str {
+fn ttl_bucket(ttl_ms: Option<i64>) -> &'static str {
     const HOUR: i64 = 3_600_000;
+    let Some(ttl_ms) = ttl_ms else {
+        return "Expiry unknown";
+    };
     match ttl_ms {
         ..0 => "No expiry",
         ttl if ttl < HOUR => "Under 1 hour",
@@ -81,7 +91,7 @@ fn ttl_bucket(ttl_ms: i64) -> &'static str {
     }
 }
 
-const TTL_ORDER: [&str; 7] = [
+const TTL_ORDER: [&str; 8] = [
     "Under 1 hour",
     "1–4 hours",
     "4–12 hours",
@@ -89,6 +99,7 @@ const TTL_ORDER: [&str; 7] = [
     "1–7 days",
     "Over 7 days",
     "No expiry",
+    "Expiry unknown",
 ];
 
 fn add(buckets: &mut Vec<Bucket>, name: &str, memory: Option<u64>) {
@@ -112,6 +123,7 @@ pub fn summarize(
     stats: &[KeyStat],
     nodes: Vec<NodeCoverage>,
     delimiter: &str,
+    vanished: u64,
     stopped: Option<String>,
     elapsed: Duration,
 ) -> Analysis {
@@ -165,6 +177,8 @@ pub fn summarize(
         sampled: stats.len() as u64,
         memory: stats.iter().filter_map(|stat| stat.memory).sum(),
         memory_unknown: stats.iter().filter(|stat| stat.memory.is_none()).count() as u64,
+        length_unknown: stats.iter().filter(|stat| stat.length.is_none()).count() as u64,
+        vanished,
         by_type,
         by_ttl,
         namespaces,
@@ -175,9 +189,43 @@ pub fn summarize(
     }
 }
 
+/// How one key read went.
+enum Read {
+    Stat(KeyStat),
+    Vanished,
+    Unread(String),
+}
+
 impl RedisSession {
-    /// Samples up to `keys_per_node` keys from every primary, stopping early at `TIME_LIMIT` or
-    /// when `cancel` is set (checked between pages, so a dropped report stops scanning soon).
+    /// TYPE, PTTL and MEMORY USAGE (its default sampling, never SAMPLES 0) together, then the
+    /// length. A missing answer is kept as unknown, never taken as a real value.
+    async fn read_key(&self, key: &Bytes) -> Read {
+        let (kind, ttl, memory) = futures::join!(
+            self.call("TYPE", vec![bytes_arg(key)]),
+            self.call("PTTL", vec![bytes_arg(key)]),
+            self.call("MEMORY", vec!["USAGE".into(), bytes_arg(key)]),
+        );
+        let kind = match kind.map(|kind| kind.as_string()) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => return Read::Unread("TYPE gave no answer".to_string()),
+            Err(error) => return Read::Unread(format!("{error:#}")),
+        };
+        let ttl_ms = ttl.ok().and_then(|ttl| ttl.as_i64());
+        if kind == "none" || ttl_ms == Some(-2) {
+            return Read::Vanished;
+        }
+        Read::Stat(KeyStat {
+            length: self.length(key, &kind).await.ok().flatten(),
+            key: key.clone(),
+            kind,
+            ttl_ms,
+            memory: memory.ok().and_then(|memory| memory.as_u64()),
+        })
+    }
+
+    /// Samples up to `keys_per_node` distinct keys from every primary. Every server call waits
+    /// at most until the overall `TIME_LIMIT`, and `cancel` is checked before each call, so a
+    /// dropped report stops sending soon.
     pub async fn analyze(
         &self,
         keys_per_node: u64,
@@ -185,74 +233,129 @@ impl RedisSession {
         cancel: &AtomicBool,
     ) -> Analysis {
         let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + TIME_LIMIT;
         let mut stats = Vec::new();
         let mut nodes = Vec::new();
-        let mut stopped = None;
+        let mut vanished = 0;
+        let mut stopped: Option<String> = None;
         for node in self.scan_nodes() {
             let mut coverage = NodeCoverage {
                 label: node.label.clone(),
                 scanned: 0,
-                total: self.dbsize(&node).await.ok(),
+                total: None,
                 finished: false,
                 error: None,
+                unread: 0,
+                first_unread_error: None,
             };
-            let mut cursor = "0".to_string();
-            while stopped.is_none() && coverage.scanned < keys_per_node {
-                if cancel.load(Ordering::Relaxed) {
-                    stopped = Some("Cancelled.".to_string());
-                    break;
-                }
-                if started.elapsed() >= TIME_LIMIT {
-                    stopped = Some(format!(
-                        "Stopped at the {} second limit.",
-                        TIME_LIMIT.as_secs()
-                    ));
-                    break;
-                }
-                let page = match self.scan(&node, &cursor, "*", PAGE, None).await {
-                    Ok(page) => page,
-                    Err(error) => {
-                        coverage.error = Some(format!("{error:#}"));
-                        break;
-                    }
-                };
-                let room = usize::try_from(keys_per_node - coverage.scanned).unwrap_or(usize::MAX);
-                let taken = page.keys.len().min(room);
-                for batch in page.keys[..taken].chunks(BATCH) {
-                    let meta = self.key_meta(batch, true).await;
-                    let lengths = futures::future::join_all(
-                        batch
-                            .iter()
-                            .zip(&meta)
-                            .map(|(key, (info, _))| self.length(key, &info.kind)),
+            // Once stopped, the remaining primaries are listed but not asked anything.
+            if stopped.is_none()
+                && let Err(reason) = self
+                    .sample_node(
+                        &node,
+                        keys_per_node,
+                        deadline,
+                        cancel,
+                        &mut coverage,
+                        &mut stats,
+                        &mut vanished,
                     )
-                    .await;
-                    for ((key, (info, memory)), length) in batch.iter().zip(meta).zip(lengths) {
-                        coverage.scanned += 1;
-                        // Gone between SCAN and TYPE.
-                        if info.kind == "none" {
-                            continue;
-                        }
-                        stats.push(KeyStat {
-                            key: key.clone(),
-                            kind: info.kind,
-                            ttl_ms: info.ttl_ms,
-                            memory,
-                            length: length.ok().flatten(),
-                        });
-                    }
-                }
-                cursor = page.cursor;
-                if cursor == "0" {
-                    // Only a page taken whole completes the node.
-                    coverage.finished = taken == page.keys.len();
-                    break;
-                }
-                tokio::time::sleep(PAUSE).await;
+                    .await
+            {
+                stopped = Some(reason.unwrap_or_else(|| {
+                    format!("Stopped at the {} second limit.", TIME_LIMIT.as_secs())
+                }));
             }
             nodes.push(coverage);
         }
-        summarize(&stats, nodes, delimiter, stopped, started.elapsed())
+        summarize(
+            &stats,
+            nodes,
+            delimiter,
+            vanished,
+            stopped,
+            started.elapsed(),
+        )
+    }
+
+    /// One primary's part of the sample. `Err(None)` means the time limit ran out,
+    /// `Err(Some(reason))` another reason to stop the whole analysis.
+    #[allow(clippy::too_many_arguments)]
+    async fn sample_node(
+        &self,
+        node: &ScanNode,
+        keys_per_node: u64,
+        deadline: tokio::time::Instant,
+        cancel: &AtomicBool,
+        coverage: &mut NodeCoverage,
+        stats: &mut Vec<KeyStat>,
+        vanished: &mut u64,
+    ) -> Result<(), Option<String>> {
+        let check = || {
+            if cancel.load(Ordering::Relaxed) {
+                Err(Some("Cancelled.".to_string()))
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        coverage.total = tokio::time::timeout_at(deadline, self.dbsize(node))
+            .await
+            .map_err(|_| None)?
+            .ok();
+        // SCAN may return a key more than once while the server rehashes.
+        let mut seen = HashSet::new();
+        let mut cursor = "0".to_string();
+        while coverage.scanned < keys_per_node {
+            check()?;
+            let scanned =
+                tokio::time::timeout_at(deadline, self.scan(node, &cursor, "*", PAGE, None))
+                    .await
+                    .map_err(|_| None)?;
+            let page = match scanned {
+                Ok(page) => page,
+                Err(error) => {
+                    coverage.error = Some(format!("{error:#}"));
+                    return Ok(());
+                }
+            };
+            let fresh = page
+                .keys
+                .iter()
+                .filter(|key| seen.insert((*key).clone()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let room = usize::try_from(keys_per_node - coverage.scanned).unwrap_or(usize::MAX);
+            let taken = fresh.len().min(room);
+            for batch in fresh[..taken].chunks(BATCH) {
+                check()?;
+                let reads = tokio::time::timeout_at(
+                    deadline,
+                    futures::future::join_all(batch.iter().map(|key| self.read_key(key))),
+                )
+                .await
+                .map_err(|_| None)?;
+                for read in reads {
+                    coverage.scanned += 1;
+                    match read {
+                        Read::Stat(stat) => stats.push(stat),
+                        Read::Vanished => *vanished += 1,
+                        Read::Unread(error) => {
+                            coverage.unread += 1;
+                            coverage.first_unread_error.get_or_insert(error);
+                        }
+                    }
+                }
+            }
+            cursor = page.cursor;
+            if cursor == "0" {
+                // Only a page taken whole completes the node.
+                coverage.finished = taken == fresh.len();
+                return Ok(());
+            }
+            tokio::time::sleep(PAUSE).await;
+        }
+        Ok(())
     }
 }
 
@@ -270,7 +373,7 @@ mod tests {
         KeyStat {
             key: key.as_bytes().to_vec(),
             kind: kind.to_string(),
-            ttl_ms,
+            ttl_ms: Some(ttl_ms),
             memory,
             length,
         }
@@ -284,7 +387,7 @@ mod tests {
             stat("queue:a", "list", 5 * 3_600_000, Some(50), Some(40)),
             stat("plain", "string", 8 * 24 * 3_600_000, None, Some(5)),
         ];
-        let analysis = summarize(&stats, Vec::new(), ":", None, Duration::ZERO);
+        let analysis = summarize(&stats, Vec::new(), ":", 0, None, Duration::ZERO);
         assert_eq!(
             (analysis.sampled, analysis.memory, analysis.memory_unknown),
             (4, 450, 1)
@@ -398,6 +501,63 @@ mod tests {
         assert_eq!(cancelled.sampled, 0);
         assert_eq!(cancelled.stopped.as_deref(), Some("Cancelled."));
 
+        // A user who may not run TYPE or PTTL: keys are reported unread or of unknown expiry,
+        // never as gone or as never expiring.
+        let user = "vilo_test_analysis";
+        session
+            .call(
+                "ACL",
+                [
+                    "SETUSER",
+                    user,
+                    "reset",
+                    "on",
+                    ">vilo-test",
+                    "~*",
+                    "+@all",
+                    "-pttl",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            )
+            .await
+            .unwrap();
+        let limited = RedisSession::connect_to_database(
+            &url.replacen("redis://", &format!("redis://{user}:vilo-test@"), 1),
+            Some(5),
+        )
+        .await
+        .unwrap();
+        let no_ttl = limited.analyze(1_000, ":", &never).await;
+        assert_eq!(no_ttl.sampled, 25);
+        assert!(
+            no_ttl
+                .by_ttl
+                .iter()
+                .all(|bucket| bucket.name == "Expiry unknown")
+        );
+        session
+            .call(
+                "ACL",
+                ["SETUSER", user, "-type"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let no_type = limited.analyze(1_000, ":", &never).await;
+        assert_eq!(no_type.sampled, 0);
+        assert_eq!(no_type.vanished, 0);
+        assert_eq!(no_type.nodes[0].unread, 25);
+        assert!(no_type.nodes[0].first_unread_error.is_some());
+        limited.quit().await.unwrap();
+        session
+            .call("ACL", vec!["DELUSER".into(), user.into()])
+            .await
+            .unwrap();
+
         session
             .call("DEL", keys.into_iter().map(Into::into).collect())
             .await
@@ -410,21 +570,40 @@ mod tests {
             return;
         };
         let session = RedisSession::connect(&url).await.unwrap();
+        let keys = (0..30)
+            .map(|index| format!("vilo_test:an:{index}"))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            session
+                .call(
+                    "SET",
+                    vec![key.clone().into(), "x".into(), "EX".into(), 600.into()],
+                )
+                .await
+                .unwrap();
+        }
         let analysis = session.analyze(1_000, ":", &AtomicBool::new(false)).await;
         assert_eq!(analysis.nodes.len(), 3, "every primary is sampled");
         assert!(
-            analysis
-                .nodes
-                .iter()
-                .all(|node| node.error.is_none() && node.total.is_some())
+            analysis.nodes.iter().all(|node| node.error.is_none()
+                && node.finished
+                && node.total == Some(node.scanned))
         );
+        assert!(
+            analysis.nodes.iter().map(|node| node.scanned).sum::<u64>() >= 30,
+            "keys on every primary are counted once"
+        );
+        for key in keys {
+            session.call("DEL", vec![key.into()]).await.unwrap();
+        }
     }
 
     #[test]
     fn test_ttl_buckets() {
-        assert_eq!(ttl_bucket(-1), "No expiry");
-        assert_eq!(ttl_bucket(0), "Under 1 hour");
-        assert_eq!(ttl_bucket(3_600_000), "1–4 hours");
-        assert_eq!(ttl_bucket(7 * 24 * 3_600_000), "Over 7 days");
+        assert_eq!(ttl_bucket(Some(-1)), "No expiry");
+        assert_eq!(ttl_bucket(None), "Expiry unknown");
+        assert_eq!(ttl_bucket(Some(0)), "Under 1 hour");
+        assert_eq!(ttl_bucket(Some(3_600_000)), "1–4 hours");
+        assert_eq!(ttl_bucket(Some(7 * 24 * 3_600_000)), "Over 7 days");
     }
 }
