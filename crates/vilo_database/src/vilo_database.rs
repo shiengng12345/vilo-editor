@@ -354,6 +354,10 @@ pub struct DatabaseView {
     command_history: Vec<String>,
     /// Where Up/Down stands in `command_history` while browsing it.
     history_position: Option<usize>,
+    /// Counts history saves so only the newest reaches the file.
+    history_saves: u64,
+    /// Why the command history could not be read or saved.
+    history_problem: Option<SharedString>,
     redis_state: Option<RedisState>,
     doc_write: Option<mongo_write::DocWrite>,
     redis_write: Option<redis_write::RedisWriteForm>,
@@ -503,8 +507,10 @@ impl DatabaseView {
                 });
                 input
             },
-            command_history: redis_view::load_command_history(),
+            command_history: Vec::new(),
             history_position: None,
+            history_saves: 0,
+            history_problem: None,
             redis_state: None,
             doc_write: None,
             redis_write: None,
@@ -524,6 +530,13 @@ impl DatabaseView {
             _subscriptions: subscriptions,
         };
         view.check_write_log(cx);
+        match redis_view::load_command_history() {
+            Ok(history) => view.command_history = history,
+            Err(error) => {
+                view.history_problem =
+                    Some(format!("Command history could not be read: {error:#}").into())
+            }
+        }
         let workspace = view.workspace.clone();
         cx.spawn(async move |this, cx| {
             let language = workspace

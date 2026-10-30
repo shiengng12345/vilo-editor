@@ -15,7 +15,6 @@ use gpui::{
     uniform_list,
 };
 use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
-use util::ResultExt as _;
 use vilo_database_core::redis::{
     Bytes, ClusterNode, KeyInfo, ScanNode, StreamEntry, format_reply, quote_bytes, split_command,
 };
@@ -132,6 +131,8 @@ struct Detail {
     local_filter: Option<String>,
     /// Why the last "Load more" failed.
     more_error: Option<SharedString>,
+    /// The load that produced this detail, so later pages join only their own search.
+    request: u64,
 }
 
 /// What the right panel shows.
@@ -210,6 +211,8 @@ pub(crate) struct RedisState {
     /// The database being connected to while a switch is in progress.
     switching: Option<u8>,
     pub(crate) switch_error: Option<SharedString>,
+    /// Bumped by every key load; a load or "Load more" answering an older one is dropped.
+    detail_request: u64,
     /// Seconds between automatic refreshes of the key list and the open key; `None` is off.
     auto_refresh: Option<u64>,
     _auto_refresh: Option<Task<()>>,
@@ -263,6 +266,7 @@ impl RedisState {
             keyspace_error: None,
             switching: None,
             switch_error: None,
+            detail_request: 0,
             auto_refresh: None,
             _auto_refresh: None,
             analyze: Default::default(),
@@ -457,11 +461,50 @@ fn command_history_path() -> std::path::PathBuf {
     paths::config_dir().join("database_redis_history.json")
 }
 
-pub(crate) fn load_command_history() -> Vec<String> {
-    std::fs::read(command_history_path())
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).log_err())
-        .unwrap_or_default()
+/// The saved history; a missing file is an empty history, an unreadable one is an error.
+pub(crate) fn load_command_history() -> anyhow::Result<Vec<String>> {
+    match std::fs::read(command_history_path()) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The newest history save that reached the file; saves can finish out of order.
+static HISTORY_SAVED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+/// Writes the history through its own temporary file and renames it into place only when no
+/// newer save got there first, so the file always holds a whole and latest snapshot.
+fn save_command_history(history: &[String], save: u64) -> anyhow::Result<()> {
+    save_snapshot(
+        &command_history_path(),
+        &serde_json::to_vec_pretty(history)?,
+        save,
+        &HISTORY_SAVED,
+    )
+}
+
+fn save_snapshot(
+    path: &std::path::Path,
+    bytes: &[u8],
+    save: u64,
+    saved: &std::sync::Mutex<u64>,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("{save}.tmp"));
+    std::fs::write(&temporary, bytes)?;
+    let mut saved = saved
+        .lock()
+        .map_err(|_| anyhow::anyhow!("history save lock poisoned"))?;
+    if save > *saved {
+        std::fs::rename(&temporary, path)?;
+        *saved = save;
+    } else {
+        std::fs::remove_file(&temporary)?;
+    }
+    Ok(())
 }
 
 /// Completes the command name (the first word) from the read commands the Workbench accepts.
@@ -859,6 +902,7 @@ impl DatabaseView {
         let key = detail.key.clone();
         if detail.info.kind == "list" {
             detail.local_filter = (!text.trim().is_empty()).then(|| text.trim().to_string());
+            detail.more_error = None;
             cx.notify();
             return;
         }
@@ -892,18 +936,18 @@ impl DatabaseView {
                             if busy || state.scanning || state.switching.is_some() {
                                 return true;
                             }
+                            // The open key reloads with its current search; a load still running is left alone.
                             let open = match &state.detail {
-                                Some(Fetch::Loaded(detail))
-                                    if detail.pattern.is_none()
-                                        && detail.local_filter.is_none() =>
-                                {
-                                    Some(detail.key.clone())
-                                }
+                                Some(Fetch::Loaded(detail)) => Some((
+                                    detail.key.clone(),
+                                    detail.pattern.clone(),
+                                    detail.local_filter.clone(),
+                                )),
                                 _ => None,
                             };
                             this.scan(true, cx);
-                            if let Some(key) = open {
-                                this.open_key(key, cx);
+                            if let Some((key, pattern, local_filter)) = open {
+                                this.open_key_matching(key, pattern, local_filter, cx);
                             }
                             true
                         })
@@ -1184,6 +1228,8 @@ impl DatabaseView {
         state.selected = Some(key.clone());
         state.panel = RightPanel::Key;
         state.detail = Some(Fetch::Loading);
+        state.detail_request += 1;
+        let request = state.detail_request;
         let task = run(cx, {
             let key = key.clone();
             async move {
@@ -1251,6 +1297,7 @@ impl DatabaseView {
                     pattern,
                     local_filter,
                     more_error: None,
+                    request,
                 })
             }
         });
@@ -1267,6 +1314,7 @@ impl DatabaseView {
                 }
                 if let Some(state) = this.redis_state()
                     && state.selected.as_ref() == Some(&key)
+                    && state.detail_request == request
                 {
                     state.detail = Some(fetched(result));
                     cx.notify();
@@ -1290,6 +1338,7 @@ impl DatabaseView {
             return;
         };
         let key = detail.key.clone();
+        let request = detail.request;
         enum Next {
             Hash(String),
             List(i64),
@@ -1388,7 +1437,7 @@ impl DatabaseView {
                 let Some(Fetch::Loaded(detail)) = &mut state.detail else {
                     return;
                 };
-                if detail.key != key {
+                if detail.key != key || detail.request != request {
                     return;
                 }
                 let more = match result {
@@ -2343,12 +2392,10 @@ impl DatabaseView {
     /// Value search and copying for the open key.
     fn render_value_tools(&self, detail: &Detail, cx: &mut Context<Self>) -> AnyElement {
         let searchable = matches!(detail.info.kind.as_str(), "hash" | "set" | "zset" | "list");
-        let rebuilt = rebuild_command(
-            &detail.key,
-            &detail.value,
-            detail.pattern.is_some() || detail.local_filter.is_some(),
-            detail.info.ttl_ms,
-        );
+        // A list's filter only hides rows, so its command still holds every loaded item.
+        let searched = detail.pattern.is_some();
+        let rebuilt = rebuild_command(&detail.key, &detail.value, false, detail.info.ttl_ms)
+            .map(|(command, more)| (command, searched, more));
         let note = match (&detail.pattern, &detail.local_filter) {
             (Some(pattern), _) => Some(format!(
                 "Matching {} across the whole key",
@@ -2359,8 +2406,12 @@ impl DatabaseView {
             )),
             (None, None) => None,
         };
+        // Bytes that are not text are copied escaped, never with replacement characters.
         let value_text = match &detail.value {
-            Value::String(Some(bytes)) => Some(String::from_utf8_lossy(bytes).to_string()),
+            Value::String(Some(bytes)) => Some(match String::from_utf8(bytes.clone()) {
+                Ok(text) => ("Copy value", text),
+                Err(_) => ("Copy value (escaped)", escape_bytes(bytes)),
+            }),
             _ => None,
         };
         h_flex()
@@ -2379,9 +2430,9 @@ impl DatabaseView {
                 this.child(Label::new(note).size(LabelSize::Small).color(Color::Muted))
             })
             .child(div().flex_1())
-            .when_some(value_text, |this, text| {
+            .when_some(value_text, |this, (label, text)| {
                 this.child(
-                    Button::new("database-redis-copy-value", "Copy value")
+                    Button::new("database-redis-copy-value", label)
                         .label_size(LabelSize::Small)
                         .start_icon(Icon::new(IconName::Copy).size(IconSize::XSmall))
                         .on_click(move |_, _, cx| {
@@ -2389,22 +2440,26 @@ impl DatabaseView {
                         }),
                 )
             })
-            .when_some(rebuilt, |this, (command, partial)| {
+            .when_some(rebuilt, |this, (command, searched, more)| {
+                let (label, tip) = match (searched, more) {
+                    (true, _) => (
+                        "Copy as command (matching items only)",
+                        "Only the items matching the search are in the command; it would not recreate the whole key",
+                    ),
+                    (false, true) => (
+                        "Copy as command (loaded part only)",
+                        "Only the items loaded so far are in the command; load the rest first for the whole key",
+                    ),
+                    (false, false) => ("Copy as command", "Commands that recreate this key, for redis-cli"),
+                };
                 this.child(
-                    Button::new(
-                        "database-redis-copy-command",
-                        if partial { "Copy as command (loaded part only)" } else { "Copy as command" },
-                    )
-                    .label_size(LabelSize::Small)
-                    .start_icon(Icon::new(IconName::Copy).size(IconSize::XSmall))
-                    .tooltip(Tooltip::text(if partial {
-                        "Only the items loaded or matching so far are in the command; load the rest first for the whole key"
-                    } else {
-                        "Commands that recreate this key, for redis-cli"
-                    }))
-                    .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(command.clone()))
-                    }),
+                    Button::new("database-redis-copy-command", label)
+                        .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::Copy).size(IconSize::XSmall))
+                        .tooltip(Tooltip::text(tip))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(command.clone()))
+                        }),
                 )
             })
             .into_any_element()
@@ -2651,16 +2706,17 @@ impl DatabaseView {
         self.command_history.push(line.to_string());
         let excess = self.command_history.len().saturating_sub(COMMAND_HISTORY);
         self.command_history.drain(..excess);
-        let history = self.command_history.clone();
-        cx.background_spawn(async move {
-            let path = command_history_path();
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let temporary = path.with_extension("json.tmp");
-            std::fs::write(&temporary, serde_json::to_vec_pretty(&history)?)?;
-            std::fs::rename(&temporary, &path)?;
-            anyhow::Ok(())
+        self.history_saves += 1;
+        let (history, save) = (self.command_history.clone(), self.history_saves);
+        let task = cx.background_spawn(async move { save_command_history(&history, save) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.history_problem = result
+                    .err()
+                    .map(|error| format!("Command history not saved: {error:#}").into());
+                cx.notify();
+            })
         })
         .detach_and_log_err(cx);
     }
@@ -2704,6 +2760,9 @@ impl DatabaseView {
             .p_3()
             .gap_2()
             .child(self.render_command_input(cx))
+            .when_some(self.history_problem.clone(), |this, problem| {
+                this.child(Label::new(problem).size(LabelSize::Small).color(Color::Warning))
+            })
             .child(
                 Label::new("Read commands only in this release. Writes, KEYS, FLUSH*, CONFIG, MONITOR, scripts and risky subcommands are refused before sending.")
                     .size(LabelSize::Small)
@@ -3131,6 +3190,25 @@ impl DatabaseView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_newer_snapshot_wins() {
+        let folder = std::env::temp_dir().join(format!("vilo-history-{}", std::process::id()));
+        let path = folder.join("history.json");
+        let saved = std::sync::Mutex::new(0);
+        save_snapshot(&path, b"[\"two\"]", 2, &saved).unwrap();
+        // An older save finishing later must not replace the newer file.
+        save_snapshot(&path, b"[\"one\"]", 1, &saved).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[\"two\"]");
+        save_snapshot(&path, b"[\"three\"]", 3, &saved).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[\"three\"]");
+        assert_eq!(
+            std::fs::read_dir(&folder).unwrap().count(),
+            1,
+            "no temporary files are left"
+        );
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
     #[test]
     fn test_history_position() {
         assert_eq!(history_position(None, 0, true), None);

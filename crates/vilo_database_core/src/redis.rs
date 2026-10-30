@@ -1114,8 +1114,14 @@ impl RedisSession {
             .map(pairs)
             .unwrap_or_default()
             .into_iter()
-            .map(|(member, score)| (value_bytes(&member), score.as_string().unwrap_or_default()))
-            .collect();
+            .map(|(member, score)| {
+                let score = score
+                    .as_string()
+                    .or_else(|| score.as_f64().map(|score| score.to_string()))
+                    .context("ZSCAN returned a score that is not a number")?;
+                Ok((value_bytes(&member), score))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok((members, cursor))
     }
 
