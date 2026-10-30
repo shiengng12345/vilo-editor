@@ -51,6 +51,9 @@ enum Node {
     /// Text holding a lone surrogate (Python and Java allow them), kept as UTF-16 units so it
     /// never equals ordinary text that merely spells the escape out.
     Utf16(Vec<u16>),
+    /// Python text holding a lone surrogate, kept as code points: a Python str is a sequence of
+    /// code points, so a surrogate pair written as two of them is not the character they encode.
+    CodePoints(Vec<u32>),
     Bytes(Vec<u8>),
     List(Vec<Id>),
     Tuple(Vec<Id>),
@@ -79,6 +82,7 @@ fn text_size(node: &Node) -> usize {
         Node::Text(text) | Node::Int(text) | Node::Name(text) => text.len(),
         Node::Bytes(bytes) => bytes.len(),
         Node::Utf16(units) => units.len() * 2,
+        Node::CodePoints(points) => points.len() * 4,
         Node::Custom(label, bytes) => label.len() + bytes.len(),
         Node::Object { class, fields } => {
             class.len() + fields.iter().map(|(name, _)| name.len()).sum::<usize>()
@@ -219,15 +223,22 @@ struct Output {
 }
 
 impl Output {
+    /// Appends what still fits; a piece that does not fit whole is cut where the limit is.
     fn push(&mut self, text: &str) {
         if self.cut {
             return;
         }
-        if self.text.len() + text.len() > MAX_OUTPUT {
-            self.cut = true;
+        let room = MAX_OUTPUT.saturating_sub(self.text.len());
+        if text.len() <= room {
+            self.text.push_str(text);
             return;
         }
-        self.text.push_str(text);
+        let end = (0..=room)
+            .rev()
+            .find(|end| text.is_char_boundary(*end))
+            .unwrap_or(0);
+        self.text.push_str(&text[..end]);
+        self.cut = true;
     }
 
     /// A JSON-style quoted string, escaped piece by piece so the limit cuts it where it is
@@ -253,6 +264,21 @@ impl Output {
             match decoded {
                 Ok(character) => self.push_char(character),
                 Err(error) => self.push(&format!("\\u{{{:x}}}", error.unpaired_surrogate())),
+            }
+        }
+        self.push("\"");
+    }
+
+    /// Like `push_text`, with each surrogate code point shown as \u{…}.
+    fn push_points(&mut self, points: &[u32]) {
+        self.push("\"");
+        for point in points {
+            if self.cut {
+                return;
+            }
+            match char::from_u32(*point) {
+                Some(character) => self.push_char(character),
+                None => self.push(&format!("\\u{{{point:x}}}")),
             }
         }
         self.push("\"");
@@ -347,6 +373,7 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
         Node::Float(value) => out.push(&format_float(*value)),
         Node::Text(text) => out.push_text(text),
         Node::Utf16(units) => out.push_units(units),
+        Node::CodePoints(points) => out.push_points(points),
         Node::Bytes(bytes) => {
             out.push("b");
             out.push_bytes(bytes);
@@ -899,7 +926,9 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             b'.' => return pop(&mut stack, at),
             b'(' => stack.push(Slot::Mark),
             b'0' => {
-                stack.pop();
+                if stack.pop().is_none() {
+                    return fail(at, "POP with nothing to pop");
+                }
             }
             b'1' => {
                 pop_mark(&mut stack, at)?;
@@ -1768,7 +1797,7 @@ fn is_integer(text: &str) -> bool {
 /// Python text as pickled: UTF-8 with surrogates passed through (Python allows lone
 /// surrogates in a str), which stay visible as \u{…}. Anything else that is not UTF-8 is `None`.
 fn python_text(bytes: &[u8]) -> Option<Node> {
-    let mut units: Vec<u16> = Vec::new();
+    let mut points: Vec<u32> = Vec::new();
     let mut lone = false;
     let mut rest = bytes;
     loop {
@@ -1777,16 +1806,16 @@ fn python_text(bytes: &[u8]) -> Option<Node> {
                 if !lone {
                     return Some(Node::Text(String::from_utf8(bytes.to_vec()).ok()?));
                 }
-                units.extend(text.encode_utf16());
-                return Some(Node::Utf16(units));
+                points.extend(text.chars().map(u32::from));
+                return Some(Node::CodePoints(points));
             }
             Err(error) => {
                 let (valid, after) = rest.split_at(error.valid_up_to());
-                units.extend(std::str::from_utf8(valid).ok()?.encode_utf16());
+                points.extend(std::str::from_utf8(valid).ok()?.chars().map(u32::from));
                 match after {
                     [0xED, second @ 0xA0..=0xBF, third @ 0x80..=0xBF, ..] => {
-                        units.push(
-                            0xD000 | (u16::from(second & 0x3F) << 6) | u16::from(third & 0x3F),
+                        points.push(
+                            0xD000 | (u32::from(second & 0x3F) << 6) | u32::from(third & 0x3F),
                         );
                         lone = true;
                         rest = &after[3..];
@@ -1909,6 +1938,11 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
         Node::Float(value) => format!("f{}", value.to_bits()).into_bytes(),
         Node::Text(text) if text.len() > MAX_KEY => return None,
         Node::Text(text) => [b"s".as_slice(), text.as_bytes()].concat(),
+        Node::Utf16(units) if units.len() * 2 > MAX_KEY => return None,
+        Node::CodePoints(points) if points.len() * 4 > MAX_KEY => return None,
+        Node::CodePoints(points) => std::iter::once(b'p')
+            .chain(points.iter().flat_map(|point| point.to_le_bytes()))
+            .collect(),
         Node::Utf16(units) => std::iter::once(b'u')
             .chain(units.iter().flat_map(|unit| unit.to_le_bytes()))
             .collect(),
@@ -2531,6 +2565,32 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(decode(Decoder::Pickle, &nested).is_ok());
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_code_points_and_whole_cuts() {
+        // python3: {chr(0xd800) + chr(0xdc00) + chr(0xd800): 1, chr(0x10000) + chr(0xd800): 2}
+        // has two keys (the first is three code points, not a pair).
+        let pair = decode(
+            Decoder::Pickle,
+            &hex(include_str!("../data/pickle_pair.hex").trim()),
+        )
+        .unwrap();
+        assert!(pair.contains(": 1") && pair.contains(": 2"), "{pair}");
+        assert!(
+            pair.contains(r#""\u{d800}\u{dc00}\u{d800}""#) && pair.contains("𐀀"),
+            "{pair}"
+        );
+        // A number longer than the limit is cut, not dropped.
+        let mut long = b"L".to_vec();
+        long.extend(std::iter::repeat_n(b'9', 2_000_000));
+        long.extend_from_slice(b"\n.");
+        let text = decode(Decoder::Pickle, &long).unwrap();
+        assert!(text.starts_with("9999") && text.ends_with("KB of text"));
+        assert!(
+            decode(Decoder::Pickle, b"0N.").is_err(),
+            "POP on an empty stack"
+        );
     }
 
     #[test]
