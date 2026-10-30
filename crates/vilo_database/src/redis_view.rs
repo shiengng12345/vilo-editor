@@ -1357,7 +1357,7 @@ impl DatabaseView {
                 let orphans = others.len();
                 for node in &others {
                     let (state_text, state_color) = match health(node) {
-                        (_, Color::Error) => health(node),
+                        (text, Color::Error) => (text, Color::Error),
                         _ => ("no known primary".to_string(), Color::Warning),
                     };
                     table = table.child(
@@ -1392,9 +1392,13 @@ impl DatabaseView {
                             primaries.len(),
                             nodes
                                 .iter()
-                                .filter(|node| !node.primary)
-                                .count()
-                                .saturating_sub(orphans),
+                                .filter(|node| {
+                                    !node.primary
+                                        && primaries.iter().any(|primary| {
+                                            Some(primary.id.as_str()) == node.primary_id.as_deref()
+                                        })
+                                })
+                                .count(),
                             if orphans > 0 {
                                 format!(" · {orphans} nodes without a known primary, listed last")
                             } else {
