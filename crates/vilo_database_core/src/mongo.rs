@@ -50,13 +50,19 @@ pub struct FindPage {
 
 impl MongoSession {
     pub async fn connect(uri: &str) -> Result<Self> {
-        let mut options = ClientOptions::parse(uri).await.context("The connection string is not valid")?;
+        let mut options = ClientOptions::parse(uri)
+            .await
+            .context("The connection string is not valid")?;
         options.app_name = Some("Vilo".into());
         // Writes are sent once; Vilo reports an unknown outcome instead of letting the driver resend.
         options.retry_writes = Some(false);
         options.server_selection_timeout = Some(SERVER_SELECTION_TIMEOUT);
         let client = Client::with_options(options)?;
-        client.database("admin").run_command(doc! { "ping": 1 }).await.context("Could not reach MongoDB")?;
+        client
+            .database("admin")
+            .run_command(doc! { "ping": 1 })
+            .await
+            .context("Could not reach MongoDB")?;
         Ok(Self { client })
     }
 
@@ -66,7 +72,10 @@ impl MongoSession {
             .list_databases()
             .await?
             .into_iter()
-            .map(|database| DatabaseInfo { name: database.name, size_on_disk: database.size_on_disk })
+            .map(|database| DatabaseInfo {
+                name: database.name,
+                size_on_disk: database.size_on_disk,
+            })
             .collect::<Vec<_>>();
         databases.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(databases)
@@ -90,11 +99,22 @@ impl MongoSession {
 
     /// From collection metadata, so it is cheap and may lag behind the real count.
     pub async fn estimated_count(&self, database: &str, collection: &str) -> Result<u64> {
-        Ok(self.client.database(database).collection::<Document>(collection).estimated_document_count().await?)
+        Ok(self
+            .client
+            .database(database)
+            .collection::<Document>(collection)
+            .estimated_document_count()
+            .await?)
     }
 
     /// How many documents match, within `max_time`; slow counts give up rather than hold the page.
-    pub async fn count(&self, database: &str, collection: &str, filter: Document, max_time: Duration) -> Result<u64> {
+    pub async fn count(
+        &self,
+        database: &str,
+        collection: &str,
+        filter: Document,
+        max_time: Duration,
+    ) -> Result<u64> {
         Ok(self
             .client
             .database(database)
@@ -105,10 +125,16 @@ impl MongoSession {
     }
 
     pub async fn find_page(&self, request: &FindRequest) -> Result<FindPage> {
-        let collection = self.client.database(&request.database).collection::<Document>(&request.collection);
+        let collection = self
+            .client
+            .database(&request.database)
+            .collection::<Document>(&request.collection);
         let page_size = request.page_size.max(1);
         // One extra document tells whether another page exists without counting.
-        let mut find = collection.find(request.filter.clone()).skip(request.skip).limit(i64::from(page_size) + 1);
+        let mut find = collection
+            .find(request.filter.clone())
+            .skip(request.skip)
+            .limit(i64::from(page_size) + 1);
         if let Some(projection) = &request.projection {
             find = find.projection(projection.clone());
         }
@@ -121,7 +147,10 @@ impl MongoSession {
         let mut documents = find.await?.try_collect::<Vec<_>>().await?;
         let has_more = documents.len() > page_size as usize;
         documents.truncate(page_size as usize);
-        Ok(FindPage { documents, has_more })
+        Ok(FindPage {
+            documents,
+            has_more,
+        })
     }
 }
 
@@ -177,7 +206,10 @@ pub fn summarize_explain(explain: &Document) -> ExplainSummary {
         summary.keys_examined = number(stats, "totalKeysExamined");
         summary.millis = number(stats, "executionTimeMillis");
     }
-    if let Ok(plan) = explain.get_document("queryPlanner").and_then(|planner| planner.get_document("winningPlan")) {
+    if let Ok(plan) = explain
+        .get_document("queryPlanner")
+        .and_then(|planner| planner.get_document("winningPlan"))
+    {
         walk_plan(plan, &mut summary.stages, &mut summary.indexes);
     }
     summary
@@ -187,16 +219,20 @@ pub fn summarize_explain(explain: &Document) -> ExplainSummary {
 pub fn write_stage(pipeline: &[Document]) -> Option<&'static str> {
     fn scan(value: &Bson) -> Option<&'static str> {
         match value {
-            Bson::Document(document) => document.iter().find_map(|(key, value)| match key.as_str() {
-                "$out" => Some("$out"),
-                "$merge" => Some("$merge"),
-                _ => scan(value),
-            }),
+            Bson::Document(document) => {
+                document.iter().find_map(|(key, value)| match key.as_str() {
+                    "$out" => Some("$out"),
+                    "$merge" => Some("$merge"),
+                    _ => scan(value),
+                })
+            }
             Bson::Array(items) => items.iter().find_map(scan),
             _ => None,
         }
     }
-    pipeline.iter().find_map(|stage| scan(&Bson::Document(stage.clone())))
+    pipeline
+        .iter()
+        .find_map(|stage| scan(&Bson::Document(stage.clone())))
 }
 
 impl MongoSession {
@@ -212,15 +248,25 @@ impl MongoSession {
         if let Some(max_time) = request.max_time {
             find.insert("maxTimeMS", max_time.as_millis() as i64);
         }
-        Ok(self.client.database(&request.database).run_command(doc! { "explain": find, "verbosity": "executionStats" }).await?)
+        Ok(self
+            .client
+            .database(&request.database)
+            .run_command(doc! { "explain": find, "verbosity": "executionStats" })
+            .await?)
     }
 
     /// The collection's options as stored (validator, validationLevel, validationAction, …), or `None` if it is gone.
-    pub async fn collection_options(&self, database: &str, collection: &str) -> Result<Option<Document>> {
+    pub async fn collection_options(
+        &self,
+        database: &str,
+        collection: &str,
+    ) -> Result<Option<Document>> {
         let reply = self
             .client
             .database(database)
-            .run_command(doc! { "listCollections": 1, "filter": { "name": collection }, "nameOnly": false })
+            .run_command(
+                doc! { "listCollections": 1, "filter": { "name": collection }, "nameOnly": false },
+            )
             .await?;
         Ok(reply
             .get_document("cursor")
@@ -228,23 +274,47 @@ impl MongoSession {
             .ok()
             .and_then(|batch| batch.first())
             .and_then(Bson::as_document)
-            .map(|specification| specification.get_document("options").cloned().unwrap_or_default()))
+            .map(|specification| {
+                specification
+                    .get_document("options")
+                    .cloned()
+                    .unwrap_or_default()
+            }))
     }
 
     /// Index specifications as the server returns them, so nothing (partial filters, TTL, collation) is lost.
     pub async fn indexes(&self, database: &str, collection: &str) -> Result<Vec<Document>> {
-        let reply = self.client.database(database).run_command(doc! { "listIndexes": collection, "cursor": { "batchSize": 1000 } }).await?;
+        let reply = self
+            .client
+            .database(database)
+            .run_command(doc! { "listIndexes": collection, "cursor": { "batchSize": 1000 } })
+            .await?;
         Ok(reply
             .get_document("cursor")
             .and_then(|cursor| cursor.get_array("firstBatch"))
-            .map(|batch| batch.iter().filter_map(|index| index.as_document().cloned()).collect())
+            .map(|batch| {
+                batch
+                    .iter()
+                    .filter_map(|index| index.as_document().cloned())
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
     /// One page of an aggregation. Pipelines that write are refused before anything is sent.
-    pub async fn aggregate_page(&self, database: &str, collection: &str, pipeline: &[Document], skip: u64, page_size: u32, max_time: Duration) -> Result<FindPage> {
+    pub async fn aggregate_page(
+        &self,
+        database: &str,
+        collection: &str,
+        pipeline: &[Document],
+        skip: u64,
+        page_size: u32,
+        max_time: Duration,
+    ) -> Result<FindPage> {
         if let Some(stage) = write_stage(pipeline) {
-            anyhow::bail!("This pipeline writes with {stage}; Vilo only runs read-only pipelines for now.");
+            anyhow::bail!(
+                "This pipeline writes with {stage}; Vilo only runs read-only pipelines for now."
+            );
         }
         let page_size = page_size.max(1);
         let mut stages = pipeline.to_vec();
@@ -261,7 +331,10 @@ impl MongoSession {
             .await?;
         let has_more = documents.len() > page_size as usize;
         documents.truncate(page_size as usize);
-        Ok(FindPage { documents, has_more })
+        Ok(FindPage {
+            documents,
+            has_more,
+        })
     }
 
     /// Every matching document, one at a time, for export. `cancel` stops after the current document.
@@ -272,11 +345,16 @@ impl MongoSession {
         cancel: &std::sync::atomic::AtomicBool,
         mut each: impl FnMut(Document) -> Result<()>,
     ) -> Result<()> {
-        let collection = self.client.database(&request.database).collection::<Document>(&request.collection);
+        let collection = self
+            .client
+            .database(&request.database)
+            .collection::<Document>(&request.collection);
         let mut cursor = match pipeline {
             Some(pipeline) => {
                 if let Some(stage) = write_stage(pipeline) {
-                    anyhow::bail!("This pipeline writes with {stage}; Vilo only runs read-only pipelines for now.");
+                    anyhow::bail!(
+                        "This pipeline writes with {stage}; Vilo only runs read-only pipelines for now."
+                    );
                 }
                 collection.aggregate(pipeline.to_vec()).await?
             }
@@ -334,12 +412,24 @@ mod tests {
         let summary = summarize_explain(&explain);
         assert_eq!(summary.stages, vec!["FETCH", "IXSCAN"]);
         assert_eq!(summary.indexes, vec!["status_1"]);
-        assert_eq!((summary.returned, summary.documents_examined, summary.keys_examined, summary.millis), (3, 3, 4, 2));
-        let slot_based = doc! { "queryPlanner": { "winningPlan": { "queryPlan": { "stage": "COLLSCAN" } } } };
+        assert_eq!(
+            (
+                summary.returned,
+                summary.documents_examined,
+                summary.keys_examined,
+                summary.millis
+            ),
+            (3, 3, 4, 2)
+        );
+        let slot_based =
+            doc! { "queryPlanner": { "winningPlan": { "queryPlan": { "stage": "COLLSCAN" } } } };
         assert_eq!(summarize_explain(&slot_based).stages, vec!["COLLSCAN"]);
 
         assert_eq!(write_stage(&[doc! { "$match": {} }]), None);
-        assert_eq!(write_stage(&[doc! { "$merge": { "into": "x" } }]), Some("$merge"));
+        assert_eq!(
+            write_stage(&[doc! { "$merge": { "into": "x" } }]),
+            Some("$merge")
+        );
         let nested = doc! { "$facet": { "a": [ { "$lookup": { "from": "y", "pipeline": [ { "$out": "z" } ], "as": "j" } } ] } };
         assert_eq!(write_stage(&[nested]), Some("$out"));
     }
@@ -351,8 +441,14 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(document.get("_id"), Some(Bson::ObjectId(_))));
-        assert_eq!(document.get("amount"), Some(&Bson::Decimal128("0.10".parse::<Decimal128>().unwrap())));
-        assert_eq!(document.get("big"), Some(&Bson::Int64(9_007_199_254_740_993)));
+        assert_eq!(
+            document.get("amount"),
+            Some(&Bson::Decimal128("0.10".parse::<Decimal128>().unwrap()))
+        );
+        assert_eq!(
+            document.get("big"),
+            Some(&Bson::Int64(9_007_199_254_740_993))
+        );
         assert_eq!(parse_document("  ").unwrap(), Document::new());
         assert!(parse_document("[1]").is_err());
         assert!(parse_document("{oops").is_err());
@@ -365,7 +461,10 @@ mod tests {
             return;
         };
         let session = MongoSession::connect(&uri).await.unwrap();
-        let collection = session.client.database("vilo_test").collection::<Document>("paging");
+        let collection = session
+            .client
+            .database("vilo_test")
+            .collection::<Document>("paging");
         collection.drop().await.unwrap();
         let id = ObjectId::new();
         let documents = (0..5)
@@ -376,7 +475,8 @@ mod tests {
         let mut request = FindRequest {
             database: "vilo_test".into(),
             collection: "paging".into(),
-            filter: parse_document(&format!(r#"{{"owner": {{"$oid": "{}"}}}}"#, id.to_hex())).unwrap(),
+            filter: parse_document(&format!(r#"{{"owner": {{"$oid": "{}"}}}}"#, id.to_hex()))
+                .unwrap(),
             projection: Some(doc! { "_id": 0 }),
             sort: Some(doc! { "index": 1 }),
             skip: 0,
@@ -386,30 +486,94 @@ mod tests {
         let first = session.find_page(&request).await.unwrap();
         assert_eq!(first.documents.len(), 2);
         assert!(first.has_more);
-        assert!(matches!(first.documents[0].get("amount"), Some(Bson::Decimal128(_))));
+        assert!(matches!(
+            first.documents[0].get("amount"),
+            Some(Bson::Decimal128(_))
+        ));
         request.skip = 4;
         let last = session.find_page(&request).await.unwrap();
         assert_eq!((last.documents.len(), last.has_more), (1, false));
-        assert!(session.databases().await.unwrap().iter().any(|database| database.name == "vilo_test"));
-        assert_eq!(session.collections("vilo_test").await.unwrap()[0].name, "paging");
-        assert_eq!(session.estimated_count("vilo_test", "paging").await.unwrap(), 5);
-        assert_eq!(session.count("vilo_test", "paging", doc! { "index": { "$gte": 3 } }, Duration::from_secs(5)).await.unwrap(), 2);
+        assert!(
+            session
+                .databases()
+                .await
+                .unwrap()
+                .iter()
+                .any(|database| database.name == "vilo_test")
+        );
+        assert_eq!(
+            session.collections("vilo_test").await.unwrap()[0].name,
+            "paging"
+        );
+        assert_eq!(
+            session
+                .estimated_count("vilo_test", "paging")
+                .await
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            session
+                .count(
+                    "vilo_test",
+                    "paging",
+                    doc! { "index": { "$gte": 3 } },
+                    Duration::from_secs(5)
+                )
+                .await
+                .unwrap(),
+            2
+        );
 
         let explain = session.explain(&request).await.unwrap();
         let summary = summarize_explain(&explain);
         assert!(!summary.stages.is_empty());
-        assert!(session.collection_options("vilo_test", "paging").await.unwrap().is_some());
+        assert!(
+            session
+                .collection_options("vilo_test", "paging")
+                .await
+                .unwrap()
+                .is_some()
+        );
         let indexes = session.indexes("vilo_test", "paging").await.unwrap();
         assert_eq!(indexes[0].get_str("name").unwrap(), "_id_");
-        let pipeline = vec![doc! { "$match": { "index": { "$gte": 1 } } }, doc! { "$sort": { "index": 1 } }];
-        let page = session.aggregate_page("vilo_test", "paging", &pipeline, 1, 2, Duration::from_secs(5)).await.unwrap();
+        let pipeline = vec![
+            doc! { "$match": { "index": { "$gte": 1 } } },
+            doc! { "$sort": { "index": 1 } },
+        ];
+        let page = session
+            .aggregate_page(
+                "vilo_test",
+                "paging",
+                &pipeline,
+                1,
+                2,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
         assert_eq!(page.documents[0].get_i32("index").unwrap(), 2);
         assert!(page.has_more);
-        let refused = session.aggregate_page("vilo_test", "paging", &[doc! { "$out": "copy" }], 0, 2, Duration::from_secs(5)).await;
+        let refused = session
+            .aggregate_page(
+                "vilo_test",
+                "paging",
+                &[doc! { "$out": "copy" }],
+                0,
+                2,
+                Duration::from_secs(5),
+            )
+            .await;
         assert!(refused.is_err());
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let mut seen = 0;
-        session.for_each_match(&request, None, &cancel, |_| { seen += 1; Ok(()) }).await.unwrap();
+        session
+            .for_each_match(&request, None, &cancel, |_| {
+                seen += 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
         assert_eq!(seen, 1, "export follows the query's own skip, not paging");
     }
 }

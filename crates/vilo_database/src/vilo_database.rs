@@ -1,4 +1,5 @@
 mod mongo_tab;
+mod redis_view;
 
 use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 
@@ -6,23 +7,24 @@ use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use editor::Editor;
 use gpui::{
-    App, AsyncApp, Entity, FocusHandle, Focusable, ListHorizontalSizingBehavior, Task, TaskExt as _, UniformListScrollHandle, Window,
-    prelude::*, uniform_list,
+    App, AsyncApp, Entity, FocusHandle, Focusable, ListHorizontalSizingBehavior, Task,
+    TaskExt as _, UniformListScrollHandle, Window, prelude::*, uniform_list,
 };
 use gpui_tokio::Tokio;
 use serde::{Deserialize, Serialize};
-use ui::{Button, ButtonStyle, IconButton, Tooltip, prelude::*};
+use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 use vilo_database_core::{
     mongo::{CollectionInfo, DatabaseInfo, MongoSession},
-    redis::{KeyInfo, RedisSession},
+    redis::RedisSession,
 };
 
 use mongo_tab::{MongoTab, SavedQuery, load_history};
+use redis_view::RedisState;
 use workspace::Workspace;
 
 const MODULE_ID: &str = "database";
-const SCAN_COUNT: u32 = 200;
+const UNASSIGNED_SITE: &str = "Unassigned";
 const QUERY_TIME_LIMIT: Duration = Duration::from_secs(30);
 /// Counting can be slow on big collections; past this the total is simply not shown.
 const COUNT_TIME_LIMIT: Duration = Duration::from_secs(5);
@@ -47,7 +49,10 @@ pub fn init(cx: &mut App) {
 
 /// Runs a driver call on Tokio to completion even if the view stops waiting:
 /// the MongoDB driver warns that dropping an operation midway can leave it inconsistent.
-fn run<R: Send + 'static>(cx: &App, future: impl Future<Output = Result<R>> + Send + 'static) -> Task<Result<R>> {
+fn run<R: Send + 'static>(
+    cx: &App,
+    future: impl Future<Output = Result<R>> + Send + 'static,
+) -> Task<Result<R>> {
     let join = Tokio::handle(cx).spawn(future);
     cx.background_spawn(async move { join.await? })
 }
@@ -72,6 +77,9 @@ struct Connection {
     id: String,
     name: String,
     kind: Kind,
+    /// The site the database belongs to (CP, NP, ZP, BP …); the sidebar shows one site at a time.
+    #[serde(default)]
+    site: String,
     /// e.g. CP QAT; shown on every page so results are never mistaken for another environment's.
     environment: String,
 }
@@ -79,6 +87,14 @@ struct Connection {
 impl Connection {
     fn credential_url(&self) -> String {
         format!("vilo-database://{}", self.id)
+    }
+
+    fn site_label(&self) -> String {
+        if self.site.trim().is_empty() {
+            UNASSIGNED_SITE.to_string()
+        } else {
+            self.site.trim().to_string()
+        }
     }
 
     fn production(&self) -> bool {
@@ -109,18 +125,13 @@ enum Session {
 struct Form {
     editing: Option<String>,
     kind: Kind,
+    site: Entity<Editor>,
     name: Entity<Editor>,
     environment: Entity<Editor>,
     uri: Entity<Editor>,
     message: Option<SharedString>,
     checking: bool,
     _task: Option<Task<()>>,
-}
-
-struct KeyDetail {
-    info: KeyInfo,
-    /// The raw value of a string key; other types get their own viewers.
-    value: Option<Vec<u8>>,
 }
 
 pub struct DatabaseView {
@@ -137,6 +148,8 @@ pub struct DatabaseView {
     form: Option<Form>,
     databases: Fetch<Vec<DatabaseInfo>>,
     collections: HashMap<String, Fetch<Vec<CollectionInfo>>>,
+    /// The site whose connections the sidebar lists.
+    site: Option<String>,
     /// Searches connections and collections at once, keeping each match's parents visible.
     search: Entity<Editor>,
     tabs: Vec<MongoTab>,
@@ -145,21 +158,19 @@ pub struct DatabaseView {
     /// Readable dates in this Mac's time zone instead of UTC.
     local_dates: bool,
     pattern: Entity<Editor>,
-    keys: Vec<Vec<u8>>,
-    /// The next SCAN cursor; `None` once the walk came back to "0".
-    cursor: Option<String>,
-    scanning: bool,
-    scan_error: Option<SharedString>,
-    selected_key: Option<Vec<u8>>,
-    key_detail: Option<Fetch<KeyDetail>>,
-    hex: bool,
-    lines_scroll: UniformListScrollHandle,
-    keys_scroll: UniformListScrollHandle,
+    workbench_input: Entity<Editor>,
+    redis_state: Option<RedisState>,
     tasks: Vec<Task<()>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
-fn editor(placeholder: &str, text: &str, masked: bool, window: &mut Window, cx: &mut App) -> Entity<Editor> {
+fn editor(
+    placeholder: &str,
+    text: &str,
+    masked: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<Editor> {
     let placeholder = placeholder.to_string();
     let text = text.to_string();
     cx.new(|cx| {
@@ -175,41 +186,28 @@ fn editor(placeholder: &str, text: &str, masked: bool, window: &mut Window, cx: 
     })
 }
 
-/// Printable ASCII as is, everything else as `\xNN`, so different bytes never look the same.
-fn escape_bytes(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| match byte {
-            b' '..=b'~' if *byte != b'\\' => (*byte as char).to_string(),
-            b'\\' => "\\\\".to_string(),
-            _ => format!("\\x{byte:02x}"),
-        })
-        .collect()
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ")
-}
-
-fn describe_ttl(ttl_ms: i64) -> String {
-    match ttl_ms {
-        -1 => "no expiry".into(),
-        -2 => "key does not exist".into(),
-        ms if ms < 1000 => format!("{ms} ms"),
-        ms => format!("{} s", ms / 1000),
-    }
-}
-
 async fn connect(connection: &Connection, uri: String, cx: &AsyncApp) -> Result<Session> {
     let handle_task = match connection.kind {
-        Kind::MongoDb => cx.update(|cx| run(cx, async move { Ok(Session::Mongo(Arc::new(MongoSession::connect(&uri).await?))) })),
-        Kind::Redis => cx.update(|cx| run(cx, async move { Ok(Session::Redis(Arc::new(RedisSession::connect(&uri).await?))) })),
+        Kind::MongoDb => cx.update(|cx| {
+            run(cx, async move {
+                Ok(Session::Mongo(Arc::new(MongoSession::connect(&uri).await?)))
+            })
+        }),
+        Kind::Redis => cx.update(|cx| {
+            run(cx, async move {
+                Ok(Session::Redis(Arc::new(RedisSession::connect(&uri).await?)))
+            })
+        }),
     };
     handle_task.await
 }
 
 impl DatabaseView {
-    pub fn new(workspace: gpui::WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        workspace: gpui::WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let path = paths::config_dir().join("database_connections.json");
         let connections = std::fs::read(&path)
             .ok()
@@ -223,13 +221,15 @@ impl DatabaseView {
             .filter_map(|entry| serde_json::from_value::<Connection>(entry).log_err())
             .collect::<Vec<_>>();
         let search = editor("Search connections and collections", "", false, window, cx);
-        let subscriptions = vec![cx.subscribe(&search, |this, _, _: &editor::EditorEvent, cx| {
-            // Searching needs every database's collections; load the ones not opened yet.
-            if !this.search.read(cx).text(cx).trim().is_empty() {
-                this.load_all_collections(cx);
-            }
-            cx.notify();
-        })];
+        let subscriptions = vec![
+            cx.subscribe(&search, |this, _, _: &editor::EditorEvent, cx| {
+                // Searching needs every database's collections; load the ones not opened yet.
+                if !this.search.read(cx).text(cx).trim().is_empty() {
+                    this.load_all_collections(cx);
+                }
+                cx.notify();
+            }),
+        ];
         let mut view = Self {
             focus_handle: cx.focus_handle(),
             workspace,
@@ -242,21 +242,21 @@ impl DatabaseView {
             form: None,
             databases: Fetch::Loaded(Vec::new()),
             collections: HashMap::default(),
+            site: None,
             search,
             tabs: Vec::new(),
             active_tab: None,
             history: load_history(),
             local_dates: false,
-            pattern: editor("Key pattern, e.g. user:*", "*", false, window, cx),
-            keys: Vec::new(),
-            cursor: None,
-            scanning: false,
-            scan_error: None,
-            selected_key: None,
-            key_detail: None,
-            hex: false,
-            lines_scroll: UniformListScrollHandle::new(),
-            keys_scroll: UniformListScrollHandle::new(),
+            pattern: editor("Filter by Key Name or Pattern", "", false, window, cx),
+            workbench_input: editor(
+                "Enter a Redis command, e.g. HGETALL user:1",
+                "",
+                false,
+                window,
+                cx,
+            ),
+            redis_state: None,
             tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -280,8 +280,33 @@ impl DatabaseView {
         })
     }
 
+    /// Every site that has a connection, sorted, with unassigned ones last.
+    fn sites(&self) -> Vec<String> {
+        let mut sites = self
+            .connections
+            .iter()
+            .map(Connection::site_label)
+            .collect::<Vec<_>>();
+        sites.sort_by_key(|site| (site == UNASSIGNED_SITE, site.clone()));
+        sites.dedup();
+        sites
+    }
+
+    fn current_site(&self) -> String {
+        let sites = self.sites();
+        self.site
+            .clone()
+            .filter(|site| sites.contains(site))
+            .or_else(|| sites.first().cloned())
+            .unwrap_or_default()
+    }
+
     fn active_connection(&self) -> Option<&Connection> {
-        self.active.as_ref().and_then(|id| self.connections.iter().find(|connection| &connection.id == id))
+        self.active.as_ref().and_then(|id| {
+            self.connections
+                .iter()
+                .find(|connection| &connection.id == id)
+        })
     }
 
     fn reset(&mut self) {
@@ -292,17 +317,17 @@ impl DatabaseView {
         self.collections.clear();
         self.tabs.clear();
         self.active_tab = None;
-        self.keys.clear();
-        self.cursor = None;
-        self.scanning = false;
-        self.scan_error = None;
-        self.selected_key = None;
-        self.key_detail = None;
+        self.redis_state = None;
         self.tasks.clear();
     }
 
     fn connect(&mut self, id: String, cx: &mut Context<Self>) {
-        let Some(connection) = self.connections.iter().find(|connection| connection.id == id).cloned() else {
+        let Some(connection) = self
+            .connections
+            .iter()
+            .find(|connection| connection.id == id)
+            .cloned()
+        else {
             return;
         };
         self.reset();
@@ -316,8 +341,10 @@ impl DatabaseView {
                     .update(|cx| cx.read_credentials(&connection.credential_url()))
                     .await
                     .context("Could not read the connection string from the keychain")?;
-                let (_, uri) = credential.ok_or_else(|| anyhow!("No connection string saved. Edit the connection."))?;
-                let uri = String::from_utf8(uri).context("The saved connection string is unreadable")?;
+                let (_, uri) = credential
+                    .ok_or_else(|| anyhow!("No connection string saved. Edit the connection."))?;
+                let uri =
+                    String::from_utf8(uri).context("The saved connection string is unreadable")?;
                 connect(&connection, uri, cx).await
             }
             .await;
@@ -333,6 +360,7 @@ impl DatabaseView {
                         if mongo {
                             this.load_databases(cx);
                         } else {
+                            this.redis_state = Some(RedisState::new());
                             this.scan(true, cx);
                         }
                     }
@@ -391,7 +419,11 @@ impl DatabaseView {
         let Fetch::Loaded(databases) = &self.databases else {
             return;
         };
-        let missing = databases.iter().map(|database| database.name.clone()).filter(|name| !self.collections.contains_key(name)).collect::<Vec<_>>();
+        let missing = databases
+            .iter()
+            .map(|database| database.name.clone())
+            .filter(|name| !self.collections.contains_key(name))
+            .collect::<Vec<_>>();
         for database in missing {
             self.load_collections(database, cx);
         }
@@ -418,88 +450,50 @@ impl DatabaseView {
         cx.notify();
     }
 
-    fn scan(&mut self, restart: bool, cx: &mut Context<Self>) {
-        let Some(session) = self.redis() else {
-            return;
-        };
-        if restart {
-            self.generation += 1;
-            self.keys.clear();
-            self.cursor = Some("0".into());
-            self.selected_key = None;
-            self.key_detail = None;
-        }
-        let Some(cursor) = self.cursor.clone() else {
-            return;
-        };
-        let pattern = self.pattern.read(cx).text(cx);
-        let pattern = if pattern.trim().is_empty() { "*".to_string() } else { pattern };
-        self.scanning = true;
-        self.scan_error = None;
-        let generation = self.generation;
-        let task = run(cx, async move { session.scan(&cursor, &pattern, SCAN_COUNT, None).await });
-        self.tasks.push(cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                if this.generation != generation {
-                    return;
-                }
-                this.scanning = false;
-                match result {
-                    Ok(page) => {
-                        // SCAN may return a key again on a later page.
-                        for key in page.keys {
-                            if !this.keys.contains(&key) {
-                                this.keys.push(key);
-                            }
-                        }
-                        this.cursor = (page.cursor != "0").then_some(page.cursor);
-                    }
-                    Err(error) => this.scan_error = Some(format!("{error:#}").into()),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn open_key(&mut self, key: Vec<u8>, cx: &mut Context<Self>) {
-        let Some(session) = self.redis() else {
-            return;
-        };
-        self.selected_key = Some(key.clone());
-        self.key_detail = Some(Fetch::Loading);
-        let generation = self.generation;
-        let task = run(cx, {
-            let key = key.clone();
-            async move {
-                let info = session.key_info(&key).await?;
-                let value = if info.kind == "string" { session.get_string(&key).await? } else { None };
-                Ok(KeyDetail { info, value })
-            }
-        });
-        self.tasks.push(cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                if this.generation == generation && this.selected_key.as_ref() == Some(&key) {
-                    this.key_detail = Some(fetched(result));
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
     fn open_form(&mut self, editing: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let existing = editing.as_ref().and_then(|id| self.connections.iter().find(|c| &c.id == id)).cloned();
+        let existing = editing
+            .as_ref()
+            .and_then(|id| self.connections.iter().find(|c| &c.id == id))
+            .cloned();
         self.form = Some(Form {
             kind: existing.as_ref().map_or(Kind::MongoDb, |c| c.kind),
-            name: editor("Name, e.g. CP fpms", &existing.as_ref().map(|c| c.name.clone()).unwrap_or_default(), false, window, cx),
-            environment: editor("Environment, e.g. QAT", &existing.as_ref().map(|c| c.environment.clone()).unwrap_or_default(), false, window, cx),
+            site: editor(
+                "Site, e.g. CP",
+                &existing
+                    .as_ref()
+                    .map(|c| c.site.clone())
+                    .or_else(|| self.site.clone().filter(|site| site != UNASSIGNED_SITE))
+                    .unwrap_or_default(),
+                false,
+                window,
+                cx,
+            ),
+            name: editor(
+                "Name, e.g. CP fpms",
+                &existing
+                    .as_ref()
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default(),
+                false,
+                window,
+                cx,
+            ),
+            environment: editor(
+                "Environment, e.g. QAT",
+                &existing
+                    .as_ref()
+                    .map(|c| c.environment.clone())
+                    .unwrap_or_default(),
+                false,
+                window,
+                cx,
+            ),
             uri: editor(
-                if existing.is_some() { "Leave empty to keep the saved one" } else { "mongodb://… or redis://…" },
+                if existing.is_some() {
+                    "Leave empty to keep the saved one"
+                } else {
+                    "mongodb://… or redis://…"
+                },
                 "",
                 true,
                 window,
@@ -518,39 +512,65 @@ impl DatabaseView {
             return;
         };
         let text = |editor: &Entity<Editor>, cx: &App| editor.read(cx).text(cx).trim().to_string();
-        let (name, environment, uri) = (text(&form.name, cx), text(&form.environment, cx), text(&form.uri, cx));
-        if name.is_empty() || environment.is_empty() {
-            form.message = Some("Fill in a name and an environment.".into());
+        let (site, name, environment, uri) = (
+            text(&form.site, cx),
+            text(&form.name, cx),
+            text(&form.environment, cx),
+            text(&form.uri, cx),
+        );
+        if site.is_empty() || name.is_empty() || environment.is_empty() {
+            form.message = Some("Fill in the site, a name and an environment.".into());
             cx.notify();
             return;
         }
-        let existing = form.editing.as_ref().and_then(|id| self.connections.iter().find(|c| &c.id == id)).cloned();
-        if uri.is_empty() && existing.as_ref().is_none_or(|existing| existing.kind != form.kind) {
+        let existing = form
+            .editing
+            .as_ref()
+            .and_then(|id| self.connections.iter().find(|c| &c.id == id))
+            .cloned();
+        if uri.is_empty()
+            && existing
+                .as_ref()
+                .is_none_or(|existing| existing.kind != form.kind)
+        {
             form.message = Some("Enter the connection string.".into());
             cx.notify();
             return;
         }
         let connection = Connection {
-            id: existing.as_ref().map_or_else(|| uuid::Uuid::new_v4().simple().to_string(), |c| c.id.clone()),
+            id: existing.as_ref().map_or_else(
+                || uuid::Uuid::new_v4().simple().to_string(),
+                |c| c.id.clone(),
+            ),
             name,
             kind: form.kind,
+            site: site.clone(),
             environment,
         };
+        self.site = Some(site);
         form.checking = true;
         form.message = Some("Connecting…".into());
         form._task = Some(cx.spawn(async move |this, cx| {
             let result: Result<()> = async {
                 if !uri.is_empty() {
                     let expected = match connection.kind {
-                        Kind::MongoDb => uri.starts_with("mongodb://") || uri.starts_with("mongodb+srv://"),
+                        Kind::MongoDb => {
+                            uri.starts_with("mongodb://") || uri.starts_with("mongodb+srv://")
+                        }
                         Kind::Redis => uri.starts_with("redis://") || uri.starts_with("rediss://"),
                     };
-                    anyhow::ensure!(expected, "That is not a {} connection string.", connection.kind.label());
+                    anyhow::ensure!(
+                        expected,
+                        "That is not a {} connection string.",
+                        connection.kind.label()
+                    );
                     connect(&connection, uri.clone(), cx).await?;
                     let url = connection.credential_url();
-                    cx.update(|cx| cx.write_credentials(&url, connection.kind.label(), uri.as_bytes()))
-                        .await
-                        .context("Vilo could not save the connection string to the keychain")?;
+                    cx.update(|cx| {
+                        cx.write_credentials(&url, connection.kind.label(), uri.as_bytes())
+                    })
+                    .await
+                    .context("Vilo could not save the connection string to the keychain")?;
                 }
                 let persist = this.update(cx, |this, cx| {
                     match this.connections.iter_mut().find(|c| c.id == connection.id) {
@@ -606,27 +626,49 @@ impl Focusable for DatabaseView {
 }
 
 fn section(title: &'static str) -> gpui::Div {
-    h_flex()
-        .h(px(26.))
-        .pl_3()
-        .pr_1()
-        .justify_between()
-        .child(Label::new(title).size(LabelSize::XSmall).weight(gpui::FontWeight::SEMIBOLD).color(Color::Muted))
+    h_flex().h(px(26.)).pl_3().pr_1().justify_between().child(
+        Label::new(title)
+            .size(LabelSize::XSmall)
+            .weight(gpui::FontWeight::SEMIBOLD)
+            .color(Color::Muted),
+    )
 }
 
 fn boxed(child: impl IntoElement, cx: &App) -> gpui::Div {
     let colors = cx.theme().colors();
-    div().px_2().py_1().rounded_sm().border_1().border_color(colors.border).bg(colors.editor_background).child(child)
+    div()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.editor_background)
+        .child(child)
 }
 
 /// Monospaced lines in a virtual list; long lines scroll sideways so every row keeps one height.
-fn render_lines(id: &'static str, lines: Vec<SharedString>, scroll: &UniformListScrollHandle, cx: &mut Context<DatabaseView>) -> AnyElement {
+fn render_lines(
+    id: &'static str,
+    lines: Vec<SharedString>,
+    scroll: &UniformListScrollHandle,
+    cx: &mut Context<DatabaseView>,
+) -> AnyElement {
     let colors = cx.theme().colors().clone();
-    let widest = lines.iter().enumerate().max_by_key(|(_, line)| line.len()).map(|(index, _)| index);
+    let widest = lines
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, line)| line.len())
+        .map(|(index, _)| index);
     let list = uniform_list(id, lines.len(), move |range, _, cx| {
         range
             .filter_map(|index| lines.get(index).cloned())
-            .map(|line| div().px_2().whitespace_nowrap().child(Label::new(line).size(LabelSize::Small).buffer_font(cx)).into_any_element())
+            .map(|line| {
+                div()
+                    .px_2()
+                    .whitespace_nowrap()
+                    .child(Label::new(line).size(LabelSize::Small).buffer_font(cx))
+                    .into_any_element()
+            })
             .collect::<Vec<_>>()
     })
     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
@@ -651,107 +693,270 @@ impl DatabaseView {
         let search = self.search.read(cx).text(cx).trim().to_lowercase();
         let matches = |name: &str| search.is_empty() || name.to_lowercase().contains(&search);
         let mut tree = v_flex().gap_0p5().px_1();
-        for connection in &self.connections {
-            let active = self.active.as_ref() == Some(&connection.id);
-            let mongo_open = active && matches!(self.session, Some(Session::Mongo(_)));
-            // Under a search, the active connection's matching collections keep it visible.
-            if !matches(&connection.name) && !mongo_open {
-                continue;
-            }
-            let id = connection.id.clone();
+        let sites = self.sites();
+        let current_site = self.current_site();
+        for kind in [Kind::MongoDb, Kind::Redis] {
+            let in_site = self
+                .connections
+                .iter()
+                .filter(|connection| {
+                    connection.kind == kind && connection.site_label() == current_site
+                })
+                .collect::<Vec<_>>();
             tree = tree.child(
-                h_flex()
-                    .id(SharedString::from(format!("database-connection-{}", connection.id)))
-                    .px_2()
-                    .py_1()
-                    .gap_1p5()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .when(active, |this| this.bg(colors.element_selected))
-                    .hover(|style| style.bg(colors.element_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| this.connect(id.clone(), cx)))
-                    .child(Icon::new(if active { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Muted))
-                    .child(Icon::new(IconName::DatabaseZap).size(IconSize::Small).color(Color::Muted))
-                    .child(Label::new(connection.name.clone()).truncate())
-                    .child(div().flex_1())
-                    .child(
-                        Label::new(connection.environment.clone())
-                            .size(LabelSize::XSmall)
-                            .color(if connection.production() { Color::Warning } else { Color::Muted }),
-                    ),
+                div().px_2().pt_2().pb_0p5().child(
+                    Label::new(kind.label().to_uppercase())
+                        .size(LabelSize::XSmall)
+                        .weight(gpui::FontWeight::SEMIBOLD)
+                        .color(Color::Muted),
+                ),
             );
-            if !mongo_open {
-                continue;
+            if in_site.is_empty() {
+                tree = tree.child(
+                    div().px_3().child(
+                        Label::new(format!("No {} connections in {current_site}", kind.label()))
+                            .size(LabelSize::Small)
+                            .color(Color::Disabled),
+                    ),
+                );
             }
-            match &self.databases {
-                Fetch::Loading => tree = tree.child(div().pl_8().child(Label::new("Loading…").size(LabelSize::Small).color(Color::Muted))),
-                Fetch::Failed(message) => tree = tree.child(div().pl_8().child(Label::new(message.clone()).size(LabelSize::Small).color(Color::Warning))),
-                Fetch::Loaded(databases) => {
-                    for database in databases {
-                        let collections = self.collections.get(&database.name);
-                        let matching = match collections {
-                            Some(Fetch::Loaded(collections)) => {
-                                collections.iter().filter(|collection| matches(&collection.name) || matches(&database.name)).collect::<Vec<_>>()
-                            }
-                            _ => Vec::new(),
-                        };
-                        if !search.is_empty() && matching.is_empty() && !matches(&database.name) {
-                            continue;
-                        }
-                        let open = collections.is_some();
-                        let name = database.name.clone();
+            for connection in in_site {
+                let active = self.active.as_ref() == Some(&connection.id);
+                let mongo_open = active && matches!(self.session, Some(Session::Mongo(_)));
+                // Under a search, the active connection's matching collections keep it visible.
+                if !matches(&connection.name) && !mongo_open {
+                    continue;
+                }
+                let id = connection.id.clone();
+                tree = tree.child(
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "database-connection-{}",
+                            connection.id
+                        )))
+                        .px_2()
+                        .py_1()
+                        .gap_1p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(active, |this| this.bg(colors.element_selected))
+                        .hover(|style| style.bg(colors.element_hover))
+                        .on_click(cx.listener(move |this, _, _, cx| this.connect(id.clone(), cx)))
+                        .child(
+                            Icon::new(if active {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            Icon::new(IconName::DatabaseZap)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(connection.name.clone()).truncate())
+                        .child(div().flex_1())
+                        .child(
+                            Label::new(connection.environment.clone())
+                                .size(LabelSize::XSmall)
+                                .color(if connection.production() {
+                                    Color::Warning
+                                } else {
+                                    Color::Muted
+                                }),
+                        ),
+                );
+                if !mongo_open {
+                    continue;
+                }
+                match &self.databases {
+                    Fetch::Loading => {
                         tree = tree.child(
-                            h_flex()
-                                .id(SharedString::from(format!("database-db-{}", database.name)))
-                                .pl_6()
-                                .pr_2()
-                                .py_0p5()
-                                .gap_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(colors.element_hover))
-                                .on_click(cx.listener(move |this, _, _, cx| this.toggle_database(name.clone(), cx)))
-                                .child(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Muted))
-                                .child(Icon::new(IconName::DatabaseZap).size(IconSize::XSmall).color(Color::Muted))
-                                .child(Label::new(database.name.clone()).size(LabelSize::Small).truncate()),
-                        );
-                        match collections {
-                            Some(Fetch::Loading) => tree = tree.child(div().pl_12().child(Label::new("Loading…").size(LabelSize::XSmall).color(Color::Muted))),
-                            Some(Fetch::Failed(message)) => {
-                                tree = tree.child(div().pl_12().child(Label::new(message.clone()).size(LabelSize::XSmall).color(Color::Warning)))
+                            div().pl_8().child(
+                                Label::new("Loading…")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                    }
+                    Fetch::Failed(message) => {
+                        tree = tree.child(
+                            div().pl_8().child(
+                                Label::new(message.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Warning),
+                            ),
+                        )
+                    }
+                    Fetch::Loaded(databases) => {
+                        for database in databases {
+                            let collections = self.collections.get(&database.name);
+                            let matching = match collections {
+                                Some(Fetch::Loaded(collections)) => collections
+                                    .iter()
+                                    .filter(|collection| {
+                                        matches(&collection.name) || matches(&database.name)
+                                    })
+                                    .collect::<Vec<_>>(),
+                                _ => Vec::new(),
+                            };
+                            if !search.is_empty() && matching.is_empty() && !matches(&database.name)
+                            {
+                                continue;
                             }
-                            Some(Fetch::Loaded(_)) => {
-                                for collection in matching {
-                                    let selected = self.tab().is_some_and(|tab| tab.database == database.name && tab.collection == collection.name);
-                                    let (database_name, collection_name) = (database.name.clone(), collection.name.clone());
+                            let open = collections.is_some();
+                            let name = database.name.clone();
+                            tree = tree.child(
+                                h_flex()
+                                    .id(SharedString::from(format!(
+                                        "database-db-{}",
+                                        database.name
+                                    )))
+                                    .pl_6()
+                                    .pr_2()
+                                    .py_0p5()
+                                    .gap_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(colors.element_hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_database(name.clone(), cx)
+                                    }))
+                                    .child(
+                                        Icon::new(if open {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Icon::new(IconName::DatabaseZap)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(database.name.clone())
+                                            .size(LabelSize::Small)
+                                            .truncate(),
+                                    ),
+                            );
+                            match collections {
+                                Some(Fetch::Loading) => {
                                     tree = tree.child(
-                                        h_flex()
-                                            .id(SharedString::from(format!("database-coll-{}-{}", database.name, collection.name)))
-                                            .pl_12()
-                                            .pr_2()
-                                            .py_0p5()
-                                            .gap_1p5()
-                                            .rounded_sm()
-                                            .cursor_pointer()
-                                            .when(selected, |this| this.bg(colors.element_selected))
-                                            .hover(|style| style.bg(colors.element_hover))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.open_collection(database_name.clone(), collection_name.clone(), window, cx)
-                                            }))
-                                            .child(Icon::new(IconName::Folder).size(IconSize::XSmall).color(Color::Muted))
-                                            .child(Label::new(collection.name.clone()).size(LabelSize::Small).truncate())
-                                            .when(collection.kind != "collection", |this| {
-                                                this.child(div().flex_1()).child(Label::new(collection.kind.clone()).size(LabelSize::XSmall).color(Color::Muted))
-                                            }),
-                                    );
+                                        div().pl_12().child(
+                                            Label::new("Loading…")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                    )
                                 }
+                                Some(Fetch::Failed(message)) => {
+                                    tree = tree.child(
+                                        div().pl_12().child(
+                                            Label::new(message.clone())
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Warning),
+                                        ),
+                                    )
+                                }
+                                Some(Fetch::Loaded(_)) => {
+                                    for collection in matching {
+                                        let selected = self.tab().is_some_and(|tab| {
+                                            tab.database == database.name
+                                                && tab.collection == collection.name
+                                        });
+                                        let (database_name, collection_name) =
+                                            (database.name.clone(), collection.name.clone());
+                                        tree = tree.child(
+                                            h_flex()
+                                                .id(SharedString::from(format!(
+                                                    "database-coll-{}-{}",
+                                                    database.name, collection.name
+                                                )))
+                                                .pl_12()
+                                                .pr_2()
+                                                .py_0p5()
+                                                .gap_1p5()
+                                                .rounded_sm()
+                                                .cursor_pointer()
+                                                .when(selected, |this| {
+                                                    this.bg(colors.element_selected)
+                                                })
+                                                .hover(|style| style.bg(colors.element_hover))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.open_collection(
+                                                            database_name.clone(),
+                                                            collection_name.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                ))
+                                                .child(
+                                                    Icon::new(IconName::Folder)
+                                                        .size(IconSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    Label::new(collection.name.clone())
+                                                        .size(LabelSize::Small)
+                                                        .truncate(),
+                                                )
+                                                .when(collection.kind != "collection", |this| {
+                                                    this.child(div().flex_1()).child(
+                                                        Label::new(collection.kind.clone())
+                                                            .size(LabelSize::XSmall)
+                                                            .color(Color::Muted),
+                                                    )
+                                                }),
+                                        );
+                                    }
+                                }
+                                None => {}
                             }
-                            None => {}
                         }
                     }
                 }
             }
         }
+        let view = cx.entity().downgrade();
+        let site_menu = PopoverMenu::new("database-site")
+            .trigger(
+                Button::new(
+                    "database-site-button",
+                    if current_site.is_empty() {
+                        "No site".to_string()
+                    } else {
+                        current_site.clone()
+                    },
+                )
+                .style(ButtonStyle::Outlined)
+                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+            )
+            .menu(move |window, cx| {
+                let sites = sites.clone();
+                let view = view.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for site in &sites {
+                        let view = view.clone();
+                        let site = site.clone();
+                        menu = menu.entry(site.clone(), None, move |_, cx| {
+                            let site = site.clone();
+                            view.update(cx, |this, cx| {
+                                this.site = Some(site);
+                                cx.notify();
+                            })
+                            .ok();
+                        });
+                    }
+                    menu
+                }))
+            });
         v_flex()
             .w(px(300.))
             .flex_none()
@@ -760,7 +965,8 @@ impl DatabaseView {
             .border_color(colors.border)
             .bg(colors.panel_background)
             .child(
-                section("CONNECTIONS")
+                section("SITE")
+                    .child(div().flex_1().pl_2().child(site_menu))
                     .child(
                         h_flex()
                             .when(matches!(self.session, Some(Session::Mongo(_))), |this| {
@@ -768,29 +974,48 @@ impl DatabaseView {
                                     IconButton::new("database-reload", IconName::RotateCw)
                                         .icon_size(IconSize::Small)
                                         .tooltip(Tooltip::text("Reload databases"))
-                                        .on_click(cx.listener(|this, _, _, cx| this.load_databases(cx))),
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.load_databases(cx)),
+                                        ),
                                 )
                             })
                             .child(
                                 IconButton::new("database-add-connection", IconName::Plus)
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Add a MongoDB or Redis connection"))
-                                    .on_click(cx.listener(|this, _, window, cx| this.open_form(None, window, cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_form(None, window, cx)
+                                    })),
                             ),
                     ),
             )
             .child(div().mx_2().mb_1().child(boxed(self.search.clone(), cx)))
-            .child(v_flex().id("database-tree").flex_1().min_h_0().overflow_y_scroll().pb_2().child(tree))
+            .child(
+                v_flex()
+                    .id("database-tree")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .pb_2()
+                    .child(tree),
+            )
     }
 
     fn render_form(&self, form: &Form, cx: &mut Context<Self>) -> AnyElement {
         let input = |label: &'static str, editor: &Entity<Editor>, cx: &App| {
-            v_flex().gap_1().child(Label::new(label).size(LabelSize::Small).color(Color::Muted)).child(boxed(editor.clone(), cx))
+            v_flex()
+                .gap_1()
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .child(boxed(editor.clone(), cx))
         };
         let kind_button = |id: &'static str, kind: Kind, cx: &mut Context<Self>| {
             Button::new(id, kind.label())
                 .label_size(LabelSize::Small)
-                .style(if form.kind == kind { ButtonStyle::Filled } else { ButtonStyle::Subtle })
+                .style(if form.kind == kind {
+                    ButtonStyle::Filled
+                } else {
+                    ButtonStyle::Subtle
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(form) = &mut this.form {
                         form.kind = kind;
@@ -806,6 +1031,7 @@ impl DatabaseView {
             .child(Headline::new(if form.editing.is_some() { "Edit connection" } else { "Add a connection" }).size(HeadlineSize::Small))
             .child(h_flex().gap_1().child(kind_button("database-kind-mongo", Kind::MongoDb, cx)).child(kind_button("database-kind-redis", Kind::Redis, cx)))
             .child(input("Name", &form.name, cx))
+            .child(input("Site", &form.site, cx))
             .child(input("Environment", &form.environment, cx))
             .child(input("Connection string", &form.uri, cx))
             .child(
@@ -846,162 +1072,44 @@ impl DatabaseView {
             .into_any_element()
     }
 
-    fn render_header(&self, connection: &Connection, title: String, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(
+        &self,
+        connection: &Connection,
+        title: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let id = connection.id.clone();
         h_flex()
             .gap_2()
             .child(Headline::new(title).size(HeadlineSize::Small))
-            .child(Label::new(format!("{} · {}", connection.kind.label(), connection.environment)).size(LabelSize::Small).color(
-                if connection.production() { Color::Warning } else { Color::Muted },
-            ))
+            .child(
+                Label::new(format!(
+                    "{} · {}",
+                    connection.kind.label(),
+                    connection.environment
+                ))
+                .size(LabelSize::Small)
+                .color(if connection.production() {
+                    Color::Warning
+                } else {
+                    Color::Muted
+                }),
+            )
             .child(div().flex_1())
             .child(
                 Button::new("database-edit", "Edit connection")
                     .label_size(LabelSize::Small)
-                    .on_click(cx.listener(move |this, _, window, cx| this.open_form(Some(id.clone()), window, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_form(Some(id.clone()), window, cx)
+                    })),
             )
-    }
-
-    fn render_redis(&self, connection: &Connection, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let keys = self.keys.clone();
-        let selected = self.selected_key.clone();
-        let view = cx.entity().downgrade();
-        let list = uniform_list("database-keys", keys.len(), move |range, _, cx| {
-            range
-                .filter_map(|index| keys.get(index).cloned())
-                .map(|key| {
-                    let is_selected = selected.as_ref() == Some(&key);
-                    let view = view.clone();
-                    let label = escape_bytes(&key);
-                    h_flex()
-                        .id(SharedString::from(format!("database-key-{}", hex_bytes(&key))))
-                        .px_2()
-                        .cursor_pointer()
-                        .when(is_selected, |this| this.bg(cx.theme().colors().element_selected))
-                        .hover(|style| style.bg(cx.theme().colors().element_hover))
-                        .on_click(move |_, _, cx| {
-                            let key = key.clone();
-                            view.update(cx, |this, cx| this.open_key(key, cx)).ok();
-                        })
-                        .child(Label::new(label).size(LabelSize::Small).buffer_font(cx).truncate())
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>()
-        })
-        .track_scroll(&self.keys_scroll)
-        .flex_1();
-        let detail = match &self.key_detail {
-            None => Label::new("Pick a key.").size(LabelSize::Small).color(Color::Muted).into_any_element(),
-            Some(Fetch::Loading) => Label::new("Loading…").size(LabelSize::Small).color(Color::Muted).into_any_element(),
-            Some(Fetch::Failed(message)) => Label::new(message.clone()).size(LabelSize::Small).color(Color::Error).into_any_element(),
-            Some(Fetch::Loaded(detail)) => {
-                let key = self.selected_key.clone().unwrap_or_default();
-                let value = match (&detail.value, detail.info.kind.as_str()) {
-                    (Some(value), _) => {
-                        let shown = if self.hex {
-                            hex_bytes(value)
-                        } else {
-                            String::from_utf8(value.clone()).unwrap_or_else(|_| escape_bytes(value))
-                        };
-                        let lines = shown.lines().map(|line| SharedString::from(line.to_string())).collect::<Vec<_>>();
-                        render_lines("database-value", lines, &self.lines_scroll, cx)
-                    }
-                    (None, "none") => Label::new("The key no longer exists.").size(LabelSize::Small).color(Color::Warning).into_any_element(),
-                    (None, kind) => Label::new(format!("A viewer for {kind} values comes next.")).size(LabelSize::Small).color(Color::Muted).into_any_element(),
-                };
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .gap_2()
-                    .child(Label::new(escape_bytes(&key)).buffer_font(cx))
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .child(Label::new(detail.info.kind.clone()).size(LabelSize::Small))
-                            .child(Label::new(format!("TTL: {}", describe_ttl(detail.info.ttl_ms))).size(LabelSize::Small).color(Color::Muted))
-                            .child(div().flex_1())
-                            .when(detail.value.is_some(), |this| {
-                                this.child(
-                                    Button::new("database-hex", if self.hex { "Show text" } else { "Show hex" })
-                                        .label_size(LabelSize::Small)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.hex = !this.hex;
-                                            cx.notify();
-                                        })),
-                                )
-                            }),
-                    )
-                    .child(value)
-                    .into_any_element()
-            }
-        };
-        v_flex()
-            .size_full()
-            .gap_2()
-            .child(self.render_header(connection, connection.name.clone(), cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().child(boxed(self.pattern.clone(), cx)))
-                    .child(Button::new("database-scan", "Scan").style(ButtonStyle::Filled).on_click(cx.listener(|this, _, _, cx| this.scan(true, cx)))),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .gap_3()
-                    .child(
-                        v_flex()
-                            .w(px(360.))
-                            .flex_none()
-                            .h_full()
-                            .gap_1()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Label::new(format!(
-                                            "{} keys{}",
-                                            self.keys.len(),
-                                            if self.cursor.is_some() { " so far" } else { "" }
-                                        ))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                    )
-                                    .child(div().flex_1())
-                                    .when(self.cursor.is_some(), |this| {
-                                        this.child(
-                                            Button::new("database-scan-more", if self.scanning { "Scanning…" } else { "Load more" })
-                                                .label_size(LabelSize::Small)
-                                                .disabled(self.scanning)
-                                                .on_click(cx.listener(|this, _, _, cx| this.scan(false, cx))),
-                                        )
-                                    }),
-                            )
-                            .when_some(self.scan_error.clone(), |this, message| this.child(Label::new(message).size(LabelSize::Small).color(Color::Error)))
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .py_1()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(colors.border)
-                                    .bg(colors.editor_background)
-                                    .child(list),
-                            ),
-                    )
-                    .child(v_flex().flex_1().min_w_0().h_full().child(detail)),
-            )
-            .into_any_element()
     }
 }
 
 impl Render for DatabaseView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connection = self.active_connection().cloned();
-        let full_bleed = self.form.is_none() && matches!(self.session, Some(Session::Mongo(_)));
+        let full_bleed = self.form.is_none() && self.session.is_some();
         let main = match (&self.form, &connection, &self.session) {
             (Some(form), _, _) => self.render_form(form, cx),
             (None, Some(connection), Some(Session::Mongo(_))) => self.render_mongo(connection, cx),
@@ -1009,34 +1117,32 @@ impl Render for DatabaseView {
             (None, Some(connection), None) => v_flex()
                 .gap_3()
                 .child(self.render_header(connection, connection.name.clone(), cx))
-                .child(Label::new(self.status.clone().unwrap_or_else(|| "Not connected.".into())).color(Color::Muted))
+                .child(
+                    Label::new(
+                        self.status
+                            .clone()
+                            .unwrap_or_else(|| "Not connected.".into()),
+                    )
+                    .color(Color::Muted),
+                )
                 .into_any_element(),
-            (None, None, _) => Label::new("Pick a connection on the left, or add one.").color(Color::Muted).into_any_element(),
+            (None, None, _) => Label::new("Pick a connection on the left, or add one.")
+                .color(Color::Muted)
+                .into_any_element(),
         };
         h_flex()
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.render_sidebar(cx))
-            // Mongo pages run edge to edge like Compass, starting with their tab strip.
-            .child(v_flex().flex_1().min_w_0().h_full().when(!full_bleed, |this| this.p_4()).child(main))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_bytes_never_look_alike() {
-        assert_eq!(escape_bytes(b"user:1"), "user:1");
-        assert_eq!(escape_bytes(b"a\x00\xff"), "a\\x00\\xff");
-        // A real backslash must not read like an escape.
-        assert_eq!(escape_bytes(b"a\\x00"), "a\\\\x00");
-        assert_ne!(escape_bytes(b"a\\x00"), escape_bytes(b"a\x00"));
-        assert_eq!(hex_bytes(b"\x01\xab"), "01 ab");
-        assert_eq!(describe_ttl(-1), "no expiry");
-        assert_eq!(describe_ttl(-2), "key does not exist");
-        assert_eq!(describe_ttl(65_000), "65 s");
+            // Mongo and Redis pages run edge to edge like Compass and RedisInsight.
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .when(!full_bleed, |this| this.p_4())
+                    .child(main),
+            )
     }
 }

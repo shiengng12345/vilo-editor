@@ -1,7 +1,8 @@
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail};
 use fred::{
     cmd,
-    prelude::{Builder, Client, ClientLike as _, Config, Value},
+    interfaces::ClusterInterface as _,
+    prelude::{Builder, Client, ClientLike as _, Config, Server, Value},
 };
 
 /// Keys and values stay bytes end to end; text, hex and base64 are display choices made elsewhere.
@@ -9,6 +10,7 @@ pub type Bytes = Vec<u8>;
 
 pub struct RedisSession {
     client: Client,
+    clustered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,13 +28,421 @@ pub struct KeyInfo {
     pub ttl_ms: i64,
 }
 
+/// One server to SCAN: the only one, or one primary of a cluster.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanNode {
+    pub label: String,
+    server: Option<Server>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamEntry {
+    pub id: String,
+    pub fields: Vec<(Bytes, Bytes)>,
+}
+
+/// What a Workbench command may do. Only reads run in this release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    Read,
+    Write,
+    /// Blocks the server, wipes data, changes configuration or exposes every command; refused.
+    Dangerous,
+}
+
+const READ_COMMANDS: &[&str] = &[
+    "GET",
+    "MGET",
+    "GETRANGE",
+    "STRLEN",
+    "EXISTS",
+    "TYPE",
+    "TTL",
+    "PTTL",
+    "EXPIRETIME",
+    "PEXPIRETIME",
+    "DBSIZE",
+    "SCAN",
+    "HGET",
+    "HMGET",
+    "HGETALL",
+    "HKEYS",
+    "HVALS",
+    "HLEN",
+    "HEXISTS",
+    "HSTRLEN",
+    "HSCAN",
+    "HRANDFIELD",
+    "LRANGE",
+    "LINDEX",
+    "LLEN",
+    "LPOS",
+    "SMEMBERS",
+    "SISMEMBER",
+    "SMISMEMBER",
+    "SCARD",
+    "SSCAN",
+    "SRANDMEMBER",
+    "SINTER",
+    "SUNION",
+    "SDIFF",
+    "SINTERCARD",
+    "ZRANGE",
+    "ZRANGEBYSCORE",
+    "ZRANGEBYLEX",
+    "ZREVRANGE",
+    "ZREVRANGEBYSCORE",
+    "ZSCORE",
+    "ZMSCORE",
+    "ZRANK",
+    "ZREVRANK",
+    "ZCARD",
+    "ZCOUNT",
+    "ZLEXCOUNT",
+    "ZSCAN",
+    "ZRANDMEMBER",
+    "XRANGE",
+    "XREVRANGE",
+    "XLEN",
+    "XINFO",
+    "XPENDING",
+    "GETBIT",
+    "BITCOUNT",
+    "BITPOS",
+    "PFCOUNT",
+    "GEOPOS",
+    "GEODIST",
+    "GEOHASH",
+    "GEOSEARCH",
+    "OBJECT",
+    "MEMORY",
+    "INFO",
+    "TIME",
+    "PING",
+    "ECHO",
+    "LASTSAVE",
+    "ROLE",
+    "SLOWLOG",
+    "LOLWUT",
+    "COMMAND",
+    "JSON.GET",
+    "JSON.MGET",
+    "JSON.TYPE",
+    "JSON.STRLEN",
+    "JSON.ARRLEN",
+    "JSON.OBJKEYS",
+    "JSON.OBJLEN",
+    "CLUSTER",
+];
+
+const DANGEROUS_COMMANDS: &[&str] = &[
+    "KEYS",
+    "FLUSHALL",
+    "FLUSHDB",
+    "CONFIG",
+    "SHUTDOWN",
+    "DEBUG",
+    "MONITOR",
+    "SUBSCRIBE",
+    "PSUBSCRIBE",
+    "SSUBSCRIBE",
+    "SYNC",
+    "PSYNC",
+    "REPLICAOF",
+    "SLAVEOF",
+    "FAILOVER",
+    "MIGRATE",
+    "SCRIPT",
+    "FUNCTION",
+    "EVAL",
+    "EVALSHA",
+    "EVAL_RO",
+    "EVALSHA_RO",
+    "FCALL",
+    "FCALL_RO",
+    "MODULE",
+    "ACL",
+    "CLIENT",
+    "SAVE",
+    "BGSAVE",
+    "BGREWRITEAOF",
+    "SWAPDB",
+    "BLPOP",
+    "BRPOP",
+    "BLMOVE",
+    "BZPOPMIN",
+    "BZPOPMAX",
+    "BLMPOP",
+    "BZMPOP",
+    "XREAD",
+    "XREADGROUP",
+    "WAIT",
+    "WAITAOF",
+    "RESET",
+    "QUIT",
+    "SELECT",
+];
+
+/// Commands whose safety depends on the subcommand, with the read-only subcommands allowed.
+const READ_SUBCOMMANDS: &[(&str, &[&str])] = &[
+    (
+        "CLUSTER",
+        &[
+            "INFO",
+            "NODES",
+            "SLOTS",
+            "SHARDS",
+            "KEYSLOT",
+            "COUNTKEYSINSLOT",
+            "MYID",
+            "MYSHARDID",
+            "LINKS",
+            "HELP",
+        ],
+    ),
+    ("SLOWLOG", &["GET", "LEN", "HELP"]),
+    (
+        "OBJECT",
+        &["ENCODING", "FREQ", "IDLETIME", "REFCOUNT", "HELP"],
+    ),
+    (
+        "MEMORY",
+        &["USAGE", "STATS", "DOCTOR", "MALLOC-STATS", "HELP"],
+    ),
+    ("XINFO", &["STREAM", "GROUPS", "CONSUMERS", "HELP"]),
+    (
+        "COMMAND",
+        &[
+            "COUNT",
+            "DOCS",
+            "INFO",
+            "LIST",
+            "GETKEYS",
+            "GETKEYSANDFLAGS",
+            "HELP",
+        ],
+    ),
+];
+
+/// Classifies a whole command line, so `CLUSTER RESET` or `SLOWLOG RESET` is not let through as a read.
+pub fn classify_words(words: &[Bytes]) -> CommandKind {
+    let Some(first) = words.first() else {
+        return CommandKind::Write;
+    };
+    let name = String::from_utf8_lossy(first).to_ascii_uppercase();
+    match classify(&name) {
+        CommandKind::Read => match READ_SUBCOMMANDS
+            .iter()
+            .find(|(command, _)| *command == name)
+        {
+            Some((_, allowed)) => {
+                let sub = words
+                    .get(1)
+                    .map(|sub| String::from_utf8_lossy(sub).to_ascii_uppercase())
+                    .unwrap_or_default();
+                if allowed.contains(&sub.as_str()) {
+                    CommandKind::Read
+                } else {
+                    CommandKind::Dangerous
+                }
+            }
+            None => CommandKind::Read,
+        },
+        other => other,
+    }
+}
+
+/// Unknown commands count as writes: a command Vilo cannot place is not assumed safe.
+pub fn classify(command: &str) -> CommandKind {
+    let command = command.to_ascii_uppercase();
+    if DANGEROUS_COMMANDS.contains(&command.as_str()) {
+        CommandKind::Dangerous
+    } else if READ_COMMANDS.contains(&command.as_str()) {
+        CommandKind::Read
+    } else {
+        CommandKind::Write
+    }
+}
+
+/// Splits a Workbench line the way redis-cli does: spaces separate words, quotes group them, and inside
+/// double quotes `\n`, `\t`, `\"`, `\\` and `\xHH` escape bytes.
+pub fn split_command(line: &str) -> Result<Vec<Bytes>> {
+    let mut words = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while chars
+            .peek()
+            .is_some_and(|character| character.is_whitespace())
+        {
+            chars.next();
+        }
+        let Some(&first) = chars.peek() else {
+            return Ok(words);
+        };
+        let mut word = Vec::new();
+        match first {
+            '"' => {
+                chars.next();
+                loop {
+                    match chars.next() {
+                        None => bail!("A quoted word is missing its closing \""),
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some('n') => word.push(b'\n'),
+                            Some('t') => word.push(b'\t'),
+                            Some('r') => word.push(b'\r'),
+                            Some('x') => {
+                                let hex = chars
+                                    .next()
+                                    .into_iter()
+                                    .chain(chars.next())
+                                    .collect::<String>();
+                                word.push(
+                                    u8::from_str_radix(&hex, 16)
+                                        .map_err(|_| anyhow!("\\x needs two hex digits"))?,
+                                );
+                            }
+                            Some(other) => word.extend(other.to_string().as_bytes()),
+                            None => bail!("A quoted word ends in \\"),
+                        },
+                        Some(other) => word.extend(other.to_string().as_bytes()),
+                    }
+                }
+            }
+            '\'' => {
+                chars.next();
+                loop {
+                    match chars.next() {
+                        None => bail!("A quoted word is missing its closing '"),
+                        Some('\'') => break,
+                        Some(other) => word.extend(other.to_string().as_bytes()),
+                    }
+                }
+            }
+            _ => {
+                while let Some(&character) = chars.peek() {
+                    if character.is_whitespace() {
+                        break;
+                    }
+                    word.extend(character.to_string().as_bytes());
+                    chars.next();
+                }
+            }
+        }
+        words.push(word);
+    }
+}
+
+/// Text for bytes in redis-cli's quoted style: printable ASCII as is, everything else escaped.
+pub fn quote_bytes(bytes: &[u8]) -> String {
+    let mut text = String::from("\"");
+    for byte in bytes {
+        match byte {
+            b'"' => text.push_str("\\\""),
+            b'\\' => text.push_str("\\\\"),
+            b'\n' => text.push_str("\\n"),
+            b' '..=b'~' => text.push(*byte as char),
+            _ => text.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    text.push('"');
+    text
+}
+
+/// A reply as redis-cli prints it.
+pub fn format_reply(value: &Value) -> Vec<String> {
+    fn push(value: &Value, indent: usize, lines: &mut Vec<String>, prefix: String) {
+        let pad = " ".repeat(indent);
+        match value {
+            Value::Null => lines.push(format!("{pad}{prefix}(nil)")),
+            Value::Integer(number) => lines.push(format!("{pad}{prefix}(integer) {number}")),
+            Value::Double(number) => lines.push(format!("{pad}{prefix}(double) {number}")),
+            Value::Boolean(flag) => lines.push(format!("{pad}{prefix}({flag})")),
+            Value::String(text) => {
+                lines.push(format!("{pad}{prefix}{}", quote_bytes(text.as_bytes())))
+            }
+            Value::Bytes(bytes) => lines.push(format!("{pad}{prefix}{}", quote_bytes(bytes))),
+            Value::Array(items) if items.is_empty() => {
+                lines.push(format!("{pad}{prefix}(empty array)"))
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let marker = format!("{}) ", index + 1);
+                    if index == 0 {
+                        push(item, indent, lines, format!("{prefix}{marker}"));
+                    } else {
+                        push(item, indent + prefix.len(), lines, marker);
+                    }
+                }
+            }
+            Value::Map(map) => {
+                for (index, (key, item)) in map.clone().inner().iter().enumerate() {
+                    let key = quote_bytes(key.as_bytes());
+                    let marker = format!("{}# {key} => ", index + 1);
+                    if index == 0 {
+                        push(item, indent, lines, format!("{prefix}{marker}"));
+                    } else {
+                        push(item, indent + prefix.len(), lines, marker);
+                    }
+                }
+            }
+            other => lines.push(format!("{pad}{prefix}{other:?}")),
+        }
+    }
+    let mut lines = Vec::new();
+    push(value, 0, &mut lines, String::new());
+    lines
+}
+
 fn bytes_arg(bytes: &[u8]) -> Value {
     Value::Bytes(bytes.to_vec().into())
+}
+
+fn value_bytes(value: &Value) -> Bytes {
+    value
+        .as_bytes()
+        .map(<[u8]>::to_vec)
+        .unwrap_or_else(|| value.as_string().unwrap_or_default().into_bytes())
+}
+
+/// RESP2 sends pairs flat ([a, b, a, b]); RESP3 sends maps or nested pairs. Both come back as pairs.
+fn pairs(value: Value) -> Vec<(Value, Value)> {
+    match value {
+        Value::Map(map) => map
+            .inner()
+            .into_iter()
+            .map(|(key, value)| (Value::from(key), value))
+            .collect(),
+        Value::Array(items)
+            if items
+                .iter()
+                .all(|item| matches!(item, Value::Array(pair) if pair.len() == 2))
+                && !items.is_empty() =>
+        {
+            items
+                .into_iter()
+                .filter_map(|item| {
+                    let mut pair = item.into_array().into_iter();
+                    Some((pair.next()?, pair.next()?))
+                })
+                .collect()
+        }
+        Value::Array(items) => {
+            let mut iter = items.into_iter();
+            let mut out = Vec::new();
+            while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
+                out.push((key, value));
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
 }
 
 impl RedisSession {
     pub async fn connect(url: &str) -> Result<Self> {
         let config = Config::from_url(url).context("The Redis URL is not valid")?;
+        let clustered = config.server.is_clustered();
         let mut builder = Builder::from_config(config);
         builder.with_connection_config(|connection| {
             // A command whose answer was lost is reported as unknown rather than sent again.
@@ -40,40 +450,358 @@ impl RedisSession {
         });
         let client = builder.build()?;
         client.init().await.context("Could not reach Redis")?;
-        Ok(Self { client })
+        Ok(Self { client, clustered })
     }
 
-    /// One SCAN call. COUNT is a hint, so a page may hold more or fewer keys, or none, and keys may repeat across pages.
-    // shortcut: walks the node the client is connected to; a Redis Cluster needs one cursor per primary, which comes with Cluster support.
-    pub async fn scan(&self, cursor: &str, pattern: &str, count: u32, kind: Option<&str>) -> Result<ScanPage> {
-        let mut args = vec![Value::from(cursor.to_string()), "MATCH".into(), bytes_arg(pattern.as_bytes()), "COUNT".into(), Value::from(count as i64)];
+    /// The servers a full SCAN must walk: each cluster primary, or the single server.
+    pub fn scan_nodes(&self) -> Vec<ScanNode> {
+        if self.clustered
+            && let Some(state) = self.client.cached_cluster_state()
+        {
+            return state
+                .unique_primary_nodes()
+                .into_iter()
+                .map(|server| ScanNode {
+                    label: server.to_string(),
+                    server: Some(server),
+                })
+                .collect();
+        }
+        vec![ScanNode {
+            label: "server".into(),
+            server: None,
+        }]
+    }
+
+    async fn call(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
+        Ok(self.client.custom(cmd!(name), args).await?)
+    }
+
+    /// One SCAN call on one node. COUNT is a hint, so a page may hold more or fewer keys, or none, and keys may repeat.
+    pub async fn scan(
+        &self,
+        node: &ScanNode,
+        cursor: &str,
+        pattern: &str,
+        count: u32,
+        kind: Option<&str>,
+    ) -> Result<ScanPage> {
+        let mut args = vec![
+            Value::from(cursor.to_string()),
+            "MATCH".into(),
+            bytes_arg(pattern.as_bytes()),
+            "COUNT".into(),
+            Value::from(count as i64),
+        ];
         if let Some(kind) = kind {
             args.push("TYPE".into());
             args.push(Value::from(kind.to_string()));
         }
-        let reply: Value = self.client.custom(cmd!("SCAN"), args).await?;
+        let reply: Value = match &node.server {
+            Some(server) => {
+                self.client
+                    .with_cluster_node(server.clone())
+                    .custom(cmd!("SCAN"), args)
+                    .await?
+            }
+            None => self.call("SCAN", args).await?,
+        };
         let mut parts = reply.into_array().into_iter();
-        let cursor = parts.next().and_then(|cursor| cursor.as_string()).context("SCAN returned no cursor")?;
+        let cursor = parts
+            .next()
+            .and_then(|cursor| cursor.as_string())
+            .context("SCAN returned no cursor")?;
         let keys = parts
             .next()
-            .map(|keys| keys.into_array().into_iter().filter_map(|key| key.as_bytes().map(<[u8]>::to_vec)).collect())
+            .map(|keys| keys.into_array().iter().map(value_bytes).collect())
             .unwrap_or_default();
         Ok(ScanPage { keys, cursor })
     }
 
     pub async fn key_info(&self, key: &[u8]) -> Result<KeyInfo> {
-        let kind: Value = self.client.custom(cmd!("TYPE"), vec![bytes_arg(key)]).await?;
-        let ttl: Value = self.client.custom(cmd!("PTTL"), vec![bytes_arg(key)]).await?;
+        let kind = self.call("TYPE", vec![bytes_arg(key)]).await?;
+        let ttl = self.call("PTTL", vec![bytes_arg(key)]).await?;
         Ok(KeyInfo {
             kind: kind.as_string().unwrap_or_else(|| "none".into()),
             ttl_ms: ttl.as_i64().context("PTTL returned no number")?,
         })
     }
 
+    /// Items in the key: string bytes, hash fields, list, set and sorted set members, stream entries.
+    pub async fn length(&self, key: &[u8], kind: &str) -> Result<Option<u64>> {
+        let command = match kind {
+            "string" => "STRLEN",
+            "hash" => "HLEN",
+            "list" => "LLEN",
+            "set" => "SCARD",
+            "zset" => "ZCARD",
+            "stream" => "XLEN",
+            _ => return Ok(None),
+        };
+        Ok(self.call(command, vec![bytes_arg(key)]).await?.as_u64())
+    }
+
+    /// Keys in the current database of one node (`None` for the node the client is connected to).
+    pub async fn dbsize(&self, node: &ScanNode) -> Result<u64> {
+        let reply: Value = match &node.server {
+            Some(server) => {
+                self.client
+                    .with_cluster_node(server.clone())
+                    .custom(cmd!("DBSIZE"), Vec::<Value>::new())
+                    .await?
+            }
+            None => self.call("DBSIZE", Vec::new()).await?,
+        };
+        reply.as_u64().context("DBSIZE returned no number")
+    }
+
+    /// Type, TTL and (when asked) memory for many keys at once. The commands go out together and fred
+    /// pipelines them on the connection, instead of one round trip per key.
+    pub async fn key_meta(&self, keys: &[Bytes], with_size: bool) -> Vec<(KeyInfo, Option<u64>)> {
+        let lookups = keys.iter().map(|key| async move {
+            let (kind, ttl, size) = futures::join!(
+                self.call("TYPE", vec![bytes_arg(key)]),
+                self.call("PTTL", vec![bytes_arg(key)]),
+                async {
+                    if with_size {
+                        self.call("MEMORY", vec!["USAGE".into(), bytes_arg(key)])
+                            .await
+                            .ok()
+                            .and_then(|size| size.as_u64())
+                    } else {
+                        None
+                    }
+                }
+            );
+            let info = KeyInfo {
+                kind: kind
+                    .ok()
+                    .and_then(|kind| kind.as_string())
+                    .unwrap_or_else(|| "none".into()),
+                ttl_ms: ttl.ok().and_then(|ttl| ttl.as_i64()).unwrap_or(-2),
+            };
+            (info, size)
+        });
+        futures::future::join_all(lookups).await
+    }
+
+    /// Memory the key takes on the server, which is not the value's length.
+    pub async fn memory_usage(&self, key: &[u8]) -> Result<Option<u64>> {
+        Ok(self
+            .call("MEMORY", vec!["USAGE".into(), bytes_arg(key)])
+            .await?
+            .as_u64())
+    }
+
     /// The raw value of a string key, or `None` when it does not exist.
     pub async fn get_string(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let value: Value = self.client.custom(cmd!("GET"), vec![bytes_arg(key)]).await?;
+        let value = self.call("GET", vec![bytes_arg(key)]).await?;
         Ok(value.as_bytes().map(<[u8]>::to_vec))
+    }
+
+    pub async fn hash_page(
+        &self,
+        key: &[u8],
+        cursor: &str,
+        count: u32,
+    ) -> Result<(Vec<(Bytes, Bytes)>, String)> {
+        let reply = self
+            .call(
+                "HSCAN",
+                vec![
+                    bytes_arg(key),
+                    Value::from(cursor.to_string()),
+                    "COUNT".into(),
+                    Value::from(count as i64),
+                ],
+            )
+            .await?;
+        let mut parts = reply.into_array().into_iter();
+        let cursor = parts
+            .next()
+            .and_then(|cursor| cursor.as_string())
+            .context("HSCAN returned no cursor")?;
+        let fields = parts
+            .next()
+            .map(pairs)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(field, value)| (value_bytes(&field), value_bytes(&value)))
+            .collect();
+        Ok((fields, cursor))
+    }
+
+    pub async fn set_page(
+        &self,
+        key: &[u8],
+        cursor: &str,
+        count: u32,
+    ) -> Result<(Vec<Bytes>, String)> {
+        let reply = self
+            .call(
+                "SSCAN",
+                vec![
+                    bytes_arg(key),
+                    Value::from(cursor.to_string()),
+                    "COUNT".into(),
+                    Value::from(count as i64),
+                ],
+            )
+            .await?;
+        let mut parts = reply.into_array().into_iter();
+        let cursor = parts
+            .next()
+            .and_then(|cursor| cursor.as_string())
+            .context("SSCAN returned no cursor")?;
+        let members = parts
+            .next()
+            .map(|members| members.into_array().iter().map(value_bytes).collect())
+            .unwrap_or_default();
+        Ok((members, cursor))
+    }
+
+    /// List items from `start` to `stop`, inclusive, by position.
+    pub async fn list_range(&self, key: &[u8], start: i64, stop: i64) -> Result<Vec<Bytes>> {
+        let reply = self
+            .call(
+                "LRANGE",
+                vec![bytes_arg(key), Value::from(start), Value::from(stop)],
+            )
+            .await?;
+        Ok(reply.into_array().iter().map(value_bytes).collect())
+    }
+
+    /// Sorted set members with their scores, lowest score first, by position.
+    pub async fn zset_range(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<(Bytes, String)>> {
+        let reply = self
+            .call(
+                "ZRANGE",
+                vec![
+                    bytes_arg(key),
+                    Value::from(start),
+                    Value::from(stop),
+                    "WITHSCORES".into(),
+                ],
+            )
+            .await?;
+        Ok(pairs(reply)
+            .into_iter()
+            .map(|(member, score)| {
+                (
+                    value_bytes(&member),
+                    score
+                        .as_string()
+                        .or_else(|| score.as_f64().map(|score| score.to_string()))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Stream entries after `after` (exclusive), oldest first.
+    pub async fn stream_range(
+        &self,
+        key: &[u8],
+        after: Option<&str>,
+        count: u32,
+    ) -> Result<Vec<StreamEntry>> {
+        let start = after.map_or_else(|| "-".to_string(), |id| format!("({id}"));
+        let reply = self
+            .call(
+                "XRANGE",
+                vec![
+                    bytes_arg(key),
+                    Value::from(start),
+                    "+".into(),
+                    "COUNT".into(),
+                    Value::from(count as i64),
+                ],
+            )
+            .await?;
+        Ok(reply
+            .into_array()
+            .into_iter()
+            .filter_map(|entry| {
+                let mut parts = entry.into_array().into_iter();
+                let id = parts.next()?.as_string()?;
+                let fields = parts
+                    .next()
+                    .map(pairs)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(field, value)| (value_bytes(&field), value_bytes(&value)))
+                    .collect();
+                Some(StreamEntry { id, fields })
+            })
+            .collect())
+    }
+
+    /// Consumer groups of a stream: name, consumers, pending, last delivered id, as the server reports them.
+    pub async fn stream_groups(&self, key: &[u8]) -> Result<Vec<Vec<(String, String)>>> {
+        let reply = self
+            .call("XINFO", vec!["GROUPS".into(), bytes_arg(key)])
+            .await?;
+        Ok(reply
+            .into_array()
+            .into_iter()
+            .map(|group| {
+                pairs(group)
+                    .into_iter()
+                    .map(|(name, value)| {
+                        let text = value
+                            .as_string()
+                            .or_else(|| value.as_i64().map(|number| number.to_string()))
+                            .unwrap_or_else(|| format!("{value:?}"));
+                        (name.as_string().unwrap_or_default(), text)
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// A RedisJSON document as JSON text, when the module is loaded.
+    pub async fn json_get(&self, key: &[u8]) -> Result<Option<String>> {
+        Ok(self
+            .call("JSON.GET", vec![bytes_arg(key)])
+            .await?
+            .as_string())
+    }
+
+    pub async fn info(&self) -> Result<String> {
+        Ok(self
+            .call("INFO", Vec::new())
+            .await?
+            .as_string()
+            .unwrap_or_default())
+    }
+
+    /// Runs a Workbench command. Only reads are allowed in this release; the rest is refused before sending.
+    pub async fn run_read_command(&self, words: Vec<Bytes>) -> Result<Value> {
+        let (name, args) = words.split_first().context("Type a command")?;
+        let name = String::from_utf8_lossy(name).to_ascii_uppercase();
+        match classify_words(&words) {
+            CommandKind::Read => {}
+            CommandKind::Write => bail!(
+                "{name} changes data or is not known to Vilo; this release only runs read commands."
+            ),
+            CommandKind::Dangerous => bail!(
+                "{name} is blocked: it can stop the server, wipe data, change configuration or stream every command."
+            ),
+        }
+        let command =
+            fred::types::CustomCommand::new(name, fred::types::ClusterHash::FirstKey, false);
+        Ok(self
+            .client
+            .custom(
+                command,
+                args.iter().map(|arg| bytes_arg(arg)).collect::<Vec<_>>(),
+            )
+            .await?)
     }
 
     pub async fn quit(&self) -> Result<()> {
@@ -85,41 +813,282 @@ impl RedisSession {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_commands_are_split_and_classified() {
+        assert_eq!(
+            split_command(r#"GET "user:\x00\xff" 'a b'"#).unwrap(),
+            vec![b"GET".to_vec(), b"user:\x00\xff".to_vec(), b"a b".to_vec()]
+        );
+        assert_eq!(
+            split_command("  HGETALL   h  ").unwrap(),
+            vec![b"HGETALL".to_vec(), b"h".to_vec()]
+        );
+        assert!(split_command("GET \"open").is_err());
+        assert_eq!(classify("get"), CommandKind::Read);
+        assert_eq!(classify("SET"), CommandKind::Write);
+        assert_eq!(classify("FLUSHALL"), CommandKind::Dangerous);
+        assert_eq!(classify("KEYS"), CommandKind::Dangerous);
+        assert_eq!(classify("SOMETHING.NEW"), CommandKind::Write);
+        let words = |line: &str| split_command(line).unwrap();
+        assert_eq!(classify_words(&words("CLUSTER INFO")), CommandKind::Read);
+        assert_eq!(
+            classify_words(&words("cluster reset hard")),
+            CommandKind::Dangerous
+        );
+        assert_eq!(
+            classify_words(&words("SLOWLOG RESET")),
+            CommandKind::Dangerous
+        );
+        assert_eq!(classify_words(&words("SLOWLOG GET 10")), CommandKind::Read);
+        assert_eq!(
+            classify_words(&words("MEMORY PURGE")),
+            CommandKind::Dangerous
+        );
+        assert_eq!(classify_words(&words("XINFO GROUPS s")), CommandKind::Read);
+        assert_eq!(quote_bytes(b"a\"\x00"), "\"a\\\"\\x00\"");
+        let reply = Value::Array(vec![Value::from("one"), Value::Integer(2), Value::Null]);
+        assert_eq!(
+            format_reply(&reply),
+            vec!["1) \"one\"", "2) (integer) 2", "3) (nil)"]
+        );
+        assert_eq!(
+            format_reply(&Value::Array(Vec::new())),
+            vec!["(empty array)"]
+        );
+    }
+
     /// Runs against a real server: `VILO_TEST_REDIS=redis://127.0.0.1:57379 cargo test -p vilo_database_core`.
     #[tokio::test]
-    async fn test_binary_keys_and_ttl_against_a_server() {
+    async fn test_reading_every_type_against_a_server() {
         let Ok(url) = std::env::var("VILO_TEST_REDIS") else {
             return;
         };
         let session = RedisSession::connect(&url).await.unwrap();
         let key = b"vilo_test:\x00\xff\xe4\xb8\xad".to_vec();
         let value = b"\x01\x02 not utf-8 \xff".to_vec();
-        let _: Value = session
-            .client
-            .custom(cmd!("SET"), vec![bytes_arg(&key), bytes_arg(&value), "PX".into(), Value::from(60_000_i64)])
+        session
+            .call(
+                "SET",
+                vec![
+                    bytes_arg(&key),
+                    bytes_arg(&value),
+                    "PX".into(),
+                    Value::from(60_000_i64),
+                ],
+            )
             .await
             .unwrap();
+        session
+            .call(
+                "DEL",
+                vec![
+                    "vilo_test:h".into(),
+                    "vilo_test:l".into(),
+                    "vilo_test:s".into(),
+                    "vilo_test:z".into(),
+                    "vilo_test:x".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        session
+            .call(
+                "HSET",
+                vec![
+                    "vilo_test:h".into(),
+                    "f1".into(),
+                    "v1".into(),
+                    "f2".into(),
+                    "v2".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        session
+            .call(
+                "RPUSH",
+                vec!["vilo_test:l".into(), "a".into(), "b".into(), "c".into()],
+            )
+            .await
+            .unwrap();
+        session
+            .call("SADD", vec!["vilo_test:s".into(), "m1".into(), "m2".into()])
+            .await
+            .unwrap();
+        session
+            .call(
+                "ZADD",
+                vec![
+                    "vilo_test:z".into(),
+                    "1.5".into(),
+                    "low".into(),
+                    "9".into(),
+                    "high".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        session
+            .call(
+                "XADD",
+                vec![
+                    "vilo_test:x".into(),
+                    "*".into(),
+                    "event".into(),
+                    "login".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        session
+            .call(
+                "XGROUP",
+                vec![
+                    "CREATE".into(),
+                    "vilo_test:x".into(),
+                    "workers".into(),
+                    "0".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        for key in [
+            "vilo_test:h",
+            "vilo_test:l",
+            "vilo_test:s",
+            "vilo_test:z",
+            "vilo_test:x",
+        ] {
+            session
+                .call("PEXPIRE", vec![key.into(), Value::from(60_000_i64)])
+                .await
+                .unwrap();
+        }
 
+        let nodes = session.scan_nodes();
+        assert_eq!(nodes.len(), 1);
         let mut cursor = "0".to_string();
         let mut found = Vec::new();
         loop {
-            let page = session.scan(&cursor, "vilo_test:*", 100, Some("string")).await.unwrap();
+            let page = session
+                .scan(&nodes[0], &cursor, "vilo_test:*", 100, None)
+                .await
+                .unwrap();
             found.extend(page.keys);
             cursor = page.cursor;
             if cursor == "0" {
                 break;
             }
         }
-        assert!(found.contains(&key), "SCAN must return the key with its exact bytes");
-
+        assert!(
+            found.contains(&key),
+            "SCAN must return the key with its exact bytes"
+        );
         let info = session.key_info(&key).await.unwrap();
         assert_eq!(info.kind, "string");
         assert!((1..=60_000).contains(&info.ttl_ms));
-        assert_eq!(session.get_string(&key).await.unwrap(), Some(value));
+        assert_eq!(session.get_string(&key).await.unwrap(), Some(value.clone()));
+        assert_eq!(
+            session.length(&key, "string").await.unwrap(),
+            Some(value.len() as u64)
+        );
+        assert!(session.memory_usage(&key).await.unwrap().is_some());
+        assert!(session.dbsize(&nodes[0]).await.unwrap() >= 6);
+        let meta = session
+            .key_meta(
+                &[
+                    key.clone(),
+                    b"vilo_test:h".to_vec(),
+                    b"vilo_test:missing".to_vec(),
+                ],
+                true,
+            )
+            .await;
+        assert_eq!(
+            meta.iter()
+                .map(|(info, _)| info.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["string", "hash", "none"]
+        );
+        assert!(meta[0].1.is_some() && meta[2].0.ttl_ms == -2);
+        assert!(
+            session
+                .run_read_command(split_command("SLOWLOG RESET").unwrap())
+                .await
+                .is_err()
+        );
 
-        let missing = session.key_info(b"vilo_test:missing").await.unwrap();
-        assert_eq!((missing.kind.as_str(), missing.ttl_ms), ("none", -2));
-        assert_eq!(session.get_string(b"vilo_test:missing").await.unwrap(), None);
+        let (mut fields, _) = session.hash_page(b"vilo_test:h", "0", 100).await.unwrap();
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec![
+                (b"f1".to_vec(), b"v1".to_vec()),
+                (b"f2".to_vec(), b"v2".to_vec())
+            ]
+        );
+        assert_eq!(
+            session.list_range(b"vilo_test:l", 1, 2).await.unwrap(),
+            vec![b"b".to_vec(), b"c".to_vec()]
+        );
+        let (mut members, _) = session.set_page(b"vilo_test:s", "0", 100).await.unwrap();
+        members.sort();
+        assert_eq!(members, vec![b"m1".to_vec(), b"m2".to_vec()]);
+        assert_eq!(
+            session.zset_range(b"vilo_test:z", 0, -1).await.unwrap(),
+            vec![
+                (b"low".to_vec(), "1.5".to_string()),
+                (b"high".to_vec(), "9".to_string())
+            ]
+        );
+        let entries = session
+            .stream_range(b"vilo_test:x", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries[0].fields,
+            vec![(b"event".to_vec(), b"login".to_vec())]
+        );
+        assert!(
+            session
+                .stream_range(b"vilo_test:x", Some(&entries[0].id), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let groups = session.stream_groups(b"vilo_test:x").await.unwrap();
+        assert!(
+            groups[0]
+                .iter()
+                .any(|(name, value)| name == "name" && value == "workers")
+        );
+        assert!(session.info().await.unwrap().contains("redis_version"));
+
+        let reply = session
+            .run_read_command(split_command("LRANGE vilo_test:l 0 -1").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            format_reply(&reply),
+            vec!["1) \"a\"", "2) \"b\"", "3) \"c\""]
+        );
+        assert!(
+            session
+                .run_read_command(split_command("SET vilo_test:new 1").unwrap())
+                .await
+                .is_err()
+        );
+        assert!(
+            session
+                .run_read_command(split_command("FLUSHALL").unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            session.key_info(b"vilo_test:new").await.unwrap().kind,
+            "none",
+            "a refused write must not reach the server"
+        );
         session.quit().await.unwrap();
     }
 }

@@ -14,9 +14,14 @@ use std::{
 use anyhow::{Result, anyhow};
 use collections::{HashMap, HashSet};
 use editor::Editor;
-use gpui::{ClipboardItem, Entity, ListHorizontalSizingBehavior, Task, UniformListScrollHandle, Window, prelude::*, uniform_list};
+use gpui::{
+    ClipboardItem, Entity, ListHorizontalSizingBehavior, Task, UniformListScrollHandle, Window,
+    prelude::*, uniform_list,
+};
 use serde::{Deserialize, Serialize};
-use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, TintColor, Tooltip, prelude::*};
+use ui::{
+    Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, TintColor, Tooltip, prelude::*,
+};
 use vilo_database_core::{
     bson::{Bson, Document},
     display::{Shown, ValueKind, human_date, show, to_canonical_json},
@@ -24,7 +29,10 @@ use vilo_database_core::{
     shell::{parse_pipeline, parse_query},
 };
 
-use crate::{COUNT_TIME_LIMIT, DatabaseView, Fetch, QUERY_TIME_LIMIT, boxed, editor, fetched, render_lines, run};
+use crate::{
+    COUNT_TIME_LIMIT, DatabaseView, Fetch, QUERY_TIME_LIMIT, boxed, editor, fetched, render_lines,
+    run,
+};
 
 /// Top-level fields shown per document before "Show N more fields", as Compass does.
 const FIELDS_SHOWN: usize = 25;
@@ -139,7 +147,12 @@ pub(crate) struct MongoTab {
 }
 
 impl MongoTab {
-    pub(crate) fn new(database: String, collection: String, window: &mut Window, cx: &mut gpui::App) -> Self {
+    pub(crate) fn new(
+        database: String,
+        collection: String,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Self {
         let pipeline = cx.new(|cx| {
             let mut editor = Editor::auto_height(4, 16, window, cx);
             editor.set_placeholder_text("[ { $match: { status: 'Success' } }, { $group: { _id: '$type', count: { $sum: 1 } } } ]", window, cx);
@@ -151,7 +164,13 @@ impl MongoTab {
             sub_tab: SubTab::Documents,
             panel: Panel::Results,
             code_language: CodeLanguage::Shell,
-            filter: editor("Type a query: { field: 'value' } or Generate query", "", false, window, cx),
+            filter: editor(
+                "Type a query: { field: 'value' } or Generate query",
+                "",
+                false,
+                window,
+                cx,
+            ),
             projection: editor("{ field: 0 }", "", false, window, cx),
             sort: editor("{ field: -1 }", "", false, window, cx),
             skip_editor: editor("0", "", false, window, cx),
@@ -211,8 +230,16 @@ pub(crate) struct SavedQuery {
 
 impl SavedQuery {
     fn label(&self) -> String {
-        let mut label = if self.filter.trim().is_empty() { "{}".to_string() } else { self.filter.trim().to_string() };
-        for (name, value) in [("project", &self.project), ("sort", &self.sort), ("skip", &self.skip)] {
+        let mut label = if self.filter.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            self.filter.trim().to_string()
+        };
+        for (name, value) in [
+            ("project", &self.project),
+            ("sort", &self.sort),
+            ("skip", &self.skip),
+        ] {
             if !value.trim().is_empty() {
                 label.push_str(&format!(" · {name} {}", value.trim()));
             }
@@ -221,14 +248,32 @@ impl SavedQuery {
     }
 
     fn same_query(&self, other: &SavedQuery) -> bool {
-        (&self.connection, &self.database, &self.collection, &self.filter, &self.project, &self.sort, &self.skip)
-            == (&other.connection, &other.database, &other.collection, &other.filter, &other.project, &other.sort, &other.skip)
+        (
+            &self.connection,
+            &self.database,
+            &self.collection,
+            &self.filter,
+            &self.project,
+            &self.sort,
+            &self.skip,
+        ) == (
+            &other.connection,
+            &other.database,
+            &other.collection,
+            &other.filter,
+            &other.project,
+            &other.sort,
+            &other.skip,
+        )
     }
 }
 
 /// Recent and starred queries; queries can hold player ids, so the user can clear them.
 pub(crate) fn load_history() -> Vec<SavedQuery> {
-    std::fs::read(history_path()).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+    std::fs::read(history_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 fn history_path() -> PathBuf {
@@ -251,9 +296,18 @@ fn value_at<'a>(document: &'a Document, path: &[String]) -> Option<&'a Bson> {
 
 #[derive(Clone)]
 enum RowKind {
-    Field { path: FieldPath, depth: usize },
-    MoreFields { hidden: usize },
-    MoreItems { path: FieldPath, depth: usize, hidden: usize },
+    Field {
+        path: FieldPath,
+        depth: usize,
+    },
+    MoreFields {
+        hidden: usize,
+    },
+    MoreItems {
+        path: FieldPath,
+        depth: usize,
+        hidden: usize,
+    },
     /// Space between two cards.
     Gap,
 }
@@ -280,8 +334,23 @@ fn kind_color(kind: ValueKind) -> Color {
 }
 
 impl MongoTab {
-    fn push_rows(&self, rows: &mut Vec<Row>, document: usize, path: FieldPath, value: &Bson, depth: usize) {
-        rows.push(Row { document, kind: RowKind::Field { path: path.clone(), depth }, first: false, last: false });
+    fn push_rows(
+        &self,
+        rows: &mut Vec<Row>,
+        document: usize,
+        path: FieldPath,
+        value: &Bson,
+        depth: usize,
+    ) {
+        rows.push(Row {
+            document,
+            kind: RowKind::Field {
+                path: path.clone(),
+                depth,
+            },
+            first: false,
+            last: false,
+        });
         if !self.expanded.contains(&(document, path.clone())) {
             return;
         }
@@ -294,14 +363,27 @@ impl MongoTab {
                 }
             }
             Bson::Array(items) => {
-                let shown = self.items_shown.get(&(document, path.clone())).copied().unwrap_or(ITEMS_SHOWN);
+                let shown = self
+                    .items_shown
+                    .get(&(document, path.clone()))
+                    .copied()
+                    .unwrap_or(ITEMS_SHOWN);
                 for (position, value) in items.iter().enumerate().take(shown) {
                     let mut child = path.clone();
                     child.push(position.to_string());
                     self.push_rows(rows, document, child, value, depth + 1);
                 }
                 if items.len() > shown {
-                    rows.push(Row { document, kind: RowKind::MoreItems { path, depth: depth + 1, hidden: items.len() - shown }, first: false, last: false });
+                    rows.push(Row {
+                        document,
+                        kind: RowKind::MoreItems {
+                            path,
+                            depth: depth + 1,
+                            hidden: items.len() - shown,
+                        },
+                        first: false,
+                        last: false,
+                    });
                 }
             }
             _ => {}
@@ -312,16 +394,29 @@ impl MongoTab {
         let mut rows = Vec::new();
         for (index, document) in documents.iter().enumerate() {
             if index > 0 {
-                rows.push(Row { document: index, kind: RowKind::Gap, first: false, last: false });
+                rows.push(Row {
+                    document: index,
+                    kind: RowKind::Gap,
+                    first: false,
+                    last: false,
+                });
             }
             let start = rows.len();
             let all = self.show_all.contains(&index);
-            for (key, value) in document.iter().take(if all { usize::MAX } else { FIELDS_SHOWN }) {
+            for (key, value) in document
+                .iter()
+                .take(if all { usize::MAX } else { FIELDS_SHOWN })
+            {
                 self.push_rows(&mut rows, index, vec![key.clone()], value, 0);
             }
             let hidden = document.len().saturating_sub(FIELDS_SHOWN);
             if hidden > 0 && !all {
-                rows.push(Row { document: index, kind: RowKind::MoreFields { hidden }, first: false, last: false });
+                rows.push(Row {
+                    document: index,
+                    kind: RowKind::MoreFields { hidden },
+                    first: false,
+                    last: false,
+                });
             }
             if rows.len() > start {
                 rows[start].first = true;
@@ -368,13 +463,19 @@ fn csv_field(value: Option<&Bson>) -> String {
     let text = match value {
         None => String::new(),
         Some(Bson::String(text)) => text.clone(),
-        Some(value @ (Bson::Document(_) | Bson::Array(_))) => value.clone().into_canonical_extjson().to_string(),
+        Some(value @ (Bson::Document(_) | Bson::Array(_))) => {
+            value.clone().into_canonical_extjson().to_string()
+        }
         Some(value) => match show(value) {
             Shown::Scalar { text, .. } => text,
             _ => String::new(),
         },
     };
-    if text.contains([',', '"', '\n', '\r']) { format!("\"{}\"", text.replace('"', "\"\"")) } else { text }
+    if text.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text
+    }
 }
 
 fn index_type(keys: &Document) -> &'static str {
@@ -416,7 +517,10 @@ fn index_properties(index: &Document) -> Vec<String> {
 }
 
 fn compass_button(id: &'static str, label: &'static str, icon: IconName) -> Button {
-    Button::new(id, label).label_size(LabelSize::Small).style(ButtonStyle::Outlined).start_icon(Icon::new(icon).size(IconSize::XSmall))
+    Button::new(id, label)
+        .label_size(LabelSize::Small)
+        .style(ButtonStyle::Outlined)
+        .start_icon(Icon::new(icon).size(IconSize::XSmall))
 }
 
 impl DatabaseView {
@@ -429,11 +533,23 @@ impl DatabaseView {
     }
 
     fn tab_at(&mut self, database: &str, collection: &str) -> Option<&mut MongoTab> {
-        self.tabs.iter_mut().find(|tab| tab.database == database && tab.collection == collection)
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.database == database && tab.collection == collection)
     }
 
-    pub(crate) fn open_collection(&mut self, database: String, collection: String, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self.tabs.iter().position(|tab| tab.database == database && tab.collection == collection) {
+    pub(crate) fn open_collection(
+        &mut self,
+        database: String,
+        collection: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.database == database && tab.collection == collection)
+        {
             self.active_tab = Some(index);
             cx.notify();
             return;
@@ -441,7 +557,9 @@ impl DatabaseView {
         let mut tab = MongoTab::new(database.clone(), collection.clone(), window, cx);
         if let Some(session) = self.mongo() {
             let connection = self.generation;
-            let task = run(cx, async move { session.estimated_count(&database, &collection).await });
+            let task = run(cx, async move {
+                session.estimated_count(&database, &collection).await
+            });
             let (key_database, key_collection) = (tab.database.clone(), tab.collection.clone());
             tab.keep(cx.spawn(async move |this, cx| {
                 let result = task.await;
@@ -508,13 +626,25 @@ impl DatabaseView {
     }
 
     fn remember(&mut self, query: SavedQuery, cx: &mut Context<Self>) {
-        let favorite = self.history.iter().any(|saved| saved.favorite && saved.same_query(&query));
+        let favorite = self
+            .history
+            .iter()
+            .any(|saved| saved.favorite && saved.same_query(&query));
         self.history.retain(|saved| !saved.same_query(&query));
-        self.history.insert(0, SavedQuery { favorite, ..query.clone() });
+        self.history.insert(
+            0,
+            SavedQuery {
+                favorite,
+                ..query.clone()
+            },
+        );
         // Keep every favourite; cap the recent ones per collection.
         let mut recent = 0;
         self.history.retain(|saved| {
-            if saved.favorite || (&saved.connection, &saved.database, &saved.collection) != (&query.connection, &query.database, &query.collection) {
+            if saved.favorite
+                || (&saved.connection, &saved.database, &saved.collection)
+                    != (&query.connection, &query.database, &query.collection)
+            {
                 return true;
             }
             recent += 1;
@@ -542,9 +672,19 @@ impl DatabaseView {
         let Some(query) = self.current_query(cx) else {
             return;
         };
-        match self.history.iter_mut().find(|saved| saved.same_query(&query)) {
+        match self
+            .history
+            .iter_mut()
+            .find(|saved| saved.same_query(&query))
+        {
             Some(saved) => saved.favorite = !saved.favorite,
-            None => self.history.insert(0, SavedQuery { favorite: true, ..query }),
+            None => self.history.insert(
+                0,
+                SavedQuery {
+                    favorite: true,
+                    ..query
+                },
+            ),
         }
         self.save_history(cx);
         cx.notify();
@@ -554,10 +694,16 @@ impl DatabaseView {
         let Some(tab) = self.tab_mut() else {
             return;
         };
-        for (editor, text) in [(&tab.filter, &query.filter), (&tab.projection, &query.project), (&tab.sort, &query.sort), (&tab.skip_editor, &query.skip)] {
+        for (editor, text) in [
+            (&tab.filter, &query.filter),
+            (&tab.projection, &query.project),
+            (&tab.sort, &query.sort),
+            (&tab.skip_editor, &query.skip),
+        ] {
             editor.update(cx, |editor, cx| editor.set_text(text.clone(), window, cx));
         }
-        tab.show_options |= !(query.project.is_empty() && query.sort.is_empty() && query.skip.is_empty());
+        tab.show_options |=
+            !(query.project.is_empty() && query.sort.is_empty() && query.skip.is_empty());
         tab.skip = 0;
         self.find(cx);
     }
@@ -573,7 +719,13 @@ impl DatabaseView {
             let filter = parse(&tab.filter, "Filter", cx)?;
             let projection = parse(&tab.projection, "Project", cx)?;
             let sort = parse(&tab.sort, "Sort", cx)?;
-            let base_skip = if base_skip.is_empty() { 0 } else { base_skip.parse::<u64>().map_err(|_| anyhow!("Skip must be a whole number"))? };
+            let base_skip = if base_skip.is_empty() {
+                0
+            } else {
+                base_skip
+                    .parse::<u64>()
+                    .map_err(|_| anyhow!("Skip must be a whole number"))?
+            };
             anyhow::Ok((filter, projection, sort, base_skip))
         })();
         match parsed {
@@ -620,8 +772,17 @@ impl DatabaseView {
             } else {
                 tab.total = Some(Total::Counting);
                 let task = {
-                    let (session, database, collection, filter) = (session.clone(), database.clone(), collection.clone(), request.filter.clone());
-                    run(cx, async move { session.count(&database, &collection, filter, COUNT_TIME_LIMIT).await })
+                    let (session, database, collection, filter) = (
+                        session.clone(),
+                        database.clone(),
+                        collection.clone(),
+                        request.filter.clone(),
+                    );
+                    run(cx, async move {
+                        session
+                            .count(&database, &collection, filter, COUNT_TIME_LIMIT)
+                            .await
+                    })
                 };
                 let counted = request.filter.clone();
                 let (database, collection) = (database.clone(), collection.clone());
@@ -695,8 +856,14 @@ impl DatabaseView {
         let (database, collection) = (tab.database.clone(), tab.collection.clone());
         let task = run(cx, async move {
             let explain = session.explain(&request).await?;
-            let raw = to_display_json(&explain).lines().map(|line| SharedString::from(line.to_string())).collect();
-            Ok(ExplainResult { summary: summarize_explain(&explain), raw })
+            let raw = to_display_json(&explain)
+                .lines()
+                .map(|line| SharedString::from(line.to_string()))
+                .collect();
+            Ok(ExplainResult {
+                summary: summarize_explain(&explain),
+                raw,
+            })
         });
         tab.keep(cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -734,11 +901,25 @@ impl DatabaseView {
         tab.aggregation = Some(Fetch::Loading);
         tab.expanded.clear();
         tab.show_all.clear();
-        let (database, collection, skip, page_size) = (tab.database.clone(), tab.collection.clone(), tab.aggregation_skip, tab.page_size);
+        let (database, collection, skip, page_size) = (
+            tab.database.clone(),
+            tab.collection.clone(),
+            tab.aggregation_skip,
+            tab.page_size,
+        );
         let task = {
             let (database, collection) = (database.clone(), collection.clone());
             run(cx, async move {
-                let page = session.aggregate_page(&database, &collection, &pipeline, skip, page_size, QUERY_TIME_LIMIT).await?;
+                let page = session
+                    .aggregate_page(
+                        &database,
+                        &collection,
+                        &pipeline,
+                        skip,
+                        page_size,
+                        QUERY_TIME_LIMIT,
+                    )
+                    .await?;
                 Ok(page_view(page.documents, page.has_more))
             })
         };
@@ -770,7 +951,10 @@ impl DatabaseView {
         let (database, collection) = (tab.database.clone(), tab.collection.clone());
         let task = {
             let (database, collection) = (database.clone(), collection.clone());
-            run(cx, async move { session.indexes(&database, &collection).await })
+            run(
+                cx,
+                async move { session.indexes(&database, &collection).await },
+            )
         };
         tab.keep(cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -798,7 +982,9 @@ impl DatabaseView {
         let (database, collection) = (tab.database.clone(), tab.collection.clone());
         let task = {
             let (database, collection) = (database.clone(), collection.clone());
-            run(cx, async move { session.collection_options(&database, &collection).await })
+            run(cx, async move {
+                session.collection_options(&database, &collection).await
+            })
         };
         tab.keep(cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -832,11 +1018,26 @@ impl DatabaseView {
     fn query_code(&self, language: CodeLanguage, cx: &App) -> Result<String> {
         let tab = self.tab().ok_or_else(|| anyhow!("No collection is open"))?;
         let text = |editor: &Entity<Editor>| editor.read(cx).text(cx).trim().to_string();
-        let (filter, project, sort, skip) = (text(&tab.filter), text(&tab.projection), text(&tab.sort), text(&tab.skip_editor));
-        let or_empty = |text: &str| if text.is_empty() { "{}".to_string() } else { text.to_string() };
+        let (filter, project, sort, skip) = (
+            text(&tab.filter),
+            text(&tab.projection),
+            text(&tab.sort),
+            text(&tab.skip_editor),
+        );
+        let or_empty = |text: &str| {
+            if text.is_empty() {
+                "{}".to_string()
+            } else {
+                text.to_string()
+            }
+        };
         Ok(match language {
             CodeLanguage::Shell => {
-                let mut code = format!("db.getCollection('{}').find(\n  {}", tab.collection, or_empty(&filter));
+                let mut code = format!(
+                    "db.getCollection('{}').find(\n  {}",
+                    tab.collection,
+                    or_empty(&filter)
+                );
                 if !project.is_empty() {
                     code.push_str(&format!(",\n  {project}"));
                 }
@@ -852,11 +1053,16 @@ impl DatabaseView {
             CodeLanguage::Node => {
                 let json = |text: &str| -> Result<String> {
                     let document = parse_query(text)?;
-                    Ok(serde_json::to_string(&Bson::Document(document).into_canonical_extjson())?)
+                    Ok(serde_json::to_string(
+                        &Bson::Document(document).into_canonical_extjson(),
+                    )?)
                 };
                 let mut options = Vec::new();
                 if !project.is_empty() {
-                    options.push(format!("projection: BSON.EJSON.parse('{}')", json(&project)?));
+                    options.push(format!(
+                        "projection: BSON.EJSON.parse('{}')",
+                        json(&project)?
+                    ));
                 }
                 if !sort.is_empty() {
                     options.push(format!("sort: BSON.EJSON.parse('{}')", json(&sort)?));
@@ -869,13 +1075,23 @@ impl DatabaseView {
                     json(&filter)?,
                     tab.database,
                     tab.collection,
-                    if options.is_empty() { String::new() } else { format!(", {{ {} }}", options.join(", ")) }
+                    if options.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {{ {} }}", options.join(", "))
+                    }
                 )
             }
         })
     }
 
-    fn start_export(&mut self, format: ExportFormat, whole: bool, _window: &mut Window, cx: &mut Context<Self>) {
+    fn start_export(
+        &mut self,
+        format: ExportFormat,
+        whole: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = self.mongo() else {
             return;
         };
@@ -885,7 +1101,11 @@ impl DatabaseView {
         let Some(tab) = self.tab_mut() else {
             return;
         };
-        if tab.export.as_ref().is_some_and(|export| export.outcome.is_none()) {
+        if tab
+            .export
+            .as_ref()
+            .is_some_and(|export| export.outcome.is_none())
+        {
             return;
         }
         let page = match &tab.page {
@@ -893,7 +1113,10 @@ impl DatabaseView {
             _ => None,
         };
         // shortcut: CSV columns are the current page's top-level keys; keys that only appear later are not exported.
-        let columns = page.as_ref().map(|documents| table_columns(documents)).unwrap_or_default();
+        let columns = page
+            .as_ref()
+            .map(|documents| table_columns(documents))
+            .unwrap_or_default();
         let extension = match format {
             ExportFormat::Json => "json",
             ExportFormat::Csv => "csv",
@@ -908,7 +1131,12 @@ impl DatabaseView {
             let written = Arc::new(AtomicU64::new(0));
             let cancel = Arc::new(AtomicBool::new(false));
             let job = {
-                let (written, cancel, file, columns) = (written.clone(), cancel.clone(), file.clone(), columns.clone());
+                let (written, cancel, file, columns) = (
+                    written.clone(),
+                    cancel.clone(),
+                    file.clone(),
+                    columns.clone(),
+                );
                 cx.update(|cx| {
                     run(cx, async move {
                         let mut out = std::io::BufWriter::new(std::fs::File::create(&file)?);
@@ -921,9 +1149,27 @@ impl DatabaseView {
                                 }
                                 ExportFormat::Csv => {
                                     if index == 0 {
-                                        writeln!(out, "{}", columns.iter().map(|column| csv_field(Some(&Bson::String(column.clone())))).collect::<Vec<_>>().join(","))?;
+                                        writeln!(
+                                            out,
+                                            "{}",
+                                            columns
+                                                .iter()
+                                                .map(|column| csv_field(Some(&Bson::String(
+                                                    column.clone()
+                                                ))))
+                                                .collect::<Vec<_>>()
+                                                .join(",")
+                                        )?;
                                     }
-                                    writeln!(out, "{}", columns.iter().map(|column| csv_field(document.get(column))).collect::<Vec<_>>().join(","))?;
+                                    writeln!(
+                                        out,
+                                        "{}",
+                                        columns
+                                            .iter()
+                                            .map(|column| csv_field(document.get(column)))
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    )?;
                                 }
                             }
                             Ok(())
@@ -934,10 +1180,18 @@ impl DatabaseView {
                                     write(document.clone())?;
                                 }
                             }
-                            _ => session.for_each_match(&request, None, &cancel, &mut write).await?,
+                            _ => {
+                                session
+                                    .for_each_match(&request, None, &cancel, &mut write)
+                                    .await?
+                            }
                         }
                         if format == ExportFormat::Json {
-                            out.write_all(if written.load(Ordering::Relaxed) == 0 { b"[]\n" } else { b"\n]\n" })?;
+                            out.write_all(if written.load(Ordering::Relaxed) == 0 {
+                                b"[]\n"
+                            } else {
+                                b"\n]\n"
+                            })?;
                         }
                         out.flush()?;
                         Ok(written.load(Ordering::Relaxed))
@@ -946,7 +1200,13 @@ impl DatabaseView {
             };
             this.update(cx, |this, cx| {
                 if let Some(tab) = this.tab_at(&database, &collection) {
-                    tab.export = Some(Export { file: file.clone(), written: written.clone(), cancel: cancel.clone(), outcome: None, _task: Task::ready(()) });
+                    tab.export = Some(Export {
+                        file: file.clone(),
+                        written: written.clone(),
+                        cancel: cancel.clone(),
+                        outcome: None,
+                        _task: Task::ready(()),
+                    });
                     cx.notify();
                 }
             })
@@ -958,7 +1218,9 @@ impl DatabaseView {
                 cx.spawn(async move |cx| {
                     let mut last = 0;
                     loop {
-                        cx.background_executor().timer(Duration::from_millis(300)).await;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(300))
+                            .await;
                         let now = written.load(Ordering::Relaxed);
                         if now != last {
                             last = now;
@@ -991,7 +1253,9 @@ impl DatabaseView {
         let database = tab.database.clone();
         let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |_, cx| {
-            let credential = cx.update(|_, cx| cx.read_credentials(&connection.credential_url()))?.await?;
+            let credential = cx
+                .update(|_, cx| cx.read_credentials(&connection.credential_url()))?
+                .await?;
             let (_, uri) = credential.ok_or_else(|| anyhow!("No connection string saved"))?;
             let uri = String::from_utf8(uri)?;
             // The connection string goes through the environment, never the command line, so `ps` does not show the password.
@@ -1013,7 +1277,9 @@ impl DatabaseView {
                 allow_concurrent_runs: true,
                 ..Default::default()
             };
-            workspace.update_in(cx, |workspace, window, cx| workspace.spawn_in_terminal(spawn, window, cx).detach())?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.spawn_in_terminal(spawn, window, cx).detach()
+            })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -1023,10 +1289,18 @@ impl DatabaseView {
 fn page_view(documents: Vec<Document>, has_more: bool) -> MongoPage {
     let mut json_lines = Vec::new();
     for document in &documents {
-        json_lines.extend(to_display_json(document).lines().map(|line| SharedString::from(line.to_string())));
+        json_lines.extend(
+            to_display_json(document)
+                .lines()
+                .map(|line| SharedString::from(line.to_string())),
+        );
         json_lines.push(SharedString::default());
     }
-    MongoPage { documents: Arc::new(documents), json_lines, has_more }
+    MongoPage {
+        documents: Arc::new(documents),
+        json_lines,
+        has_more,
+    }
 }
 
 impl DatabaseView {
@@ -1035,9 +1309,19 @@ impl DatabaseView {
         let documents = page.documents.clone();
         let expanded = tab.expanded.clone();
         let opened_documents = (0..documents.len())
-            .filter(|index| documents.get(*index).is_some_and(|document| tab.top_level_containers(document, *index).iter().any(|key| expanded.contains(key))))
+            .filter(|index| {
+                documents.get(*index).is_some_and(|document| {
+                    tab.top_level_containers(document, *index)
+                        .iter()
+                        .any(|key| expanded.contains(key))
+                })
+            })
             .collect::<HashSet<_>>();
-        let containers = documents.iter().enumerate().map(|(index, document)| tab.top_level_containers(document, index)).collect::<Vec<_>>();
+        let containers = documents
+            .iter()
+            .enumerate()
+            .map(|(index, document)| tab.top_level_containers(document, index))
+            .collect::<Vec<_>>();
         let local_dates = self.local_dates;
         let view = cx.entity().downgrade();
         let colors = cx.theme().colors().clone();
@@ -1047,7 +1331,11 @@ impl DatabaseView {
                 .filter_map(|index| rows.get(index).cloned().map(|row| (index, row)))
                 .map(|(index, row)| {
                     if matches!(row.kind, RowKind::Gap) {
-                        return div().id(("database-gap", index)).h(px(ROW_HEIGHT)).w_full().into_any_element();
+                        return div()
+                            .id(("database-gap", index))
+                            .h(px(ROW_HEIGHT))
+                            .w_full()
+                            .into_any_element();
                     }
                     let group = SharedString::from(format!("database-card-row-{index}"));
                     let document = row.document;
@@ -1065,15 +1353,28 @@ impl DatabaseView {
                         .when(row.first, |this| this.border_t_1().rounded_t_md())
                         .when(row.last, |this| this.border_b_1().rounded_b_md());
                     // The card's expand toggle sits left of its first line, as in Compass.
-                    card = card.child(div().w(px(36.)).flex_none().flex().justify_center().when(row.first, |this| {
-                        let opened = opened_documents.contains(&document);
-                        let keys = containers.get(document).cloned().unwrap_or_default();
-                        let view = view.clone();
-                        this.child(
-                            IconButton::new(("database-expand-all", index), if opened { IconName::ChevronDown } else { IconName::ChevronRight })
+                    card = card.child(div().w(px(36.)).flex_none().flex().justify_center().when(
+                        row.first,
+                        |this| {
+                            let opened = opened_documents.contains(&document);
+                            let keys = containers.get(document).cloned().unwrap_or_default();
+                            let view = view.clone();
+                            this.child(
+                                IconButton::new(
+                                    ("database-expand-all", index),
+                                    if opened {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    },
+                                )
                                 .icon_size(IconSize::XSmall)
                                 .style(ButtonStyle::Outlined)
-                                .tooltip(Tooltip::text(if opened { "Collapse all" } else { "Expand all" }))
+                                .tooltip(Tooltip::text(if opened {
+                                    "Collapse all"
+                                } else {
+                                    "Expand all"
+                                }))
                                 .on_click(move |_, _, cx| {
                                     let keys = keys.clone();
                                     view.update(cx, |this, cx| {
@@ -1090,50 +1391,78 @@ impl DatabaseView {
                                     })
                                     .ok();
                                 }),
-                        )
-                    }));
+                            )
+                        },
+                    ));
                     let content = match row.kind {
                         RowKind::Gap => div().into_any_element(),
                         RowKind::MoreFields { hidden } => {
                             let view = view.clone();
-                            Button::new(("database-more", document), format!("Show {hidden} more field{}", if hidden == 1 { "" } else { "s" }))
-                                .label_size(LabelSize::Small)
-                                .color(Color::Accent)
-                                .start_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Accent))
-                                .on_click(move |_, _, cx| {
-                                    view.update(cx, |this, cx| {
-                                        if let Some(tab) = this.tab_mut() {
-                                            tab.show_all.insert(document);
-                                        }
-                                        cx.notify();
-                                    })
-                                    .ok();
+                            Button::new(
+                                ("database-more", document),
+                                format!(
+                                    "Show {hidden} more field{}",
+                                    if hidden == 1 { "" } else { "s" }
+                                ),
+                            )
+                            .label_size(LabelSize::Small)
+                            .color(Color::Accent)
+                            .start_icon(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Accent),
+                            )
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    if let Some(tab) = this.tab_mut() {
+                                        tab.show_all.insert(document);
+                                    }
+                                    cx.notify();
                                 })
-                                .into_any_element()
+                                .ok();
+                            })
+                            .into_any_element()
                         }
-                        RowKind::MoreItems { path, depth, hidden } => {
+                        RowKind::MoreItems {
+                            path,
+                            depth,
+                            hidden,
+                        } => {
                             let view = view.clone();
                             h_flex()
                                 .child(div().w(px(depth as f32 * 18.)))
                                 .child(
-                                    Button::new(("database-more-items", index), format!("Show {} more of {hidden} items", hidden.min(ITEMS_SHOWN)))
-                                        .label_size(LabelSize::Small)
-                                        .color(Color::Accent)
-                                        .on_click(move |_, _, cx| {
+                                    Button::new(
+                                        ("database-more-items", index),
+                                        format!(
+                                            "Show {} more of {hidden} items",
+                                            hidden.min(ITEMS_SHOWN)
+                                        ),
+                                    )
+                                    .label_size(LabelSize::Small)
+                                    .color(Color::Accent)
+                                    .on_click(
+                                        move |_, _, cx| {
                                             let key = (document, path.clone());
                                             view.update(cx, |this, cx| {
                                                 if let Some(tab) = this.tab_mut() {
-                                                    *tab.items_shown.entry(key).or_insert(ITEMS_SHOWN) += ITEMS_SHOWN;
+                                                    *tab.items_shown
+                                                        .entry(key)
+                                                        .or_insert(ITEMS_SHOWN) += ITEMS_SHOWN;
                                                 }
                                                 cx.notify();
                                             })
                                             .ok();
-                                        }),
+                                        },
+                                    ),
                                 )
                                 .into_any_element()
                         }
                         RowKind::Field { path, depth } => {
-                            let Some(value) = documents.get(document).and_then(|item| value_at(item, &path)) else {
+                            let Some(value) = documents
+                                .get(document)
+                                .and_then(|item| value_at(item, &path))
+                            else {
                                 return card.into_any_element();
                             };
                             let key = path.last().cloned().unwrap_or_default();
@@ -1142,7 +1471,9 @@ impl DatabaseView {
                             let open = expanded.contains(&(document, path.clone()));
                             let (text, color) = match &shown {
                                 Shown::Scalar { text, kind } => (text.clone(), kind_color(*kind)),
-                                Shown::Object(count) => (format!("Object ({count})"), Color::Default),
+                                Shown::Object(count) => {
+                                    (format!("Object ({count})"), Color::Default)
+                                }
                                 Shown::Array(count) => (format!("Array ({count})"), Color::Default),
                             };
                             let human = match value {
@@ -1170,17 +1501,47 @@ impl DatabaseView {
                                         })
                                         .ok();
                                     } else {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy.clone(),
+                                        ));
                                     }
                                 })
                                 .child(div().w(px(depth as f32 * 18.)).flex_none())
                                 .child(div().w(px(10.)).flex_none().when(expandable, |this| {
-                                    this.child(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Default))
+                                    this.child(
+                                        Icon::new(if open {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Default),
+                                    )
                                 }))
-                                .child(Label::new(format!("{key}:")).size(LabelSize::Small).buffer_font(cx).weight(gpui::FontWeight::BOLD).single_line())
-                                .child(Label::new(text).size(LabelSize::Small).buffer_font(cx).color(color).single_line().truncate())
+                                .child(
+                                    Label::new(format!("{key}:"))
+                                        .size(LabelSize::Small)
+                                        .buffer_font(cx)
+                                        .weight(gpui::FontWeight::BOLD)
+                                        .single_line(),
+                                )
+                                .child(
+                                    Label::new(text)
+                                        .size(LabelSize::Small)
+                                        .buffer_font(cx)
+                                        .color(color)
+                                        .single_line()
+                                        .truncate(),
+                                )
                                 .when_some(human, |this, human| {
-                                    this.child(Label::new(human).size(LabelSize::Small).buffer_font(cx).color(Color::Default).underline().single_line())
+                                    this.child(
+                                        Label::new(human)
+                                            .size(LabelSize::Small)
+                                            .buffer_font(cx)
+                                            .color(Color::Default)
+                                            .underline()
+                                            .single_line(),
+                                    )
                                 })
                                 .into_any_element()
                         }
@@ -1196,7 +1557,9 @@ impl DatabaseView {
                                     .tooltip(Tooltip::text("Copy document"))
                                     .on_click(move |_, _, cx| {
                                         if let Some(document) = documents.get(document) {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(to_canonical_json(document)));
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                to_canonical_json(document),
+                                            ));
                                         }
                                     }),
                             ),
@@ -1220,15 +1583,29 @@ impl DatabaseView {
         let list = uniform_list("database-table", row_count, move |range, _, cx| {
             range
                 .map(|index| {
-                    let mut row = h_flex().id(("database-table-row", index)).h(px(ROW_HEIGHT + 4.)).border_b_1().border_color(colors.border_variant);
+                    let mut row = h_flex()
+                        .id(("database-table-row", index))
+                        .h(px(ROW_HEIGHT + 4.))
+                        .border_b_1()
+                        .border_color(colors.border_variant);
                     if index == 0 {
                         row = row.bg(colors.element_background);
                         row = row.child(div().w(px(48.)).flex_none().px_2());
                         for column in columns.iter() {
                             row = row.child(
-                                div().w(px(COLUMN_WIDTH)).flex_none().px_2().border_r_1().border_color(colors.border_variant).child(
-                                    Label::new(column.clone()).size(LabelSize::Small).weight(gpui::FontWeight::SEMIBOLD).single_line().truncate(),
-                                ),
+                                div()
+                                    .w(px(COLUMN_WIDTH))
+                                    .flex_none()
+                                    .px_2()
+                                    .border_r_1()
+                                    .border_color(colors.border_variant)
+                                    .child(
+                                        Label::new(column.clone())
+                                            .size(LabelSize::Small)
+                                            .weight(gpui::FontWeight::SEMIBOLD)
+                                            .single_line()
+                                            .truncate(),
+                                    ),
                             );
                         }
                         return row.into_any_element();
@@ -1236,7 +1613,13 @@ impl DatabaseView {
                     let Some(document) = documents.get(index - 1) else {
                         return row.into_any_element();
                     };
-                    row = row.child(div().w(px(48.)).flex_none().px_2().child(Label::new(index.to_string()).size(LabelSize::Small).color(Color::Muted)));
+                    row = row.child(
+                        div().w(px(48.)).flex_none().px_2().child(
+                            Label::new(index.to_string())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                    );
                     for (column_index, column) in columns.iter().enumerate() {
                         let (text, color) = cell_text(document.get(column));
                         let copy = text.clone();
@@ -1251,8 +1634,17 @@ impl DatabaseView {
                                 .cursor_pointer()
                                 .hover(|style| style.bg(colors.element_hover))
                                 .tooltip(Tooltip::text("Click to copy"))
-                                .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone())))
-                                .child(Label::new(text).size(LabelSize::Small).buffer_font(cx).color(color).single_line().truncate()),
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
+                                })
+                                .child(
+                                    Label::new(text)
+                                        .size(LabelSize::Small)
+                                        .buffer_font(cx)
+                                        .color(color)
+                                        .single_line()
+                                        .truncate(),
+                                ),
                         );
                     }
                     row.into_any_element()
@@ -1262,19 +1654,45 @@ impl DatabaseView {
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
         .track_scroll(&tab.scroll)
         .flex_1();
-        v_flex().flex_1().min_h_0().rounded_md().border_1().border_color(colors.border).bg(colors.editor_background).child(list).into_any_element()
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .child(list)
+            .into_any_element()
     }
 
-    fn render_results(&self, tab: &MongoTab, page: Option<&Fetch<MongoPage>>, cx: &mut Context<Self>) -> AnyElement {
+    fn render_results(
+        &self,
+        tab: &MongoTab,
+        page: Option<&Fetch<MongoPage>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match page {
-            Some(Fetch::Failed(message)) => Label::new(message.clone()).size(LabelSize::Small).color(Color::Error).into_any_element(),
-            Some(Fetch::Loading) => Label::new("Loading documents…").size(LabelSize::Small).color(Color::Muted).into_any_element(),
-            Some(Fetch::Loaded(page)) if page.documents.is_empty() => {
-                v_flex().pt_8().items_center().child(Label::new("No results").color(Color::Muted)).into_any_element()
-            }
+            Some(Fetch::Failed(message)) => Label::new(message.clone())
+                .size(LabelSize::Small)
+                .color(Color::Error)
+                .into_any_element(),
+            Some(Fetch::Loading) => Label::new("Loading documents…")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+            Some(Fetch::Loaded(page)) if page.documents.is_empty() => v_flex()
+                .pt_8()
+                .items_center()
+                .child(Label::new("No results").color(Color::Muted))
+                .into_any_element(),
             Some(Fetch::Loaded(page)) => match tab.view {
                 DocumentView::List => self.render_list(tab, page, cx),
-                DocumentView::Json => render_lines("database-documents-json", page.json_lines.clone(), &tab.scroll, cx),
+                DocumentView::Json => render_lines(
+                    "database-documents-json",
+                    page.json_lines.clone(),
+                    &tab.scroll,
+                    cx,
+                ),
                 DocumentView::Table => self.render_table(tab, page, cx),
             },
             None => div().into_any_element(),
@@ -1283,47 +1701,92 @@ impl DatabaseView {
 
     pub(crate) fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let mut strip = h_flex().id("database-tabs").w_full().overflow_x_scroll().border_b_1().border_color(colors.border).bg(colors.tab_bar_background);
+        let mut strip = h_flex()
+            .id("database-tabs")
+            .w_full()
+            .overflow_x_scroll()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(colors.tab_bar_background);
         for (index, tab) in self.tabs.iter().enumerate() {
             let selected = self.active_tab == Some(index);
-            strip = strip.child(
-                h_flex()
-                    .id(("database-tab", index))
-                    .group(SharedString::from(format!("database-tab-{index}")))
-                    .h(px(36.))
-                    .px_3()
-                    .gap_2()
-                    .border_r_1()
-                    .border_color(colors.border_variant)
-                    .cursor_pointer()
-                    .bg(if selected { colors.tab_active_background } else { colors.tab_inactive_background })
-                    .tooltip(Tooltip::text(format!("{}.{}", tab.database, tab.collection)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.active_tab = Some(index);
-                        cx.notify();
-                    }))
-                    .child(Icon::new(IconName::Folder).size(IconSize::Small).color(if selected { Color::Default } else { Color::Muted }))
-                    .child(Label::new(tab.title()).color(if selected { Color::Default } else { Color::Muted }))
-                    .child(
-                        div().when(!selected, |this| this.visible_on_hover(SharedString::from(format!("database-tab-{index}")))).child(
-                            IconButton::new(("database-tab-close", index), IconName::Close).icon_size(IconSize::XSmall).on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(index, cx);
-                            })),
+            strip =
+                strip.child(
+                    h_flex()
+                        .id(("database-tab", index))
+                        .group(SharedString::from(format!("database-tab-{index}")))
+                        .h(px(36.))
+                        .px_3()
+                        .gap_2()
+                        .border_r_1()
+                        .border_color(colors.border_variant)
+                        .cursor_pointer()
+                        .bg(if selected {
+                            colors.tab_active_background
+                        } else {
+                            colors.tab_inactive_background
+                        })
+                        .tooltip(Tooltip::text(format!(
+                            "{}.{}",
+                            tab.database, tab.collection
+                        )))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.active_tab = Some(index);
+                            cx.notify();
+                        }))
+                        .child(Icon::new(IconName::Folder).size(IconSize::Small).color(
+                            if selected {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            },
+                        ))
+                        .child(Label::new(tab.title()).color(if selected {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        }))
+                        .child(
+                            div()
+                                .when(!selected, |this| {
+                                    this.visible_on_hover(SharedString::from(format!(
+                                        "database-tab-{index}"
+                                    )))
+                                })
+                                .child(
+                                    IconButton::new(("database-tab-close", index), IconName::Close)
+                                        .icon_size(IconSize::XSmall)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.close_tab(index, cx);
+                                        })),
+                                ),
                         ),
-                    ),
-            );
+                );
         }
         strip
     }
 
-    fn render_pager(&self, tab: &MongoTab, aggregation: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let page = if aggregation { &tab.aggregation } else { &tab.page };
+    fn render_pager(
+        &self,
+        tab: &MongoTab,
+        aggregation: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let page = if aggregation {
+            &tab.aggregation
+        } else {
+            &tab.page
+        };
         let (shown, has_more) = match page {
             Some(Fetch::Loaded(page)) => (page.documents.len(), page.has_more),
             _ => (0, false),
         };
-        let skip = if aggregation { tab.aggregation_skip } else { tab.skip };
+        let skip = if aggregation {
+            tab.aggregation_skip
+        } else {
+            tab.skip
+        };
         let page_size = u64::from(tab.page_size);
         let total = match (&tab.total, aggregation) {
             (_, true) => String::new(),
@@ -1338,7 +1801,11 @@ impl DatabaseView {
             _ => String::new(),
         };
         let rerun = move |this: &mut DatabaseView, cx: &mut Context<DatabaseView>| {
-            if aggregation { this.run_aggregation(cx) } else { this.find(cx) }
+            if aggregation {
+                this.run_aggregation(cx)
+            } else {
+                this.find(cx)
+            }
         };
         let set_skip = move |this: &mut DatabaseView, value: u64| {
             if let Some(tab) = this.tab_mut() {
@@ -1350,31 +1817,48 @@ impl DatabaseView {
             }
         };
         let view = cx.entity().downgrade();
-        let size_menu = PopoverMenu::new(if aggregation { "database-page-size-aggregation" } else { "database-page-size" })
-            .trigger(Button::new("database-page-size-button", tab.page_size.to_string()).label_size(LabelSize::Small).style(ButtonStyle::Outlined).end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)))
-            .menu(move |window, cx| {
-                let view = view.clone();
-                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    for size in PAGE_SIZES {
-                        let view = view.clone();
-                        menu = menu.entry(size.to_string(), None, move |_, cx| {
-                            view.update(cx, |this, cx| {
-                                if let Some(tab) = this.tab_mut() {
-                                    tab.page_size = size;
-                                }
-                                set_skip(this, 0);
-                                rerun(this, cx);
-                            })
-                            .ok();
-                        });
-                    }
-                    menu
-                }))
-            });
-        let view_icon = |id: &'static str, icon: IconName, tip: &'static str, view: DocumentView, cx: &mut Context<Self>| {
+        let size_menu = PopoverMenu::new(if aggregation {
+            "database-page-size-aggregation"
+        } else {
+            "database-page-size"
+        })
+        .trigger(
+            Button::new("database-page-size-button", tab.page_size.to_string())
+                .label_size(LabelSize::Small)
+                .style(ButtonStyle::Outlined)
+                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+        )
+        .menu(move |window, cx| {
+            let view = view.clone();
+            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                for size in PAGE_SIZES {
+                    let view = view.clone();
+                    menu = menu.entry(size.to_string(), None, move |_, cx| {
+                        view.update(cx, |this, cx| {
+                            if let Some(tab) = this.tab_mut() {
+                                tab.page_size = size;
+                            }
+                            set_skip(this, 0);
+                            rerun(this, cx);
+                        })
+                        .ok();
+                    });
+                }
+                menu
+            }))
+        });
+        let view_icon = |id: &'static str,
+                         icon: IconName,
+                         tip: &'static str,
+                         view: DocumentView,
+                         cx: &mut Context<Self>| {
             IconButton::new(id, icon)
                 .icon_size(IconSize::Small)
-                .style(if tab.view == view { ButtonStyle::Filled } else { ButtonStyle::Subtle })
+                .style(if tab.view == view {
+                    ButtonStyle::Filled
+                } else {
+                    ButtonStyle::Subtle
+                })
                 .tooltip(Tooltip::text(tip))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(tab) = this.tab_mut() {
@@ -1395,45 +1879,78 @@ impl DatabaseView {
                     Button::new("database-recount", "count unknown · retry")
                         .label_size(LabelSize::Small)
                         .color(Color::Accent)
-                        .tooltip(Tooltip::text("Counting took longer than 5 seconds or failed"))
+                        .tooltip(Tooltip::text(
+                            "Counting took longer than 5 seconds or failed",
+                        ))
                         .on_click(cx.listener(|this, _, _, cx| this.recount(cx))),
                 )
             })
-            .child(IconButton::new("database-refresh", IconName::RotateCw).icon_size(IconSize::Small).tooltip(Tooltip::text("Refresh")).on_click(cx.listener(move |this, _, _, cx| rerun(this, cx))))
-            .child(IconButton::new("database-previous", IconName::ChevronLeft).icon_size(IconSize::Small).disabled(skip == 0).on_click(cx.listener(move |this, _, _, cx| {
-                set_skip(this, skip.saturating_sub(page_size));
-                rerun(this, cx);
-            })))
-            .child(IconButton::new("database-next", IconName::ChevronRight).icon_size(IconSize::Small).disabled(!has_more).on_click(cx.listener(move |this, _, _, cx| {
-                set_skip(this, skip + page_size);
-                rerun(this, cx);
-            })))
+            .child(
+                IconButton::new("database-refresh", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Refresh"))
+                    .on_click(cx.listener(move |this, _, _, cx| rerun(this, cx))),
+            )
+            .child(
+                IconButton::new("database-previous", IconName::ChevronLeft)
+                    .icon_size(IconSize::Small)
+                    .disabled(skip == 0)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        set_skip(this, skip.saturating_sub(page_size));
+                        rerun(this, cx);
+                    })),
+            )
+            .child(
+                IconButton::new("database-next", IconName::ChevronRight)
+                    .icon_size(IconSize::Small)
+                    .disabled(!has_more)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        set_skip(this, skip + page_size);
+                        rerun(this, cx);
+                    })),
+            )
             .child(
                 PopoverMenu::new("database-view-options")
-                    .trigger(IconButton::new("database-view-options-button", IconName::ChevronDown).icon_size(IconSize::Small).style(ButtonStyle::Outlined))
+                    .trigger(
+                        IconButton::new("database-view-options-button", IconName::ChevronDown)
+                            .icon_size(IconSize::Small)
+                            .style(ButtonStyle::Outlined),
+                    )
                     .menu(move |window, cx| {
                         let view = more_view.clone();
                         Some(ContextMenu::build(window, cx, move |menu, _, _| {
                             let toggle = view.clone();
                             let collapse = view.clone();
-                            menu.entry(if local_dates { "Show dates in UTC" } else { "Show dates in local time" }, None, move |_, cx| {
-                                toggle
-                                    .update(cx, |this, cx| {
-                                        this.local_dates = !this.local_dates;
-                                        cx.notify();
-                                    })
-                                    .ok();
-                            })
-                            .entry("Collapse all documents", None, move |_, cx| {
-                                collapse
-                                    .update(cx, |this, cx| {
-                                        if let Some(tab) = this.tab_mut() {
-                                            tab.expanded.clear();
-                                        }
-                                        cx.notify();
-                                    })
-                                    .ok();
-                            })
+                            menu.entry(
+                                if local_dates {
+                                    "Show dates in UTC"
+                                } else {
+                                    "Show dates in local time"
+                                },
+                                None,
+                                move |_, cx| {
+                                    toggle
+                                        .update(cx, |this, cx| {
+                                            this.local_dates = !this.local_dates;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                },
+                            )
+                            .entry(
+                                "Collapse all documents",
+                                None,
+                                move |_, cx| {
+                                    collapse
+                                        .update(cx, |this, cx| {
+                                            if let Some(tab) = this.tab_mut() {
+                                                tab.expanded.clear();
+                                            }
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                },
+                            )
                         }))
                     }),
             )
@@ -1443,20 +1960,46 @@ impl DatabaseView {
                     .rounded_md()
                     .border_1()
                     .border_color(cx.theme().colors().border)
-                    .child(view_icon("database-view-list", IconName::Menu, "List view", DocumentView::List, cx))
-                    .child(view_icon("database-view-json", IconName::Code, "JSON view", DocumentView::Json, cx))
-                    .child(view_icon("database-view-table", IconName::Table, "Table view", DocumentView::Table, cx)),
+                    .child(view_icon(
+                        "database-view-list",
+                        IconName::Menu,
+                        "List view",
+                        DocumentView::List,
+                        cx,
+                    ))
+                    .child(view_icon(
+                        "database-view-json",
+                        IconName::Code,
+                        "JSON view",
+                        DocumentView::Json,
+                        cx,
+                    ))
+                    .child(view_icon(
+                        "database-view-table",
+                        IconName::Table,
+                        "Table view",
+                        DocumentView::Table,
+                        cx,
+                    )),
             )
     }
 
     fn render_query_bar(&self, tab: &MongoTab, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let current = self.current_query(cx);
-        let starred = current.as_ref().is_some_and(|query| self.history.iter().any(|saved| saved.favorite && saved.same_query(query)));
+        let starred = current.as_ref().is_some_and(|query| {
+            self.history
+                .iter()
+                .any(|saved| saved.favorite && saved.same_query(query))
+        });
         let saved = self
             .history
             .iter()
-            .filter(|saved| Some(&saved.connection) == self.active.as_ref() && saved.database == tab.database && saved.collection == tab.collection)
+            .filter(|saved| {
+                Some(&saved.connection) == self.active.as_ref()
+                    && saved.database == tab.database
+                    && saved.collection == tab.collection
+            })
             .cloned()
             .collect::<Vec<_>>();
         let view = cx.entity().downgrade();
@@ -1474,7 +2017,8 @@ impl DatabaseView {
                     if saved.is_empty() {
                         return menu.label("No queries yet");
                     }
-                    let (favorites, recent): (Vec<_>, Vec<_>) = saved.iter().cloned().partition(|saved| saved.favorite);
+                    let (favorites, recent): (Vec<_>, Vec<_>) =
+                        saved.iter().cloned().partition(|saved| saved.favorite);
                     for (title, group) in [("Favorites", favorites), ("Recent", recent)] {
                         if group.is_empty() {
                             continue;
@@ -1484,25 +2028,33 @@ impl DatabaseView {
                             let view = view.clone();
                             menu = menu.entry(query.label(), None, move |window, cx| {
                                 let query = query.clone();
-                                view.update(cx, |this, cx| this.apply_saved(query, window, cx)).ok();
+                                view.update(cx, |this, cx| this.apply_saved(query, window, cx))
+                                    .ok();
                             });
                         }
                     }
-                    menu.separator().entry("Clear recent queries", None, move |_, cx| {
-                        view.update(cx, |this, cx| {
-                            this.history.retain(|saved| saved.favorite);
-                            this.save_history(cx);
-                            cx.notify();
+                    menu.separator()
+                        .entry("Clear recent queries", None, move |_, cx| {
+                            view.update(cx, |this, cx| {
+                                this.history.retain(|saved| saved.favorite);
+                                this.save_history(cx);
+                                cx.notify();
+                            })
+                            .ok();
                         })
-                        .ok();
-                    })
                 }))
             });
         let option = |label: &'static str, editor: &Entity<Editor>, cx: &App| {
             h_flex()
                 .flex_1()
                 .gap_2()
-                .child(div().w(px(56.)).child(Label::new(label).size(LabelSize::Small).weight(gpui::FontWeight::SEMIBOLD)))
+                .child(
+                    div().w(px(56.)).child(
+                        Label::new(label)
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::SEMIBOLD),
+                    ),
+                )
                 .child(div().flex_1().child(boxed(editor.clone(), cx)))
         };
         let find = |this: &mut DatabaseView, cx: &mut Context<DatabaseView>| {
@@ -1525,18 +2077,51 @@ impl DatabaseView {
                     .child(history)
                     .child(div().flex_1().min_w_0().child(tab.filter.clone()))
                     .child(
-                        IconButton::new("database-star", if starred { IconName::StarFilled } else { IconName::Star })
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text(if starred { "Remove from favorites" } else { "Add to favorites" }))
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_favorite(cx))),
+                        IconButton::new(
+                            "database-star",
+                            if starred {
+                                IconName::StarFilled
+                            } else {
+                                IconName::Star
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text(if starred {
+                            "Remove from favorites"
+                        } else {
+                            "Add to favorites"
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_favorite(cx))),
                     )
-                    .child(Button::new("database-explain", "Explain").style(ButtonStyle::Outlined).on_click(cx.listener(|this, _, _, cx| this.explain(cx))))
-                    .child(Button::new("database-reset", "Reset").style(ButtonStyle::Outlined).on_click(cx.listener(|this, _, window, cx| this.reset_query(window, cx))))
-                    .child(Button::new("database-find", "Find").style(ButtonStyle::Tinted(TintColor::Success)).on_click(cx.listener(move |this, _, _, cx| find(this, cx))))
+                    .child(
+                        Button::new("database-explain", "Explain")
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(|this, _, _, cx| this.explain(cx))),
+                    )
+                    .child(
+                        Button::new("database-reset", "Reset")
+                            .style(ButtonStyle::Outlined)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.reset_query(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("database-find", "Find")
+                            .style(ButtonStyle::Tinted(TintColor::Success))
+                            .on_click(cx.listener(move |this, _, _, cx| find(this, cx))),
+                    )
                     .child(
                         Button::new("database-options", "Options")
                             .color(Color::Accent)
-                            .end_icon(Icon::new(if tab.show_options { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Accent))
+                            .end_icon(
+                                Icon::new(if tab.show_options {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(IconSize::XSmall)
+                                .color(Color::Accent),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(tab) = this.tab_mut() {
                                     tab.show_options = !tab.show_options;
@@ -1546,8 +2131,18 @@ impl DatabaseView {
                     ),
             )
             .when(tab.show_options, |this| {
-                this.child(h_flex().gap_4().child(option("Project", &tab.projection, cx)).child(option("Sort", &tab.sort, cx)))
-                    .child(h_flex().gap_4().child(option("Skip", &tab.skip_editor, cx)).child(div().flex_1()))
+                this.child(
+                    h_flex()
+                        .gap_4()
+                        .child(option("Project", &tab.projection, cx))
+                        .child(option("Sort", &tab.sort, cx)),
+                )
+                .child(
+                    h_flex()
+                        .gap_4()
+                        .child(option("Skip", &tab.skip_editor, cx))
+                        .child(div().flex_1()),
+                )
             })
             .into_any_element()
     }
@@ -1555,35 +2150,78 @@ impl DatabaseView {
     fn render_toolbar(&self, tab: &MongoTab, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity().downgrade();
         let export = PopoverMenu::new("database-export")
-            .trigger(compass_button("database-export-button", "EXPORT DATA", IconName::Download).end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)))
+            .trigger(
+                compass_button("database-export-button", "EXPORT DATA", IconName::Download)
+                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+            )
             .menu(move |window, cx| {
                 let view = view.clone();
                 Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                    let entry = |view: gpui::WeakEntity<DatabaseView>, format: ExportFormat, whole: bool| {
+                    let entry = |view: gpui::WeakEntity<DatabaseView>,
+                                 format: ExportFormat,
+                                 whole: bool| {
                         move |window: &mut Window, cx: &mut App| {
-                            view.update(cx, |this, cx| this.start_export(format, whole, window, cx)).ok();
+                            view.update(cx, |this, cx| {
+                                this.start_export(format, whole, window, cx)
+                            })
+                            .ok();
                         }
                     };
-                    menu.entry("Export the full query result as JSON…", None, entry(view.clone(), ExportFormat::Json, true))
-                        .entry("Export the full query result as CSV…", None, entry(view.clone(), ExportFormat::Csv, true))
-                        .separator()
-                        .entry("Export this page as JSON…", None, entry(view.clone(), ExportFormat::Json, false))
-                        .entry("Export this page as CSV…", None, entry(view, ExportFormat::Csv, false))
+                    menu.entry(
+                        "Export the full query result as JSON…",
+                        None,
+                        entry(view.clone(), ExportFormat::Json, true),
+                    )
+                    .entry(
+                        "Export the full query result as CSV…",
+                        None,
+                        entry(view.clone(), ExportFormat::Csv, true),
+                    )
+                    .separator()
+                    .entry(
+                        "Export this page as JSON…",
+                        None,
+                        entry(view.clone(), ExportFormat::Json, false),
+                    )
+                    .entry(
+                        "Export this page as CSV…",
+                        None,
+                        entry(view, ExportFormat::Csv, false),
+                    )
                 }))
             });
         let export_status = tab.export.as_ref().map(|export| {
-            let name = export.file.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+            let name = export
+                .file
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
             match &export.outcome {
                 None => h_flex()
                     .gap_1()
-                    .child(Label::new(format!("Exporting {}…", export.written.load(Ordering::Relaxed))).size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        Label::new(format!(
+                            "Exporting {}…",
+                            export.written.load(Ordering::Relaxed)
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
                     .child({
                         let cancel = export.cancel.clone();
-                        Button::new("database-export-cancel", "Cancel").label_size(LabelSize::Small).on_click(move |_, _, _| cancel.store(true, Ordering::Relaxed))
+                        Button::new("database-export-cancel", "Cancel")
+                            .label_size(LabelSize::Small)
+                            .on_click(move |_, _, _| cancel.store(true, Ordering::Relaxed))
                     })
                     .into_any_element(),
-                Some(Ok(count)) => Label::new(format!("Exported {count} documents to {name}")).size(LabelSize::Small).color(Color::Success).into_any_element(),
-                Some(Err(message)) => Label::new(format!("Export stopped: {message}")).size(LabelSize::Small).color(Color::Error).into_any_element(),
+                Some(Ok(count)) => Label::new(format!("Exported {count} documents to {name}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Success)
+                    .into_any_element(),
+                Some(Err(message)) => Label::new(format!("Export stopped: {message}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Error)
+                    .into_any_element(),
             }
         });
         h_flex()
@@ -1592,21 +2230,33 @@ impl DatabaseView {
                 compass_button("database-add-data", "ADD DATA", IconName::Plus)
                     .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
                     .disabled(true)
-                    .tooltip(Tooltip::text("Adding and editing documents comes with the next release")),
+                    .tooltip(Tooltip::text(
+                        "Adding and editing documents comes with the next release",
+                    )),
             )
             .child(
                 compass_button("database-bulk", "BULK", IconName::Copy)
                     .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
                     .disabled(true)
-                    .tooltip(Tooltip::text("Bulk update and delete come with the next release")),
+                    .tooltip(Tooltip::text(
+                        "Bulk update and delete come with the next release",
+                    )),
             )
             .child(export)
-            .child(compass_button("database-export-code", "EXPORT CODE", IconName::Code).on_click(cx.listener(|this, _, _, cx| {
-                if let Some(tab) = this.tab_mut() {
-                    tab.panel = if tab.panel == Panel::Code { Panel::Results } else { Panel::Code };
-                }
-                cx.notify();
-            })))
+            .child(
+                compass_button("database-export-code", "EXPORT CODE", IconName::Code).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        if let Some(tab) = this.tab_mut() {
+                            tab.panel = if tab.panel == Panel::Code {
+                                Panel::Results
+                            } else {
+                                Panel::Code
+                            };
+                        }
+                        cx.notify();
+                    }),
+                ),
+            )
             .children(export_status)
             .child(div().flex_1())
             .child(self.render_pager(tab, false, cx))
@@ -1620,23 +2270,45 @@ impl DatabaseView {
             .child(Headline::new("Explain Plan").size(HeadlineSize::Small))
             .child(div().flex_1())
             .child(
-                Button::new("database-explain-raw", if tab.explain_raw { "Visual" } else { "Raw output" }).style(ButtonStyle::Outlined).on_click(cx.listener(|this, _, _, cx| {
+                Button::new(
+                    "database-explain-raw",
+                    if tab.explain_raw {
+                        "Visual"
+                    } else {
+                        "Raw output"
+                    },
+                )
+                .style(ButtonStyle::Outlined)
+                .on_click(cx.listener(|this, _, _, cx| {
                     if let Some(tab) = this.tab_mut() {
                         tab.explain_raw = !tab.explain_raw;
                     }
                     cx.notify();
                 })),
             )
-            .child(IconButton::new("database-explain-close", IconName::Close).on_click(cx.listener(|this, _, _, cx| {
-                if let Some(tab) = this.tab_mut() {
-                    tab.panel = Panel::Results;
-                }
-                cx.notify();
-            })));
+            .child(
+                IconButton::new("database-explain-close", IconName::Close).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        if let Some(tab) = this.tab_mut() {
+                            tab.panel = Panel::Results;
+                        }
+                        cx.notify();
+                    },
+                )),
+            );
         let body = match &tab.explain {
-            None | Some(Fetch::Loading) => Label::new("Running explain…").color(Color::Muted).into_any_element(),
-            Some(Fetch::Failed(message)) => Label::new(message.clone()).color(Color::Error).into_any_element(),
-            Some(Fetch::Loaded(result)) if tab.explain_raw => render_lines("database-explain-lines", result.raw.clone(), &tab.scroll, cx),
+            None | Some(Fetch::Loading) => Label::new("Running explain…")
+                .color(Color::Muted)
+                .into_any_element(),
+            Some(Fetch::Failed(message)) => Label::new(message.clone())
+                .color(Color::Error)
+                .into_any_element(),
+            Some(Fetch::Loaded(result)) if tab.explain_raw => render_lines(
+                "database-explain-lines",
+                result.raw.clone(),
+                &tab.scroll,
+                cx,
+            ),
             Some(Fetch::Loaded(result)) => {
                 let summary = &result.summary;
                 let metric = |label: &'static str, value: String| {
@@ -1678,19 +2350,38 @@ impl DatabaseView {
                     .into_any_element()
             }
         };
-        v_flex().flex_1().min_h_0().p_4().gap_3().rounded_md().border_1().border_color(colors.border).child(header).child(body).into_any_element()
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .p_4()
+            .gap_3()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .child(header)
+            .child(body)
+            .into_any_element()
     }
 
     fn render_code(&self, tab: &MongoTab, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let code = self.query_code(tab.code_language, cx);
-        let language = |id: &'static str, label: &'static str, language: CodeLanguage, cx: &mut Context<Self>| {
-            Button::new(id, label).style(if tab.code_language == language { ButtonStyle::Filled } else { ButtonStyle::Subtle }).on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(tab) = this.tab_mut() {
-                    tab.code_language = language;
-                }
-                cx.notify();
-            }))
+        let language = |id: &'static str,
+                        label: &'static str,
+                        language: CodeLanguage,
+                        cx: &mut Context<Self>| {
+            Button::new(id, label)
+                .style(if tab.code_language == language {
+                    ButtonStyle::Filled
+                } else {
+                    ButtonStyle::Subtle
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(tab) = this.tab_mut() {
+                        tab.code_language = language;
+                    }
+                    cx.notify();
+                }))
         };
         let copy = code.as_ref().ok().cloned();
         v_flex()
@@ -1706,48 +2397,106 @@ impl DatabaseView {
                     .gap_2()
                     .child(Headline::new("Export Query To Language").size(HeadlineSize::Small))
                     .child(div().flex_1())
-                    .child(IconButton::new("database-code-close", IconName::Close).on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(tab) = this.tab_mut() {
-                            tab.panel = Panel::Results;
-                        }
-                        cx.notify();
-                    }))),
+                    .child(
+                        IconButton::new("database-code-close", IconName::Close).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(tab) = this.tab_mut() {
+                                    tab.panel = Panel::Results;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    ),
             )
-            .child(h_flex().gap_1().child(language("database-code-shell", "mongosh", CodeLanguage::Shell, cx)).child(language("database-code-node", "Node.js", CodeLanguage::Node, cx)))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(language(
+                        "database-code-shell",
+                        "mongosh",
+                        CodeLanguage::Shell,
+                        cx,
+                    ))
+                    .child(language(
+                        "database-code-node",
+                        "Node.js",
+                        CodeLanguage::Node,
+                        cx,
+                    )),
+            )
             .child(match code {
-                Ok(code) => render_lines("database-code-lines", code.lines().map(|line| SharedString::from(line.to_string())).collect(), &tab.scroll, cx),
-                Err(error) => Label::new(format!("{error:#}")).color(Color::Error).into_any_element(),
+                Ok(code) => render_lines(
+                    "database-code-lines",
+                    code.lines()
+                        .map(|line| SharedString::from(line.to_string()))
+                        .collect(),
+                    &tab.scroll,
+                    cx,
+                ),
+                Err(error) => Label::new(format!("{error:#}"))
+                    .color(Color::Error)
+                    .into_any_element(),
             })
-            .child(h_flex().child(
-                Button::new("database-code-copy", "Copy").style(ButtonStyle::Filled).start_icon(Icon::new(IconName::Copy).size(IconSize::Small)).on_click(move |_, _, cx| {
-                    if let Some(code) = &copy {
-                        cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
-                    }
-                }),
-            ))
+            .child(
+                h_flex().child(
+                    Button::new("database-code-copy", "Copy")
+                        .style(ButtonStyle::Filled)
+                        .start_icon(Icon::new(IconName::Copy).size(IconSize::Small))
+                        .on_click(move |_, _, cx| {
+                            if let Some(code) = &copy {
+                                cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+                            }
+                        }),
+                ),
+            )
             .into_any_element()
     }
 
     fn render_indexes(&self, tab: &MongoTab, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let indexes = match &tab.indexes {
-            None | Some(Fetch::Loading) => return Label::new("Loading indexes…").color(Color::Muted).into_any_element(),
-            Some(Fetch::Failed(message)) => return Label::new(message.clone()).color(Color::Error).into_any_element(),
+            None | Some(Fetch::Loading) => {
+                return Label::new("Loading indexes…")
+                    .color(Color::Muted)
+                    .into_any_element();
+            }
+            Some(Fetch::Failed(message)) => {
+                return Label::new(message.clone())
+                    .color(Color::Error)
+                    .into_any_element();
+            }
             Some(Fetch::Loaded(indexes)) => indexes,
         };
         let header = |text: &'static str, width: Option<f32>| {
-            let label = Label::new(text).size(LabelSize::Small).weight(gpui::FontWeight::SEMIBOLD);
+            let label = Label::new(text)
+                .size(LabelSize::Small)
+                .weight(gpui::FontWeight::SEMIBOLD);
             match width {
                 Some(width) => div().w(px(width)).flex_none().child(label),
                 None => div().flex_1().child(label),
             }
         };
-        let mut table = v_flex().rounded_md().border_1().border_color(colors.border).child(
-            h_flex().px_3().py_2().gap_3().bg(colors.element_background).child(header("Name & Definition", None)).child(header("Type", Some(120.))).child(header("Properties", Some(260.))),
-        );
+        let mut table = v_flex()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_3()
+                    .bg(colors.element_background)
+                    .child(header("Name & Definition", None))
+                    .child(header("Type", Some(120.)))
+                    .child(header("Properties", Some(260.))),
+            );
         for index in indexes {
             let keys = index.get_document("key").cloned().unwrap_or_default();
-            let definition = keys.iter().map(|(key, value)| format!("{key} {value}")).collect::<Vec<_>>().join(", ");
+            let definition = keys
+                .iter()
+                .map(|(key, value)| format!("{key} {value}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             table = table.child(
                 h_flex()
                     .px_3()
@@ -1759,21 +2508,52 @@ impl DatabaseView {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(Label::new(index.get_str("name").unwrap_or_default().to_string()).buffer_font(cx))
-                            .child(Label::new(definition).size(LabelSize::Small).buffer_font(cx).color(Color::Muted)),
+                            .child(
+                                Label::new(index.get_str("name").unwrap_or_default().to_string())
+                                    .buffer_font(cx),
+                            )
+                            .child(
+                                Label::new(definition)
+                                    .size(LabelSize::Small)
+                                    .buffer_font(cx)
+                                    .color(Color::Muted),
+                            ),
                     )
-                    .child(div().w(px(120.)).flex_none().child(Label::new(index_type(&keys)).size(LabelSize::Small)))
-                    .child(div().w(px(260.)).flex_none().child(Label::new(index_properties(index).join(" · ")).size(LabelSize::Small).color(Color::Accent))),
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .flex_none()
+                            .child(Label::new(index_type(&keys)).size(LabelSize::Small)),
+                    )
+                    .child(
+                        div().w(px(260.)).flex_none().child(
+                            Label::new(index_properties(index).join(" · "))
+                                .size(LabelSize::Small)
+                                .color(Color::Accent),
+                        ),
+                    ),
             );
         }
-        v_flex().id("database-indexes").flex_1().min_h_0().overflow_y_scroll().child(table).into_any_element()
+        v_flex()
+            .id("database-indexes")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(table)
+            .into_any_element()
     }
 
     fn render_validation(&self, tab: &MongoTab, cx: &mut Context<Self>) -> AnyElement {
         match &tab.options {
-            None | Some(Fetch::Loading) => Label::new("Loading…").color(Color::Muted).into_any_element(),
-            Some(Fetch::Failed(message)) => Label::new(message.clone()).color(Color::Error).into_any_element(),
-            Some(Fetch::Loaded(None)) => Label::new("The collection no longer exists.").color(Color::Warning).into_any_element(),
+            None | Some(Fetch::Loading) => Label::new("Loading…")
+                .color(Color::Muted)
+                .into_any_element(),
+            Some(Fetch::Failed(message)) => Label::new(message.clone())
+                .color(Color::Error)
+                .into_any_element(),
+            Some(Fetch::Loaded(None)) => Label::new("The collection no longer exists.")
+                .color(Color::Warning)
+                .into_any_element(),
             Some(Fetch::Loaded(Some(options))) => match options.get_document("validator") {
                 Ok(validator) => {
                     let mut lines = vec![SharedString::from(format!(
@@ -1781,7 +2561,11 @@ impl DatabaseView {
                         options.get_str("validationLevel").unwrap_or("strict"),
                         options.get_str("validationAction").unwrap_or("error")
                     ))];
-                    lines.extend(to_display_json(validator).lines().map(|line| SharedString::from(line.to_string())));
+                    lines.extend(
+                        to_display_json(validator)
+                            .lines()
+                            .map(|line| SharedString::from(line.to_string())),
+                    );
                     render_lines("database-validation", lines, &tab.scroll, cx)
                 }
                 Err(_) => v_flex()
@@ -1789,7 +2573,12 @@ impl DatabaseView {
                     .items_center()
                     .gap_2()
                     .child(Headline::new("No validation rules").size(HeadlineSize::Small))
-                    .child(Label::new("Documents in this collection are not checked against a schema.").color(Color::Muted))
+                    .child(
+                        Label::new(
+                            "Documents in this collection are not checked against a schema.",
+                        )
+                        .color(Color::Muted),
+                    )
                     .into_any_element(),
             },
         }
@@ -1813,23 +2602,39 @@ impl DatabaseView {
                         h_flex()
                             .gap_2()
                             .child(Label::new("Pipeline").weight(gpui::FontWeight::SEMIBOLD))
-                            .child(Label::new("Read-only: $out and $merge are refused.").size(LabelSize::Small).color(Color::Muted))
+                            .child(
+                                Label::new("Read-only: $out and $merge are refused.")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
                             .child(div().flex_1())
-                            .child(Button::new("database-run-pipeline", "Run").style(ButtonStyle::Tinted(TintColor::Success)).on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(tab) = this.tab_mut() {
-                                    tab.aggregation_skip = 0;
-                                }
-                                this.run_aggregation(cx);
-                            }))),
+                            .child(
+                                Button::new("database-run-pipeline", "Run")
+                                    .style(ButtonStyle::Tinted(TintColor::Success))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(tab) = this.tab_mut() {
+                                            tab.aggregation_skip = 0;
+                                        }
+                                        this.run_aggregation(cx);
+                                    })),
+                            ),
                     )
                     .child(tab.pipeline.clone()),
             )
-            .child(h_flex().child(div().flex_1()).child(self.render_pager(tab, true, cx)))
+            .child(
+                h_flex()
+                    .child(div().flex_1())
+                    .child(self.render_pager(tab, true, cx)),
+            )
             .child(self.render_results(tab, tab.aggregation.as_ref(), cx))
             .into_any_element()
     }
 
-    pub(crate) fn render_mongo(&self, connection: &crate::Connection, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_mongo(
+        &self,
+        connection: &crate::Connection,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let Some(tab) = self.tab() else {
             return v_flex()
@@ -1838,10 +2643,21 @@ impl DatabaseView {
                 .justify_center()
                 .gap_2()
                 .child(Headline::new(connection.name.clone()).size(HeadlineSize::Small))
-                .child(Label::new(self.status.clone().unwrap_or_else(|| "Pick a collection on the left.".into())).color(Color::Muted))
+                .child(
+                    Label::new(
+                        self.status
+                            .clone()
+                            .unwrap_or_else(|| "Pick a collection on the left.".into()),
+                    )
+                    .color(Color::Muted),
+                )
                 .into_any_element();
         };
-        let sub_tab = |id: &'static str, label: &'static str, badge: Option<String>, target: SubTab, cx: &mut Context<Self>| {
+        let sub_tab = |id: &'static str,
+                       label: &'static str,
+                       badge: Option<String>,
+                       target: SubTab,
+                       cx: &mut Context<Self>| {
             let selected = tab.sub_tab == target;
             h_flex()
                 .id(id)
@@ -1850,11 +2666,39 @@ impl DatabaseView {
                 .gap_2()
                 .cursor_pointer()
                 .border_b_2()
-                .border_color(if selected { colors.text_accent } else { gpui::transparent_black() })
+                .border_color(if selected {
+                    colors.text_accent
+                } else {
+                    gpui::transparent_black()
+                })
                 .on_click(cx.listener(move |this, _, _, cx| this.set_sub_tab(target, cx)))
-                .child(Label::new(label).weight(if selected { gpui::FontWeight::BOLD } else { gpui::FontWeight::NORMAL }).color(if selected { Color::Default } else { Color::Muted }))
+                .child(
+                    Label::new(label)
+                        .weight(if selected {
+                            gpui::FontWeight::BOLD
+                        } else {
+                            gpui::FontWeight::NORMAL
+                        })
+                        .color(if selected {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        }),
+                )
                 .when_some(badge, |this, badge| {
-                    this.child(div().px_2().rounded_full().border_1().border_color(colors.border).bg(colors.element_background).child(Label::new(badge).size(LabelSize::XSmall).weight(gpui::FontWeight::SEMIBOLD)))
+                    this.child(
+                        div()
+                            .px_2()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.element_background)
+                            .child(
+                                Label::new(badge)
+                                    .size(LabelSize::XSmall)
+                                    .weight(gpui::FontWeight::SEMIBOLD),
+                            ),
+                    )
                 })
         };
         let documents_badge = tab.estimated.map(short_count);
@@ -1881,12 +2725,21 @@ impl DatabaseView {
                 .items_center()
                 .gap_2()
                 .child(Headline::new("Schema analysis").size(HeadlineSize::Small))
-                .child(Label::new("Not in Vilo yet. Use the Table view to compare fields across documents.").color(Color::Muted))
+                .child(
+                    Label::new(
+                        "Not in Vilo yet. Use the Table view to compare fields across documents.",
+                    )
+                    .color(Color::Muted),
+                )
                 .into_any_element(),
             SubTab::Indexes => self.render_indexes(tab, cx),
             SubTab::Validation => self.render_validation(tab, cx),
         };
-        let crumb = |text: String, accent: bool| Label::new(text).weight(gpui::FontWeight::BOLD).color(if accent { Color::Success } else { Color::Muted });
+        let crumb = |text: String, accent: bool| {
+            Label::new(text)
+                .weight(gpui::FontWeight::BOLD)
+                .color(if accent { Color::Success } else { Color::Muted })
+        };
         v_flex()
             .size_full()
             .child(self.render_tabs(cx))
@@ -1958,24 +2811,51 @@ mod tests {
     #[test]
     fn test_paths_columns_and_cells() {
         let document = doc! { "a.b": 1, "a": { "b": 2 }, "list": [ { "x": "y" } ] };
-        assert_eq!(value_at(&document, &["a.b".to_string()]), Some(&Bson::Int32(1)));
-        assert_eq!(value_at(&document, &["a".to_string(), "b".to_string()]), Some(&Bson::Int32(2)));
-        assert_eq!(value_at(&document, &["list".to_string(), "0".to_string(), "x".to_string()]), Some(&Bson::String("y".into())));
-        assert_eq!(value_at(&document, &["list".to_string(), "9".to_string()]), None);
-        assert_eq!(table_columns(&[doc! { "b": 1, "a": 2 }, doc! { "c": 3, "a": 4 }]), vec!["b", "a", "c"]);
+        assert_eq!(
+            value_at(&document, &["a.b".to_string()]),
+            Some(&Bson::Int32(1))
+        );
+        assert_eq!(
+            value_at(&document, &["a".to_string(), "b".to_string()]),
+            Some(&Bson::Int32(2))
+        );
+        assert_eq!(
+            value_at(
+                &document,
+                &["list".to_string(), "0".to_string(), "x".to_string()]
+            ),
+            Some(&Bson::String("y".into()))
+        );
+        assert_eq!(
+            value_at(&document, &["list".to_string(), "9".to_string()]),
+            None
+        );
+        assert_eq!(
+            table_columns(&[doc! { "b": 1, "a": 2 }, doc! { "c": 3, "a": 4 }]),
+            vec!["b", "a", "c"]
+        );
         assert_eq!(cell_text(None).0, "—");
         assert_eq!(cell_text(Some(&Bson::Null)).0, "null");
     }
 
     #[test]
     fn test_csv_indexes_and_counts() {
-        assert_eq!(csv_field(Some(&Bson::String("a,b \"c\"".into()))), "\"a,b \"\"c\"\"\"");
+        assert_eq!(
+            csv_field(Some(&Bson::String("a,b \"c\"".into()))),
+            "\"a,b \"\"c\"\"\""
+        );
         assert_eq!(csv_field(None), "");
         assert_eq!(csv_field(Some(&Bson::Int32(3))), "3");
-        assert_eq!(index_type(&doc! { "status": 1, "createTime": -1 }), "REGULAR");
+        assert_eq!(
+            index_type(&doc! { "status": 1, "createTime": -1 }),
+            "REGULAR"
+        );
         assert_eq!(index_type(&doc! { "name": "text" }), "TEXT");
         assert_eq!(index_type(&doc! { "$**": 1 }), "WILDCARD");
-        assert_eq!(index_properties(&doc! { "unique": true, "expireAfterSeconds": 60 }), vec!["UNIQUE", "TTL 60s"]);
+        assert_eq!(
+            index_properties(&doc! { "unique": true, "expireAfterSeconds": 60 }),
+            vec!["UNIQUE", "TTL 60s"]
+        );
         assert_eq!(short_count(10_000_000), "10M");
         assert_eq!(short_count(4_055_771), "4.1M");
         assert_eq!(short_count(56), "56");
