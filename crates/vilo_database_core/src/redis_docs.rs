@@ -70,12 +70,15 @@ pub fn search_commands<'a>(
 /// The command a typed line starts with, preferring a subcommand (`CONFIG GET`) over its
 /// container (`CONFIG`). Words are split as the CLI runs them, quotes included.
 pub fn command_for_line(line: &str) -> Option<&'static CommandDoc> {
-    let words = match crate::redis::split_command(line) {
+    // A half-typed argument, e.g. an open quote, is closed so the command words still parse.
+    let parsed = crate::redis::split_command(line)
+        .or_else(|_| crate::redis::split_command(&format!("{line}\"")))
+        .or_else(|_| crate::redis::split_command(&format!("{line}'")));
+    let words = match parsed {
         Ok(words) => words
             .iter()
             .map(|word| String::from_utf8_lossy(word).to_uppercase())
             .collect::<Vec<_>>(),
-        // Half-typed, e.g. an open quote: the words so far still name the command.
         Err(_) => line.split_whitespace().map(str::to_uppercase).collect(),
     };
     let mut words = words.into_iter();
@@ -150,6 +153,12 @@ mod tests {
             "XINFO STREAM"
         );
         assert_eq!(command_for_line("HGET \"user").unwrap().name, "HGET");
+        assert_eq!(
+            command_for_line("XINFO \"STREAM\" \"user").unwrap().name,
+            "XINFO STREAM"
+        );
+        assert_eq!(command_for_line("\"GET\" \"user").unwrap().name, "GET");
+        assert_eq!(command_for_line("'GET' 'user").unwrap().name, "GET");
         assert!(command_for_line("   ").is_none());
         assert!(command_for_line("nonsense").is_none());
     }
