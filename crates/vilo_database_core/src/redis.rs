@@ -669,6 +669,33 @@ pub(crate) fn cluster_hash(name: &str, args: &[Value]) -> fred::types::ClusterHa
     }
 }
 
+/// The database in a connection string's path, as fred reads it for a single server.
+fn url_database(url: &str) -> Option<u8> {
+    url::Url::parse(url)
+        .ok()?
+        .path()
+        .trim_matches('/')
+        .parse()
+        .ok()
+}
+
+/// fred keeps an IPv6 seed as `[::1]` and hands that to rustls as the server name, which rustls
+/// refuses before any certificate is checked; the name is given without brackets.
+fn unbracket_tls_names(config: &mut Config) {
+    let fix = |server: &mut Server| {
+        if server.host.starts_with('[') {
+            server.tls_server_name = Some(server.host.trim_matches(['[', ']']).into());
+        }
+    };
+    match &mut config.server {
+        fred::types::config::ServerConfig::Centralized { server } => fix(server),
+        fred::types::config::ServerConfig::Clustered { hosts, .. } => {
+            hosts.iter_mut().for_each(fix)
+        }
+        _ => {}
+    }
+}
+
 /// The host a connection string names, which TLS certificates are checked against. Taken from
 /// the URL itself rather than from fred's seeds, which put `node=` entries first.
 fn url_host(url: &str) -> Result<String> {
@@ -750,6 +777,13 @@ impl RedisSession {
         let (url, tls_scheme) = crate::redis_tls::plain_url(url)?;
         let mut config = Config::from_url(&url).context("The Redis URL is not valid")?;
         let host = url_host(&url)?;
+        // fred ignores the path of a cluster URL; a database there must not quietly become 0.
+        if config.server.is_clustered() {
+            anyhow::ensure!(
+                database.or(url_database(&url)).unwrap_or(0) == 0,
+                "A Redis cluster only has database 0."
+            );
+        }
         let tls_config = match (tls_scheme, tls) {
             (true, settings) => Some(Arc::new(crate::redis_tls::client_config(
                 &settings.cloned().unwrap_or_default(),
@@ -759,6 +793,7 @@ impl RedisSession {
             (false, None) => None,
         };
         if let Some(tls_config) = &tls_config {
+            unbracket_tls_names(&mut config);
             config.tls = Some(fred::types::config::TlsConfig {
                 connector: fred::types::config::TlsConnector::from(
                     tokio_rustls::TlsConnector::from(tls_config.clone()),
@@ -2311,6 +2346,24 @@ mod tests {
         assert_eq!(url_host("redis://[::1]:6379").unwrap(), "::1");
         assert_eq!(url_host("redis://user:pw@h:1/2").unwrap(), "h");
         assert!(url_host("redis://").is_err());
+        assert_eq!(url_database("redis-cluster://h:1/2"), Some(2));
+        assert_eq!(url_database("redis://h:1"), None);
+    }
+
+    #[test]
+    fn test_ipv6_seeds_get_a_tls_name_rustls_takes() {
+        for url in ["redis://[::1]:6380", "redis-cluster://[::1]:6380"] {
+            let mut config = Config::from_url(url).unwrap();
+            unbracket_tls_names(&mut config);
+            let host = match &config.server {
+                fred::types::config::ServerConfig::Centralized { server } => server.clone(),
+                fred::types::config::ServerConfig::Clustered { hosts, .. } => hosts[0].clone(),
+                _ => panic!("{url}"),
+            };
+            let name = host.tls_server_name.unwrap_or(host.host);
+            assert_eq!(&*name, "::1", "{url}");
+            assert!(rustls::pki_types::ServerName::try_from(name.to_string()).is_ok());
+        }
     }
 
     #[test]

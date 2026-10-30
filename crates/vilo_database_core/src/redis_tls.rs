@@ -568,6 +568,15 @@ mod tests {
             format!("{error:#}").contains("only has database 0"),
             "{error:#}"
         );
+        let explicit = RedisSession::connect(&format!("{url}/2"))
+            .await
+            .err()
+            .expect("fred ignores a cluster URL's path; Vilo does not");
+        assert!(
+            format!("{explicit:#}").contains("only has database 0"),
+            "{explicit:#}"
+        );
+        assert!(RedisSession::connect(&format!("{url}/0")).await.is_ok());
         let in_the_url = RedisSession::connect(&format!("{single}/3"))
             .await
             .err()
