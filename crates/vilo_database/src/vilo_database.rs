@@ -252,6 +252,9 @@ struct RedisFields {
     password: Entity<Editor>,
     database: Entity<Editor>,
     tls: bool,
+    /// Kept from the saved string; see `RedisParts`.
+    mode: String,
+    query: String,
     ca_file: Entity<Editor>,
     cert_file: Entity<Editor>,
     key_file: Entity<Editor>,
@@ -283,11 +286,15 @@ struct RedisParts {
     password: String,
     database: String,
     tls: bool,
+    /// What the form does not show but a saved string had and keeps: the scheme's `-cluster`
+    /// or `-sentinel` and the query, such as further `node=` seeds.
+    mode: String,
+    query: String,
 }
 
 impl RedisParts {
     fn to_uri(&self) -> Result<String> {
-        let scheme = if self.tls { "rediss" } else { "redis" };
+        let scheme = format!("{}{}", if self.tls { "rediss" } else { "redis" }, self.mode);
         let port = if self.port.is_empty() {
             "6379"
         } else {
@@ -309,6 +316,9 @@ impl RedisParts {
                 .context("Database must be a number from 0")?;
             url.set_path(&format!("/{}", self.database));
         }
+        if !self.query.is_empty() {
+            url.set_query(Some(&self.query));
+        }
         Ok(url.to_string())
     }
 
@@ -326,6 +336,12 @@ impl RedisParts {
             password: url.password().map(decode).unwrap_or_default(),
             database: url.path().trim_start_matches('/').to_string(),
             tls: vilo_database_core::redis_tls::tls_scheme(uri),
+            mode: ["-cluster", "-sentinel"]
+                .into_iter()
+                .find(|mode| url.scheme().to_ascii_lowercase().ends_with(mode))
+                .unwrap_or_default()
+                .to_string(),
+            query: url.query().unwrap_or_default().to_string(),
         })
     }
 }
@@ -1065,6 +1081,8 @@ impl DatabaseView {
                         .and_then(|c| c.redis_tls.as_ref())
                         .is_none_or(|tls| tls.verify),
                     tls: false,
+                    mode: String::new(),
+                    query: String::new(),
                 },
             ),
             editing,
@@ -1098,6 +1116,8 @@ impl DatabaseView {
                                         .update(cx, |editor, cx| editor.set_text(text, window, cx));
                                 }
                                 redis.tls = parts.tls;
+                                redis.mode = parts.mode;
+                                redis.query = parts.query;
                             }
                             _ => uri.update(cx, |uri, cx| uri.set_text(saved, window, cx)),
                         }
@@ -1133,6 +1153,8 @@ impl DatabaseView {
                 password: text(&redis.password, cx),
                 database: text(&redis.database, cx),
                 tls: redis.tls,
+                mode: redis.mode.clone(),
+                query: redis.query.clone(),
             };
             // An edited connection whose fields never loaded keeps its saved string.
             uri = if parts.host.is_empty() {
@@ -1213,7 +1235,7 @@ impl DatabaseView {
                         Kind::MongoDb => {
                             uri.starts_with("mongodb://") || uri.starts_with("mongodb+srv://")
                         }
-                        Kind::Redis => uri.starts_with("redis://") || uri.starts_with("rediss://"),
+                        Kind::Redis => vilo_database_core::redis_tls::plain_url(&uri).is_ok(),
                     };
                     anyhow::ensure!(
                         expected,
@@ -2437,10 +2459,19 @@ mod tests {
             password: "p@ss/w+o=r&d%".into(),
             database: "2".into(),
             tls: true,
+            ..Default::default()
         };
         let uri = parts.to_uri().unwrap();
         assert!(uri.starts_with("rediss://default:"));
         assert_eq!(RedisParts::from_uri(&uri), Some(parts));
+        // An explicit cluster and its extra seeds survive an edit.
+        for saved in [
+            "redis-cluster://host-a:6379?node=host-b:6379",
+            "rediss-cluster://u:p@host-a:6380?node=host-b:6380&node=host-c:6380",
+        ] {
+            let parts = RedisParts::from_uri(saved).unwrap();
+            assert_eq!(parts.to_uri().unwrap(), saved);
+        }
         assert!(
             RedisParts {
                 host: "h".into(),
