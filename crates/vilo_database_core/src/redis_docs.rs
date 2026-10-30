@@ -70,17 +70,20 @@ pub fn search_commands<'a>(
 /// The command a typed line starts with, preferring a subcommand (`CONFIG GET`) over its
 /// container (`CONFIG`). Words are split as the CLI runs them, quotes included.
 pub fn command_for_line(line: &str) -> Option<&'static CommandDoc> {
-    // A half-typed argument, e.g. an open quote, is closed so the command words still parse.
-    let parsed = crate::redis::split_command(line)
-        .or_else(|_| crate::redis::split_command(&format!("{line}\"")))
-        .or_else(|_| crate::redis::split_command(&format!("{line}'")));
-    let words = match parsed {
-        Ok(words) => words
-            .iter()
-            .map(|word| String::from_utf8_lossy(word).to_uppercase())
-            .collect::<Vec<_>>(),
-        Err(_) => line.split_whitespace().map(str::to_uppercase).collect(),
-    };
+    // Only the first words matter, so a half-typed argument (an open quote, a trailing escape)
+    // is cut off: the longest prefix ending at a space that parses is used.
+    let ends = std::iter::once(line.len()).chain(
+        line.char_indices()
+            .rev()
+            .filter(|(_, character)| character.is_whitespace())
+            .map(|(index, _)| index),
+    );
+    let words = ends
+        .filter_map(|end| line.get(..end))
+        .find_map(|prefix| crate::redis::split_command(prefix).ok())?
+        .iter()
+        .map(|word| String::from_utf8_lossy(word).to_uppercase())
+        .collect::<Vec<_>>();
     let mut words = words.into_iter();
     let first = words.next()?;
     let docs = command_docs().ok()?;
@@ -159,6 +162,11 @@ mod tests {
         );
         assert_eq!(command_for_line("\"GET\" \"user").unwrap().name, "GET");
         assert_eq!(command_for_line("'GET' 'user").unwrap().name, "GET");
+        assert_eq!(
+            command_for_line("XINFO \"STREAM\" \"user\\").unwrap().name,
+            "XINFO STREAM"
+        );
+        assert_eq!(command_for_line("\"GET\" \"a b\\x").unwrap().name, "GET");
         assert!(command_for_line("   ").is_none());
         assert!(command_for_line("nonsense").is_none());
     }
