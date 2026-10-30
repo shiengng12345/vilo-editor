@@ -113,7 +113,8 @@ pub(crate) fn dangling_writes(log: &str) -> Vec<(String, String)> {
         };
         match entry.get("phase").and_then(|value| value.as_str()) {
             Some("intent") => open.push((operation.to_string(), summarize_intent(&entry))),
-            _ => open.retain(|(known, _)| known != operation),
+            Some("result" | "acknowledged") => open.retain(|(known, _)| known != operation),
+            _ => {}
         }
     }
     open
@@ -676,6 +677,7 @@ mod tests {
             r#"{"operation":"c","phase":"intent","kind":"deleteOne","target":"db.c","time":"t3","name":"QAT","environment":"QAT"}"#,
             r#"{"operation":"c","phase":"acknowledged"}"#,
             r#"{"operation":"d","phase":"intent","kind":"insertOne","target":"db.d","time":"t4","name":"QAT","environment":"QAT"}"#,
+            r#"{"operation":"d","phase":"retry"}"#,
         ]
         .join("\n");
         let dangling = dangling_writes(&log);

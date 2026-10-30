@@ -142,7 +142,11 @@ impl DatabaseView {
             .as_ref()
             .is_some_and(|state| state.switching_database())
         {
-            self.write_notice = Some("Wait for the database switch to finish, then edit.".into());
+            // Shown by the database menu, so it goes when the switch ends.
+            if let Some(state) = self.redis_state.as_mut() {
+                state.switch_error =
+                    Some("Wait for the database switch to finish, then edit.".into());
+            }
             cx.notify();
             return;
         }

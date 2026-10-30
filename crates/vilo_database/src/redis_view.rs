@@ -10,7 +10,10 @@ use std::{
 };
 
 use collections::{HashMap, HashSet};
-use gpui::{ClipboardItem, Hsla, Task, UniformListScrollHandle, prelude::*, rgb, uniform_list};
+use gpui::{
+    ClipboardItem, Entity, Focusable as _, Hsla, Task, UniformListScrollHandle, prelude::*, rgb,
+    uniform_list,
+};
 use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
 use vilo_database_core::redis::{
     Bytes, ClusterNode, KeyInfo, ScanNode, StreamEntry, format_reply, quote_bytes, split_command,
@@ -193,7 +196,9 @@ pub(crate) struct RedisState {
     keyspace_error: Option<SharedString>,
     /// The database being connected to while a switch is in progress.
     switching: Option<u8>,
-    switch_error: Option<SharedString>,
+    pub(crate) switch_error: Option<SharedString>,
+    /// A database number typed in when the menu cannot know how many there are.
+    database_input: Option<Entity<editor::Editor>>,
 }
 
 impl RedisState {
@@ -241,6 +246,7 @@ impl RedisState {
             keyspace_error: None,
             switching: None,
             switch_error: None,
+            database_input: None,
         }
     }
 
@@ -1336,7 +1342,8 @@ impl DatabaseView {
                         );
                     }
                 }
-                let orphans = nodes
+                // Nodes with no known primary (mid-failover, handshake, noaddr) are listed too.
+                let others = nodes
                     .iter()
                     .filter(|node| {
                         !node.primary
@@ -1344,7 +1351,34 @@ impl DatabaseView {
                                 Some(primary.id.as_str()) == node.primary_id.as_deref()
                             })
                     })
-                    .count();
+                    .collect::<Vec<_>>();
+                let orphans = others.len();
+                for node in &others {
+                    let (state_text, state_color) = health(node);
+                    table = table.child(
+                        row(&colors)
+                            .child(cell(node.address.clone(), Some(200.), Color::Warning))
+                            .child(cell(
+                                if node.primary_id.is_some() {
+                                    "replica"
+                                } else {
+                                    "unknown"
+                                }
+                                .into(),
+                                Some(80.),
+                                Color::Warning,
+                            ))
+                            .child(cell(
+                                match &node.primary_id {
+                                    Some(primary) => format!("primary {primary} not in the list"),
+                                    None => "no role reported".to_string(),
+                                },
+                                None,
+                                Color::Muted,
+                            ))
+                            .child(cell(state_text, Some(160.), state_color)),
+                    );
+                }
                 v_flex()
                     .gap_2()
                     .child(
@@ -1356,7 +1390,7 @@ impl DatabaseView {
                                 .filter(|node| node.primary_id.is_some())
                                 .count(),
                             if orphans > 0 {
-                                format!(" · {orphans} replicas of unknown primaries")
+                                format!(" · {orphans} nodes without a known primary, listed last")
                             } else {
                                 String::new()
                             }
@@ -2262,10 +2296,63 @@ impl DatabaseView {
                                     },
                                 );
                             }
-                            menu
+                            // CONFIG may be off-limits, so any number the server accepts can be typed.
+                            menu.separator()
+                                .entry("Other database…", None, move |window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        let input = crate::editor(
+                                            "Database number, 0–255",
+                                            "",
+                                            false,
+                                            window,
+                                            cx,
+                                        );
+                                        window.focus(&input.focus_handle(cx), cx);
+                                        if let Some(state) = this.redis_state() {
+                                            state.database_input = Some(input);
+                                        }
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                })
                         }))
                     }),
             )
+            .when_some(state.database_input.clone(), |this, input| {
+                let submit = |this: &mut DatabaseView, cx: &mut Context<DatabaseView>| {
+                    let Some(state) = this.redis_state() else {
+                        return;
+                    };
+                    let Some(input) = state.database_input.clone() else {
+                        return;
+                    };
+                    match input.read(cx).text(cx).trim().parse::<u8>() {
+                        Ok(database) => {
+                            state.database_input = None;
+                            this.switch_redis_database(database, cx);
+                        }
+                        Err(_) => {
+                            state.switch_error =
+                                Some("Type a database number from 0 to 255.".into())
+                        }
+                    }
+                    cx.notify();
+                };
+                this.child(
+                    h_flex()
+                        .w(px(120.))
+                        .on_action(
+                            cx.listener(move |this, _: &menu::Confirm, _, cx| submit(this, cx)),
+                        )
+                        .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
+                            if let Some(state) = this.redis_state() {
+                                state.database_input = None;
+                            }
+                            cx.notify();
+                        }))
+                        .child(crate::boxed(input, cx)),
+                )
+            })
             .when_some(state.switch_error.clone(), |this, error| {
                 this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
             })

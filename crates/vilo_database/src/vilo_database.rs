@@ -1866,12 +1866,10 @@ impl DatabaseView {
             let result = read.await;
             this.update(cx, |this, cx| {
                 match result {
+                    // The log is the record: a write whose result could not be logged has no result
+                    // line there either, so the fresh list still holds it.
                     Ok(dangling) => {
-                        for entry in dangling {
-                            if !this.dangling_writes.iter().any(|known| known.0 == entry.0) {
-                                this.dangling_writes.push(entry);
-                            }
-                        }
+                        this.dangling_writes = dangling;
                         this.audit_problem = None;
                     }
                     Err(error) => this.audit_problem = Some(
