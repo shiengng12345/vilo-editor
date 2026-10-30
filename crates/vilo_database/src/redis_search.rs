@@ -33,6 +33,7 @@ pub(crate) struct SearchState {
     rows: Vec<(Bytes, String, bool, String)>,
     running: bool,
     /// Bumped by every index choice and every search, so an answer to an older one is dropped.
+    list_attempt: u64,
     info_attempt: u64,
     search_attempt: u64,
     scroll: UniformListScrollHandle,
@@ -51,6 +52,7 @@ impl Default for SearchState {
             page: None,
             rows: Vec::new(),
             running: false,
+            list_attempt: 0,
             info_attempt: 0,
             search_attempt: 0,
             scroll: UniformListScrollHandle::new(),
@@ -185,6 +187,8 @@ impl DatabaseView {
             return;
         };
         search.indexes = None;
+        search.list_attempt += 1;
+        let attempt = search.list_attempt;
         let task = run(cx, async move { session.search_indexes().await });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -192,7 +196,10 @@ impl DatabaseView {
                 if this.generation != generation {
                     return;
                 }
-                let Some(search) = this.search_state() else {
+                let Some(search) = this
+                    .search_state()
+                    .filter(|search| search.list_attempt == attempt)
+                else {
                     return;
                 };
                 let first = result
