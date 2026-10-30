@@ -616,6 +616,16 @@ impl Php<'_> {
     }
 
     /// `LEN:"…"` with exactly LEN bytes between the quotes.
+    /// A sized class or enum name as text. Names are bounded before they are converted, as a
+    /// name that is not UTF-8 grows when shown.
+    fn name(&mut self) -> Result<String, String> {
+        let name = self.sized()?;
+        if name.len() > MAX_NAME {
+            return self.error("a name too long");
+        }
+        Ok(String::from_utf8_lossy(&name).to_string())
+    }
+
     fn sized(&mut self) -> Result<Vec<u8>, String> {
         let length = self.count(b':')?;
         self.expect(b'"')?;
@@ -687,9 +697,9 @@ impl Php<'_> {
                 })
             }
             b'E' => {
-                let text = self.sized()?;
+                let text = self.name()?;
                 self.expect(b';')?;
-                self.remember(Node::Name(String::from_utf8_lossy(&text).to_string()))
+                self.remember(Node::Name(text))
             }
             b'r' | b'R' => {
                 let index = self.count(b';')?;
@@ -723,7 +733,7 @@ impl Php<'_> {
                 Ok(id)
             }
             b'O' => {
-                let class = String::from_utf8_lossy(&self.sized()?).to_string();
+                let class = self.name()?;
                 self.expect(b':')?;
                 let length = self.count(b':')?;
                 self.expect(b'{')?;
@@ -744,7 +754,7 @@ impl Php<'_> {
                 Ok(id)
             }
             b'C' => {
-                let class = String::from_utf8_lossy(&self.sized()?).to_string();
+                let class = self.name()?;
                 self.expect(b':')?;
                 let length = self.count(b':')?;
                 self.expect(b'{')?;
@@ -801,6 +811,9 @@ impl Php<'_> {
         self.expect(b':')?;
         let name = self.sized()?;
         self.expect(b';')?;
+        if name.len() > MAX_NAME {
+            return self.error("a property name too long");
+        }
         let name = String::from_utf8(name)
             .unwrap_or_else(|error| crate::redis::quote_bytes(error.as_bytes()));
         Ok(
@@ -851,6 +864,23 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 return fail(at, "a line without its end");
             };
             arena.fits(length)?;
+            let text = String::from_utf8_lossy(&bytes[at..at + length]).to_string();
+            at += length + 1;
+            text
+        }};
+    }
+    // A module or class name line, bounded before it is converted.
+    macro_rules! name_line {
+        () => {{
+            let Some(length) = bytes
+                .get(at..)
+                .and_then(|rest| rest.iter().position(|b| *b == b'\n'))
+            else {
+                return fail(at, "a line without its end");
+            };
+            if length > MAX_NAME {
+                return fail(at, "a global name too long");
+            }
             let text = String::from_utf8_lossy(&bytes[at..at + length]).to_string();
             at += length + 1;
             text
@@ -1033,19 +1063,19 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 };
                 let raw = &bytes[at..at + length];
                 at += length + 1;
-                // Latin-1 can take two bytes per input byte as text.
-                arena.fits(raw.len().saturating_mul(2))?;
-                let Some(text) = raw_unicode_escape(raw) else {
+                // Code points take four bytes each.
+                arena.fits(raw.len().saturating_mul(4))?;
+                let Some(node) = raw_unicode_escape(raw) else {
                     return fail(at, "a UNICODE with a bad escape");
                 };
-                push(arena, &mut stack, Node::Text(text))?
+                push(arena, &mut stack, node)?
             }
             b'T' | b'X' | b'B' => {
                 let length = u32::from_le_bytes(take!(4).try_into().map_err(|_| "ends early")?);
                 arena.fits(length as usize)?;
                 let data = take!(length as usize).to_vec();
                 let node = match opcode {
-                    b'X' => match python_text(&data) {
+                    b'X' => match python_text(arena, &data)? {
                         Some(node) => node,
                         None => return fail(at, "text that is not UTF-8"),
                     },
@@ -1063,7 +1093,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 let data = take!(length).to_vec();
                 let node = match opcode {
                     b'C' => Node::Bytes(data),
-                    0x8c => match python_text(&data) {
+                    0x8c => match python_text(arena, &data)? {
                         Some(node) => node,
                         None => return fail(at, "text that is not UTF-8"),
                     },
@@ -1080,7 +1110,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 arena.fits(length)?;
                 let data = take!(length).to_vec();
                 let node = if opcode == 0x8d {
-                    match python_text(&data) {
+                    match python_text(arena, &data)? {
                         Some(node) => node,
                         None => return fail(at, "text that is not UTF-8"),
                     }
@@ -1167,8 +1197,8 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 set_items(arena, &mut keys_of, target, pairs)?;
             }
             b'c' => {
-                let module = line!();
-                let name = line!();
+                let module = name_line!();
+                let name = name_line!();
                 if module.len() + name.len() > MAX_NAME {
                     return fail(at, "a global name too long");
                 }
@@ -1196,8 +1226,8 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 push(arena, &mut stack, Node::Object { class, fields })?
             }
             b'i' => {
-                let module = line!();
-                let name = line!();
+                let module = name_line!();
+                let name = name_line!();
                 let arguments = pop_mark(&mut stack, at)?;
                 let arguments = arena.add(Node::Tuple(arguments))?;
                 let class = format!("{module}.{name}");
@@ -1359,6 +1389,8 @@ impl Java<'_> {
         Ok(array)
     }
 
+    /// A class, field or interface name; bounded before it is converted, as broken bytes grow
+    /// into escapes when shown.
     fn utf(&mut self, long: bool) -> Result<String, String> {
         let length = if long {
             usize::try_from(u64::from_be_bytes(self.array()?))
@@ -1366,7 +1398,9 @@ impl Java<'_> {
         } else {
             usize::from(u16::from_be_bytes(self.array()?))
         };
-        self.arena.fits(length)?;
+        if length > MAX_NAME {
+            return self.error("a name too long");
+        }
         Ok(modified_utf8(self.take(length)?))
     }
 
@@ -1796,31 +1830,34 @@ fn is_integer(text: &str) -> bool {
 
 /// Python text as pickled: UTF-8 with surrogates passed through (Python allows lone
 /// surrogates in a str), which stay visible as \u{…}. Anything else that is not UTF-8 is `None`.
-fn python_text(bytes: &[u8]) -> Option<Node> {
+fn python_text(arena: &Arena, bytes: &[u8]) -> Result<Option<Node>, String> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok(Some(Node::Text(text.to_string())));
+    }
+    // Code points take four bytes each; checked before they are built.
+    arena.fits(bytes.len().saturating_mul(4))?;
     let mut points: Vec<u32> = Vec::new();
-    let mut lone = false;
     let mut rest = bytes;
     loop {
         match std::str::from_utf8(rest) {
             Ok(text) => {
-                if !lone {
-                    return Some(Node::Text(String::from_utf8(bytes.to_vec()).ok()?));
-                }
                 points.extend(text.chars().map(u32::from));
-                return Some(Node::CodePoints(points));
+                return Ok(Some(Node::CodePoints(points)));
             }
             Err(error) => {
                 let (valid, after) = rest.split_at(error.valid_up_to());
-                points.extend(std::str::from_utf8(valid).ok()?.chars().map(u32::from));
+                let Ok(valid) = std::str::from_utf8(valid) else {
+                    return Ok(None);
+                };
+                points.extend(valid.chars().map(u32::from));
                 match after {
                     [0xED, second @ 0xA0..=0xBF, third @ 0x80..=0xBF, ..] => {
                         points.push(
                             0xD000 | (u32::from(second & 0x3F) << 6) | u32::from(third & 0x3F),
                         );
-                        lone = true;
                         rest = &after[3..];
                     }
-                    _ => return None,
+                    _ => return Ok(None),
                 }
             }
         }
@@ -1884,12 +1921,12 @@ fn python_escapes(text: &str) -> Option<Vec<u8>> {
 
 /// Python's raw-unicode-escape (protocol 0 UNICODE): bytes are Latin-1 characters except
 /// \uXXXX and \UXXXXXXXX.
-fn raw_unicode_escape(bytes: &[u8]) -> Option<String> {
-    let mut out = String::new();
+fn raw_unicode_escape(bytes: &[u8]) -> Option<Node> {
+    let mut points: Vec<u32> = Vec::new();
     let mut at = 0;
     while let Some(&byte) = bytes.get(at) {
         if byte != b'\\' {
-            out.push(char::from(byte));
+            points.push(u32::from(byte));
             at += 1;
             continue;
         }
@@ -1905,14 +1942,23 @@ fn raw_unicode_escape(bytes: &[u8]) -> Option<String> {
             _ => 0,
         };
         let literal = if width == 0 { run } else { run - 1 };
-        out.extend(std::iter::repeat_n('\\', literal));
+        points.extend(std::iter::repeat_n(u32::from(b'\\'), literal));
         if width > 0 {
             let digits = std::str::from_utf8(bytes.get(at + 1..at + 1 + width)?).ok()?;
-            out.push(char::from_u32(u32::from_str_radix(digits, 16).ok()?)?);
+            let point = u32::from_str_radix(digits, 16).ok()?;
+            // Surrogates are kept as code points, as Python does; past Unicode is not text.
+            if point > 0x10FFFF {
+                return None;
+            }
+            points.push(point);
             at += 1 + width;
         }
     }
-    Some(out)
+    let text: Option<String> = points.iter().map(|point| char::from_u32(*point)).collect();
+    Some(match text {
+        Some(text) => Node::Text(text),
+        None => Node::CodePoints(points),
+    })
 }
 
 /// What makes two pickled dict keys the same key, as Python compares them: equal numbers are
@@ -1974,6 +2020,10 @@ fn set_items(
 ) -> Result<(), String> {
     for (key, value) in pairs {
         let fingerprint = dict_key(arena, key, 0);
+        // Remembered fingerprints are held text too.
+        if let Some(fingerprint) = &fingerprint {
+            arena.charge(fingerprint.len())?;
+        }
         let Node::Map(entries) = arena.get_mut(map)? else {
             return Err("not a pickle: entries set on something that is not a dict".into());
         };
@@ -2518,11 +2568,23 @@ mod tests {
         .unwrap();
         assert_eq!(numbers, "{\n  1: 3,\n}", "{numbers}");
         // raw-unicode-escape: two backslashes stay literal, one starts an escape.
+        let text = |node: Option<Node>| match node {
+            Some(Node::Text(text)) => Some(text),
+            _ => None,
+        };
         assert_eq!(
-            raw_unicode_escape(b"\\\\u0041").as_deref(),
+            text(raw_unicode_escape(b"\\\\u0041")).as_deref(),
             Some("\\\\u0041")
         );
-        assert_eq!(raw_unicode_escape(b"\\\\\\u0041").as_deref(), Some("\\\\A"));
+        assert_eq!(
+            text(raw_unicode_escape(b"\\\\\\u0041")).as_deref(),
+            Some("\\\\A")
+        );
+        // python3: pickle.dumps(chr(0xd800), protocol=0) is b"V\\ud800\np0\n."
+        assert_eq!(
+            decode(Decoder::Pickle, b"V\\ud800\np0\n.").unwrap(),
+            r#""\u{d800}""#
+        );
         // PHP keys and property names are bytes; ones that are not text stay distinct.
         let keys = decode(Decoder::Php, b"a:2:{s:1:\"\xff\";i:1;s:1:\"\xfe\";i:2;}").unwrap();
         assert!(
@@ -2591,6 +2653,35 @@ mod tests {
             decode(Decoder::Pickle, b"0N.").is_err(),
             "POP on an empty stack"
         );
+    }
+
+    #[test]
+    fn test_fingerprints_and_names_are_bounded() {
+        // {(s, i): s for i in range(99_000)} with a 4,000-character s: the remembered keys
+        // count against the text budget.
+        let mut keys = b"\x80\x04}\x94X\xa0\x0f\x00\x00".to_vec();
+        keys.extend(std::iter::repeat_n(b'a', 4000));
+        keys.extend_from_slice(b"\x940");
+        for index in 0..99_000_i32 {
+            keys.extend_from_slice(b"h\x01J");
+            keys.extend_from_slice(&index.to_le_bytes());
+            keys.extend_from_slice(b"\x86h\x01s");
+        }
+        keys.push(b'.');
+        assert!(
+            decode(Decoder::Pickle, &keys)
+                .unwrap_err()
+                .contains("MB of text")
+        );
+        let class = format!("O:5000:\"{}\":0:{{}}", "\u{ff}".repeat(2500));
+        assert!(
+            decode(Decoder::Php, class.as_bytes()).is_err(),
+            "a name past the limit"
+        );
+        let mut global = b"c".to_vec();
+        global.extend(std::iter::repeat_n(0xff, 5000));
+        global.extend_from_slice(b"\nx\n.");
+        assert!(decode(Decoder::Pickle, &global).is_err());
     }
 
     #[test]
