@@ -207,9 +207,10 @@ fn check_name(name: &str, others: &[String]) -> Result<(), &'static str> {
 struct Form {
     editing: Option<String>,
     kind: Kind,
-    site: Entity<Editor>,
+    /// Taken from the rail; a connection that already has a site or environment keeps it.
+    site: String,
     name: Entity<Editor>,
-    environment: Entity<Editor>,
+    environment: String,
     uri: Entity<Editor>,
     message: Option<SharedString>,
     checking: bool,
@@ -680,19 +681,11 @@ impl DatabaseView {
             .cloned();
         self.form = Some(Form {
             kind: existing.as_ref().map_or(self.kind_view, |c| c.kind),
-            site: editor(
-                "Site, e.g. CP",
-                &existing
-                    .as_ref()
-                    .map(|c| c.site.clone())
-                    .or_else(|| {
-                        Some(self.current(Level::Site)).filter(|site| site != UNASSIGNED_SITE)
-                    })
-                    .unwrap_or_default(),
-                false,
-                window,
-                cx,
-            ),
+            site: existing
+                .as_ref()
+                .map(|c| c.site.trim().to_string())
+                .filter(|site| !site.is_empty())
+                .unwrap_or_else(|| self.current(Level::Site)),
             name: editor(
                 "Name, e.g. CP fpms",
                 &existing
@@ -703,20 +696,11 @@ impl DatabaseView {
                 window,
                 cx,
             ),
-            environment: editor(
-                "Environment, e.g. QAT",
-                &existing
-                    .as_ref()
-                    .map(|c| c.environment.clone())
-                    .or_else(|| {
-                        Some(self.current(Level::Environment))
-                            .filter(|environment| environment != UNASSIGNED_SITE)
-                    })
-                    .unwrap_or_default(),
-                false,
-                window,
-                cx,
-            ),
+            environment: existing
+                .as_ref()
+                .map(|c| c.environment.trim().to_string())
+                .filter(|environment| !environment.is_empty())
+                .unwrap_or_else(|| self.current(Level::Environment)),
             uri: editor(
                 if existing.is_some() {
                     "Leave empty to keep the saved one"
@@ -742,13 +726,18 @@ impl DatabaseView {
         };
         let text = |editor: &Entity<Editor>, cx: &App| editor.read(cx).text(cx).trim().to_string();
         let (site, name, environment, uri) = (
-            text(&form.site, cx),
+            form.site.clone(),
             text(&form.name, cx),
-            text(&form.environment, cx),
+            form.environment.clone(),
             text(&form.uri, cx),
         );
-        if site.is_empty() || name.is_empty() || environment.is_empty() {
-            form.message = Some("Fill in the site, a name and an environment.".into());
+        if site.is_empty() || environment.is_empty() {
+            form.message = Some("Add a site and an environment on the left first.".into());
+            cx.notify();
+            return;
+        }
+        if name.is_empty() {
+            form.message = Some("Fill in a name.".into());
             cx.notify();
             return;
         }
@@ -1180,6 +1169,9 @@ impl DatabaseView {
                 }
                 let id = connection.id.clone();
                 let (edit_id, menu_id) = (connection.id.clone(), connection.id.clone());
+                let open_edit = cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
+                    this.open_form(Some(menu_id.clone()), window, cx)
+                });
                 let group =
                     SharedString::from(format!("database-connection-group-{}", connection.id));
                 let row = h_flex()
@@ -1196,6 +1188,7 @@ impl DatabaseView {
                     .when(active, |this| this.bg(colors.element_selected))
                     .hover(|style| style.bg(colors.element_hover))
                     .on_click(cx.listener(move |this, _, _, cx| this.connect(id.clone(), cx)))
+                    .on_mouse_down(gpui::MouseButton::Right, open_edit)
                     .child(
                         Icon::new(if active {
                             IconName::ChevronDown
@@ -1239,25 +1232,7 @@ impl DatabaseView {
                                 Color::Muted
                             }),
                     );
-                let view = cx.entity().downgrade();
-                tree = tree.child(
-                    right_click_menu(SharedString::from(format!(
-                        "database-connection-menu-{}",
-                        connection.id
-                    )))
-                    .trigger(move |_, _, _| row)
-                    .menu(move |window, cx| {
-                        let (view, id) = (view.clone(), menu_id.clone());
-                        ContextMenu::build(window, cx, move |menu, _, _| {
-                            menu.entry("Edit connection…", None, move |window, cx| {
-                                view.update(cx, |this, cx| {
-                                    this.open_form(Some(id.clone()), window, cx)
-                                })
-                                .ok();
-                            })
-                        })
-                    }),
-                );
+                tree = tree.child(row);
                 if !mongo_open {
                     continue;
                 }
@@ -1500,13 +1475,15 @@ impl DatabaseView {
         let editing = form.editing.clone();
         v_flex()
             .id("database-form")
-            .max_w(px(560.))
             .gap_3()
             .child(Headline::new(if form.editing.is_some() { "Edit connection" } else { "Add a connection" }).size(HeadlineSize::Small))
             .child(h_flex().gap_1().child(kind_button("database-kind-mongo", Kind::MongoDb, cx)).child(kind_button("database-kind-redis", Kind::Redis, cx)))
             .child(input("Name", &form.name, cx))
-            .child(input("Site", &form.site, cx))
-            .child(input("Environment", &form.environment, cx))
+            .child(
+                Label::new(format!("Site {} · Environment {}", form.site, form.environment))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
             .child(input("Connection string", &form.uri, cx))
             .child(
                 Label::new(
@@ -1587,13 +1564,22 @@ impl Render for DatabaseView {
             .active_connection()
             .filter(|connection| self.in_view(connection))
             .cloned();
-        let full_bleed = self.form.is_none() && self.session.is_some() && connection.is_some();
+        let full_bleed = self.session.is_some() && connection.is_some();
         let naming = self.name_edit.is_some() || self.name_message.is_some();
-        let main = match (&self.form, &connection, &self.session) {
-            (Some(form), _, _) => self.render_form(form, cx),
-            (None, Some(connection), Some(Session::Mongo(_))) => self.render_mongo(connection, cx),
-            (None, Some(connection), Some(Session::Redis(_))) => self.render_redis(connection, cx),
-            (None, Some(connection), None) => v_flex()
+        let dialog = if naming {
+            Some((px(380.), self.render_name_form(cx)))
+        } else {
+            self.form
+                .as_ref()
+                .map(|form| (px(520.), self.render_form(form, cx)))
+        };
+        // A save that is still connecting keeps the dialog open; closing it would cancel the save halfway.
+        let closable =
+            !self.connections.is_empty() && !self.form.as_ref().is_some_and(|form| form.checking);
+        let main = match (&connection, &self.session) {
+            (Some(connection), Some(Session::Mongo(_))) => self.render_mongo(connection, cx),
+            (Some(connection), Some(Session::Redis(_))) => self.render_redis(connection, cx),
+            (Some(connection), None) => v_flex()
                 .gap_3()
                 .child(self.render_header(connection, connection.name.clone(), cx))
                 .child(
@@ -1605,7 +1591,7 @@ impl Render for DatabaseView {
                     .color(Color::Muted),
                 )
                 .into_any_element(),
-            (None, None, _) => Label::new(format!(
+            (None, _) => Label::new(format!(
                 "Pick a {} connection on the left, or add one.",
                 self.kind_view.label()
             ))
@@ -1629,7 +1615,7 @@ impl Render for DatabaseView {
                     .when(!full_bleed, |this| this.p_4())
                     .child(main),
             )
-            .when(naming, |this| {
+            .when_some(dialog, |this, (width, dialog)| {
                 this.child(
                     div()
                         .id("database-name-backdrop")
@@ -1640,15 +1626,19 @@ impl Render for DatabaseView {
                         .justify_center()
                         .bg(gpui::black().opacity(0.4))
                         .occlude()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.name_edit = None;
-                            this.name_message = None;
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.name_edit.is_some() || this.name_message.is_some() {
+                                this.name_edit = None;
+                                this.name_message = None;
+                            } else if closable {
+                                this.form = None;
+                            }
                             cx.notify();
                         }))
                         .child(
                             div()
                                 .id("database-name-dialog")
-                                .w(px(380.))
+                                .w(width)
                                 .p_4()
                                 .rounded_lg()
                                 .border_1()
@@ -1657,7 +1647,7 @@ impl Render for DatabaseView {
                                 .shadow_lg()
                                 // Clicks inside the dialog must not reach the backdrop, which closes it.
                                 .on_click(|_, _, cx| cx.stop_propagation())
-                                .child(self.render_name_form(cx)),
+                                .child(dialog),
                         ),
                 )
             })
