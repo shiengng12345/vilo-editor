@@ -56,8 +56,8 @@ pub(crate) struct PubSubState {
     confirm: Option<Entity<Editor>>,
     publishing: bool,
     publish_result: Option<(bool, SharedString)>,
-    /// The lock of a publish whose outcome is unknown, until the user checked it.
-    publish_locked: Option<String>,
+    /// The lock and operation of the unknown publish this tab asks the user to check.
+    publish_locked: Option<(String, String)>,
     scroll: UniformListScrollHandle,
 }
 
@@ -414,10 +414,10 @@ impl DatabaseView {
                     cx,
                 );
             }
-            Some((_, true)) => {
+            Some((owner, true)) => {
                 // The tab may have been rebuilt since; offer the confirmation again.
                 if let Some(pubsub) = self.pubsub() {
-                    pubsub.publish_locked = Some(lock);
+                    pubsub.publish_locked = Some((lock, owner));
                 }
                 return refuse(
                     self,
@@ -510,7 +510,7 @@ impl DatabaseView {
                             Err(WriteError::Refused(message)) => (false, format!("Not published: {message}")),
                             Err(WriteError::Unknown(message)) => {
                                 // A publish cannot be checked by reloading anything, and is never sent again.
-                                locked = Some(lock.clone());
+                                locked = Some((lock.clone(), operation.clone()));
                                 (false, format!("The outcome is unknown ({message}): it may have been delivered. Vilo will not send it again; check the subscribers, then press I checked it."))
                             }
                         }
@@ -537,20 +537,21 @@ impl DatabaseView {
     /// Settles an unknown publish once the user checked it: the acknowledgement goes into the
     /// write log first, so the channel stays settled after a restart.
     fn release_publish_lock(&mut self, cx: &mut Context<Self>) {
-        let Some(lock) = self
+        let Some((lock, shown)) = self
             .pubsub()
             .and_then(|pubsub| pubsub.publish_locked.clone())
         else {
             return;
         };
-        // Only an outcome already known to be unknown can be acknowledged, never a pending one.
+        // Only the publish this tab showed, and only once its outcome is known to be unknown;
+        // never a pending one, nor a later publish that took the same channel's lock.
         let held = publish_locks()
             .held
             .get(&lock)
-            .filter(|(_, unknown)| *unknown)
+            .filter(|(owner, unknown)| *unknown && *owner == shown)
             .map(|(operation, _)| operation.clone());
         let Some(operation) = held else {
-            // Settled meanwhile (another window, or the banner); nothing is left to confirm.
+            // Settled or replaced meanwhile (another window, or the banner); nothing to confirm here.
             if let Some(pubsub) = self.pubsub() {
                 pubsub.publish_locked = None;
                 pubsub.publish_result = None;
