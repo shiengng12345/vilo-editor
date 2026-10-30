@@ -20,6 +20,7 @@ use vilo_database_core::redis::{
 };
 
 use crate::{Connection, DatabaseView, Fetch, fetched, render_lines, run};
+use util::ResultExt as _;
 
 /// Keys asked for per SCAN call, and keys walked per "Scan more", as RedisInsight does.
 const SCAN_COUNT: u32 = 200;
@@ -192,6 +193,8 @@ pub(crate) struct RedisState {
     selected: Option<Bytes>,
     panel: RightPanel,
     detail: Option<Fetch<Detail>>,
+    /// The key last opened and its search, kept through a failed load so a reload repeats it.
+    detail_search: Option<(Bytes, Option<Bytes>, Option<String>)>,
     format: Format,
     cli_open: bool,
     workbench: Vec<(String, Result<Vec<String>, String>)>,
@@ -251,6 +254,7 @@ impl RedisState {
             selected: None,
             panel: RightPanel::Empty,
             detail: None,
+            detail_search: None,
             format: Format::Unicode,
             cli_open: false,
             workbench: Vec::new(),
@@ -472,15 +476,20 @@ pub(crate) fn load_command_history() -> anyhow::Result<Vec<String>> {
     }
 }
 
-/// Serializes history appends from every window of this process.
-static HISTORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Appends one command to the history file and returns the file's history: read, add, write,
-/// all under one lock, so windows add to each other's history instead of replacing it.
+/// all under a file lock, so windows and other Vilo processes add to each other's history
+/// instead of replacing it.
 fn append_history(path: &std::path::Path, line: &str, limit: usize) -> anyhow::Result<Vec<String>> {
-    let _guard = HISTORY_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("history lock poisoned"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // A separate lock file, because the history file itself is replaced by the rename.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    lock.lock()?;
     let mut history: Vec<String> = match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -491,13 +500,13 @@ fn append_history(path: &std::path::Path, line: &str, limit: usize) -> anyhow::R
     }
     let excess = history.len().saturating_sub(limit);
     history.drain(..excess);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("tmp");
+    let written = std::fs::write(&temporary, serde_json::to_vec_pretty(&history)?)
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if let Err(error) = written {
+        std::fs::remove_file(&temporary).log_err();
+        return Err(error.into());
     }
-    // The process id keeps two Vilo processes from sharing a temporary file.
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&temporary, serde_json::to_vec_pretty(&history)?)?;
-    std::fs::rename(&temporary, path)?;
     Ok(history)
 }
 
@@ -925,27 +934,18 @@ impl DatabaseView {
                             if busy || state.scanning || state.switching.is_some() {
                                 return true;
                             }
-                            // The open key reloads with its current search; a load still running is left alone.
-                            // Only the key still on screen reloads, and not while a page is loading.
-                            let on_screen = matches!(state.panel, RightPanel::Key);
-                            let selected = state.selected.clone();
-                            let open = match &state.detail {
-                                Some(Fetch::Loaded(detail))
-                                    if on_screen
-                                        && !detail.loading_more
-                                        && selected.as_ref() == Some(&detail.key) =>
-                                {
-                                    Some((
-                                        detail.key.clone(),
-                                        detail.pattern.clone(),
-                                        detail.local_filter.clone(),
-                                    ))
-                                }
-                                _ => None,
-                            };
+                            // Only the key still on screen reloads, with its search, and not while a
+                            // load or a page is running; a failed load is tried again.
+                            let reload = matches!(state.panel, RightPanel::Key)
+                                && match &state.detail {
+                                    Some(Fetch::Loaded(detail)) => !detail.loading_more,
+                                    Some(Fetch::Failed(_)) => true,
+                                    _ => false,
+                                };
+                            let open = state.selected.clone().filter(|_| reload);
                             this.scan(true, cx);
-                            if let Some((key, pattern, local_filter)) = open {
-                                this.open_key_matching(key, pattern, local_filter, cx);
+                            if let Some(key) = open {
+                                this.open_key(key, cx);
                             }
                             true
                         })
@@ -964,6 +964,7 @@ impl DatabaseView {
             state.panel = RightPanel::Empty;
             state.selected = None;
             state.detail = None;
+            state.detail_search = None;
         }
     }
 
@@ -1205,8 +1206,18 @@ impl DatabaseView {
         cx.notify();
     }
 
+    /// Opens the key, repeating its current search when it is the key already open.
     fn open_key(&mut self, key: Bytes, cx: &mut Context<Self>) {
-        self.open_key_matching(key, None, None, cx);
+        let search = self
+            .redis_state()
+            .and_then(|state| state.detail_search.clone())
+            .filter(|(open, _, _)| *open == key);
+        match search {
+            Some((key, pattern, local_filter)) => {
+                self.open_key_matching(key, pattern, local_filter, cx)
+            }
+            None => self.open_key_matching(key, None, None, cx),
+        }
     }
 
     fn open_key_matching(
@@ -1225,6 +1236,7 @@ impl DatabaseView {
         };
         state.selected = Some(key.clone());
         state.panel = RightPanel::Key;
+        state.detail_search = Some((key.clone(), pattern.clone(), local_filter.clone()));
         state.detail = Some(Fetch::Loading);
         state.detail_request += 1;
         let request = state.detail_request;
@@ -1893,9 +1905,18 @@ impl DatabaseView {
                             let info = meta.get(&key).cloned().unwrap_or_default();
                             let is_selected = selected.as_ref() == Some(&key);
                             base.when(is_selected, |this| this.bg(colors.element_selected))
-                                .on_click(move |_, _, cx| {
+                                .on_click(move |_, window, cx| {
                                     let key = key.clone();
-                                    view.update(cx, |this, cx| this.open_key(key, cx)).ok();
+                                    view.update(cx, |this, cx| {
+                                        // Another key's search would otherwise sit in the box and apply on Enter.
+                                        if !is_selected {
+                                            this.value_search.update(cx, |editor, cx| {
+                                                editor.set_text("", window, cx)
+                                            });
+                                        }
+                                        this.open_key(key, cx)
+                                    })
+                                    .ok();
                                 })
                                 .child(div().w(px(depth as f32 * 18. + 4.)).flex_none())
                                 .child(h_flex().w(px(64.)).flex_none().child(badge(&info.kind)))
@@ -3240,11 +3261,30 @@ mod tests {
             "a damaged file is not overwritten"
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"not json");
-        assert_eq!(
-            std::fs::read_dir(&folder).unwrap().count(),
-            1,
-            "no temporary files are left"
-        );
+        let leftovers = std::fs::read_dir(&folder)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "no temporary files are left");
+        std::fs::remove_file(&path).unwrap();
+        // Writers with their own file handles, as separate processes have, lose nothing.
+        let writers = (0..8)
+            .map(|writer| {
+                let path = path.clone();
+                std::thread::spawn(move || append_history(&path, &format!("GET {writer}"), 100))
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let history: Vec<String> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(history.len(), 8);
         std::fs::remove_dir_all(&folder).unwrap();
     }
 
