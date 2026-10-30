@@ -33,7 +33,7 @@ const META_BATCH: usize = 200;
 const PAGE: u32 = 200;
 const ROW_HEIGHT: f32 = 28.;
 const STATS_EVERY: Duration = Duration::from_secs(10);
-const KEY_TYPES: [(&str, &str); 8] = [
+pub(crate) const KEY_TYPES: [(&str, &str); 8] = [
     ("All Key Types", ""),
     ("Hash", "hash"),
     ("List", "list"),
@@ -957,7 +957,8 @@ impl DatabaseView {
             return;
         };
         // A write must finish or be closed first; its result belongs to the database it was sent to.
-        let editing = self.redis_write.is_some() || self.admin_write.is_some();
+        let editing =
+            self.redis_write.is_some() || self.admin_write.is_some() || self.bulk_delete.is_some();
         let Some(state) = self.redis_state() else {
             return;
         };
@@ -1064,7 +1065,9 @@ impl DatabaseView {
                             if this.generation != connection {
                                 return false;
                             }
-                            let busy = this.redis_write.is_some() || this.admin_write.is_some();
+                            let busy = this.redis_write.is_some()
+                                || this.admin_write.is_some()
+                                || this.bulk_delete.is_some();
                             let Some(state) = this.redis_state() else {
                                 return false;
                             };
@@ -3702,12 +3705,15 @@ impl DatabaseView {
                     ))
                     .child(div().flex_1())
                     .child(
-                        Button::new("database-redis-bulk", "Bulk actions")
-                            .start_icon(Icon::new(IconName::Copy).size(IconSize::Small))
-                            .disabled(true)
-                            .tooltip(Tooltip::text(
-                                "Bulk actions come with writes, in the next release",
-                            )),
+                        Button::new("database-redis-bulk", "Bulk delete")
+                            .start_icon(Icon::new(IconName::Trash).size(IconSize::Small))
+                            .disabled(!self.writes_allowed(connection))
+                            .tooltip(Tooltip::text(if self.writes_allowed(connection) {
+                                "Preview the keys a pattern matches, then delete exactly those"
+                            } else {
+                                "Switch writes on (top bar) to bulk delete"
+                            }))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_bulk_delete(window, cx))),
                     )
                     .child({
                         let writable = self.writes_allowed(connection);

@@ -9,6 +9,7 @@ pub mod formats;
 pub mod mongo;
 pub mod redis;
 pub mod redis_analysis;
+pub mod redis_bulk;
 pub mod redis_docs;
 pub mod redis_monitor;
 pub mod redis_pubsub;
