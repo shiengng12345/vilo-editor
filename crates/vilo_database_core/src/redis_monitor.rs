@@ -341,17 +341,9 @@ impl RedisSession {
         };
         let host = server.host.to_string();
         let port = server.port;
-        // Checked against the host the session connected to, as the session's own TLS does.
-        let tls = self.tls.clone().map(|config| {
-            let name = match &self.config.server {
-                ServerConfig::Centralized { server } => server.host.to_string(),
-                ServerConfig::Clustered { hosts, .. } => hosts
-                    .first()
-                    .map_or_else(|| host.clone(), |first| first.host.to_string()),
-                _ => host.clone(),
-            };
-            (config, name)
-        });
+        // The node's own name for the handshake; the certificate is checked against the
+        // connected host by the session's verifier.
+        let tls = self.tls.clone().map(|config| (config, host.clone()));
         let username = self.config.username.clone();
         let password = self.config.password.clone();
         let shared = Arc::new(Mutex::new(Shared::default()));

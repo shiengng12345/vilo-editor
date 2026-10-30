@@ -7,7 +7,10 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Context as _, Result, bail};
 use rustls::{
     ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    client::{
+        WebPkiServerVerifier,
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    },
     crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject as _},
 };
@@ -95,6 +98,50 @@ impl ServerCertVerifier for AnyServer {
     }
 }
 
+/// Checks every server's certificate against the host the user connected to, whatever name a
+/// cluster reports for its nodes, so a certificate for another name is never accepted.
+#[derive(Debug)]
+struct PinnedName {
+    inner: Arc<WebPkiServerVerifier>,
+    name: ServerName<'static>,
+}
+
+impl ServerCertVerifier for PinnedName {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        self.inner
+            .verify_server_cert(end_entity, intermediates, &self.name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
 fn certificates(path: &PathBuf, what: &str) -> Result<Vec<CertificateDer<'static>>> {
     let certificates = CertificateDer::pem_file_iter(path)
         .with_context(|| format!("Could not read the {what} file {}", path.display()))?
@@ -108,8 +155,8 @@ fn certificates(path: &PathBuf, what: &str) -> Result<Vec<CertificateDer<'static
     Ok(certificates)
 }
 
-/// The rustls settings for these TLS options.
-pub fn client_config(settings: &RedisTls) -> Result<ClientConfig> {
+/// The rustls settings for these TLS options; certificates are checked against `host`.
+pub fn client_config(settings: &RedisTls, host: &str) -> Result<ClientConfig> {
     let provider = provider();
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -133,7 +180,14 @@ pub fn client_config(settings: &RedisTls) -> Result<ClientConfig> {
                 );
             }
         }
-        builder.with_root_certificates(roots)
+        let name = ServerName::try_from(host.to_string())
+            .with_context(|| format!("{host} is not a valid TLS server name"))?;
+        let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+            .build()
+            .context("TLS could not be set up")?;
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedName { inner, name }))
     } else {
         builder
             .dangerous()
@@ -168,19 +222,29 @@ mod tests {
             ..RedisTls::default()
         };
         assert!(
-            format!("{:#}", client_config(&half).unwrap_err()).contains("both its certificate")
+            format!("{:#}", client_config(&half, "localhost").unwrap_err())
+                .contains("both its certificate")
         );
         let missing = RedisTls {
             ca_file: Some("/nonexistent/ca.crt".into()),
             ..RedisTls::default()
         };
-        assert!(format!("{:#}", client_config(&missing).unwrap_err()).contains("Could not read"));
-        assert!(client_config(&RedisTls::default()).is_ok(), "system roots");
         assert!(
-            client_config(&RedisTls {
-                verify: false,
-                ..RedisTls::default()
-            })
+            format!("{:#}", client_config(&missing, "localhost").unwrap_err())
+                .contains("Could not read")
+        );
+        assert!(
+            client_config(&RedisTls::default(), "localhost").is_ok(),
+            "system roots"
+        );
+        assert!(
+            client_config(
+                &RedisTls {
+                    verify: false,
+                    ..RedisTls::default()
+                },
+                "localhost"
+            )
             .is_ok()
         );
         let Some(dir) = test_files() else {
@@ -192,12 +256,53 @@ mod tests {
             key_file: Some(dir.join("server.key")),
             verify: true,
         };
-        assert!(format!("{:#}", client_config(&mismatched).unwrap_err()).contains("do not match"));
+        assert!(
+            format!("{:#}", client_config(&mismatched, "localhost").unwrap_err())
+                .contains("do not match")
+        );
         let not_pem = RedisTls {
             ca_file: Some(dir.join("server.ext")),
             ..RedisTls::default()
         };
-        assert!(format!("{:#}", client_config(&not_pem).unwrap_err()).contains("no certificate"));
+        assert!(
+            format!("{:#}", client_config(&not_pem, "localhost").unwrap_err())
+                .contains("no certificate")
+        );
+    }
+
+    #[test]
+    fn test_certificates_are_checked_against_the_connected_host() {
+        let Some(dir) = test_files() else {
+            return;
+        };
+        let server = certificates(&dir.join("server.crt"), "server certificate").unwrap();
+        let (end_entity, _) = server.split_first().unwrap();
+        let mut roots = RootCertStore::empty();
+        for certificate in certificates(&dir.join("ca.crt"), "CA certificate").unwrap() {
+            roots.add(certificate).unwrap();
+        }
+        let roots = Arc::new(roots);
+        let pinned = |name: &str| PinnedName {
+            inner: WebPkiServerVerifier::builder_with_provider(roots.clone(), provider())
+                .build()
+                .unwrap(),
+            name: ServerName::try_from(name.to_string()).unwrap(),
+        };
+        let reported = ServerName::try_from("node7.internal".to_string()).unwrap();
+        // The test certificate names localhost and 127.0.0.1.
+        assert!(
+            pinned("localhost")
+                .verify_server_cert(end_entity, &[], &reported, &[], UnixTime::now())
+                .is_ok(),
+            "whatever name a node reports, the connected host decides"
+        );
+        let localhost = ServerName::try_from("localhost".to_string()).unwrap();
+        assert!(
+            pinned("redis.example.com")
+                .verify_server_cert(end_entity, &[], &localhost, &[], UnixTime::now())
+                .is_err(),
+            "a certificate for another name is refused even when a node reports that name"
+        );
     }
 
     fn mutual(dir: &std::path::Path) -> RedisTls {

@@ -19,6 +19,8 @@ pub struct RedisSession {
     pub(crate) config: Config,
     /// The TLS settings of a `rediss` connection, for the connections Vilo opens itself (MONITOR).
     pub(crate) tls: Option<Arc<rustls::ClientConfig>>,
+    /// Something the user should know about how the session was set up.
+    notice: Option<String>,
     clustered: bool,
     /// The logical database every connection of this session selects, also after a reconnect.
     database: u8,
@@ -749,9 +751,18 @@ impl RedisSession {
             _ => (url.to_string(), false),
         };
         let mut config = Config::from_url(&url).context("The Redis URL is not valid")?;
+        let host = match &config.server {
+            fred::types::config::ServerConfig::Centralized { server } => server.host.to_string(),
+            fred::types::config::ServerConfig::Clustered { hosts, .. } => hosts
+                .first()
+                .map(|server| server.host.to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
         let tls_config = match (tls_scheme, tls) {
             (true, settings) => Some(Arc::new(crate::redis_tls::client_config(
                 &settings.cloned().unwrap_or_default(),
+                &host,
             )?)),
             (false, Some(_)) => bail!("TLS settings need a TLS connection; turn Use TLS on."),
             (false, None) => None,
@@ -761,9 +772,9 @@ impl RedisSession {
                 connector: fred::types::config::TlsConnector::from(
                     tokio_rustls::TlsConnector::from(tls_config.clone()),
                 ),
-                // Cluster nodes announce addresses; their certificates are checked against the
-                // host the connection was made to.
-                hostnames: fred::types::config::TlsHostMapping::DefaultHost,
+                // Every node's certificate is checked against the connected host by the
+                // verifier itself, so the names a cluster reports are only used to connect.
+                hostnames: fred::types::config::TlsHostMapping::None,
             });
         }
         let session = match Self::open(config, database, tls_config.clone()).await {
@@ -777,12 +788,17 @@ impl RedisSession {
         if session.clustered {
             return Ok(session);
         }
-        let info = session
-            .call("INFO", vec!["cluster".into()])
-            .await
-            .ok()
-            .and_then(|info| info.as_string())
-            .unwrap_or_default();
+        let info = match session.call("INFO", vec!["cluster".into()]).await {
+            Ok(info) => info.as_string().unwrap_or_default(),
+            // Without INFO there is no telling; a working single connection is kept, and said.
+            Err(error) => {
+                let mut session = session;
+                session.notice = Some(format!(
+                    "Vilo could not check whether this server is a cluster node (INFO cluster: {error:#}), so it is used as a single server."
+                ));
+                return Ok(session);
+            }
+        };
         let Server { host, port, .. } = match &session.config.server {
             fred::types::config::ServerConfig::Centralized { server }
                 if info.lines().any(|line| line.trim() == "cluster_enabled:1") =>
@@ -833,6 +849,7 @@ impl RedisSession {
             client,
             config,
             tls,
+            notice: None,
             clustered,
             database: selected,
         })
@@ -840,6 +857,10 @@ impl RedisSession {
 
     pub fn database(&self) -> u8 {
         self.database
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 
     pub fn is_clustered(&self) -> bool {

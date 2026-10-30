@@ -984,11 +984,17 @@ impl DatabaseView {
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("No connection string saved."))?;
                 let uri = String::from_utf8(uri)?;
+                // The same TLS settings as the first connection, client certificate included.
+                let tls = connection
+                    .redis_tls
+                    .clone()
+                    .filter(|_| uri.starts_with("rediss://"));
                 let task = cx.update(|cx| {
                     run(cx, async move {
-                        vilo_database_core::redis::RedisSession::connect_to_database(
+                        vilo_database_core::redis::RedisSession::connect_with(
                             &uri,
                             Some(database),
+                            tls.as_ref(),
                         )
                         .await
                     })
@@ -3818,6 +3824,23 @@ impl DatabaseView {
                                 }))
                             })
                     }),
+            )
+            .when_some(
+                self.redis()
+                    .and_then(|session| session.notice().map(SharedString::from)),
+                |this, notice| {
+                    this.child(
+                        h_flex()
+                            .mx_4()
+                            .mt_2()
+                            .p_2()
+                            .gap_2()
+                            .rounded_md()
+                            .bg(cx.theme().status().warning_background)
+                            .child(Icon::new(IconName::Warning).size(IconSize::Small).color(Color::Warning))
+                            .child(Label::new(notice).size(LabelSize::Small)),
+                    )
+                },
             )
             .when_some(self.write_notice.clone(), |this, notice| {
                 this.child(
