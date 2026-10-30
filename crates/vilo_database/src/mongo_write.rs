@@ -153,8 +153,12 @@ pub(crate) fn summarize_intent(entry: &serde_json::Value) -> String {
         ("", None) => text("key").to_string(),
         (target, _) => target.to_string(),
     };
+    let value = match text("value") {
+        "" => String::new(),
+        value => format!(" {value}"),
+    };
     format!(
-        "{} {} on {} ({}, {})",
+        "{} {}{value} on {} ({}, {})",
         text("time"),
         text("kind"),
         target,
@@ -715,5 +719,10 @@ mod tests {
         assert_eq!(dangling[2].2, "SLOWLOG RESET");
         let with_db = serde_json::json!({ "kind": "SET", "key": "k", "db": 3, "time": "t", "name": "R", "environment": "QAT" });
         assert_eq!(summarize_intent(&with_db), "t SET on db3 k (R, QAT)");
+        let threshold = serde_json::json!({ "kind": "CONFIG SET slowlog-log-slower-than", "value": "10000", "target": "node server", "time": "t", "name": "R", "environment": "QAT" });
+        assert_eq!(
+            summarize_intent(&threshold),
+            "t CONFIG SET slowlog-log-slower-than 10000 on node server (R, QAT)"
+        );
     }
 }

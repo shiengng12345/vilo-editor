@@ -368,7 +368,8 @@ impl DatabaseView {
             let mut outcomes = Vec::new();
             // One node at a time, each logged before it is sent. A node whose intent cannot be
             // logged, or whose outcome is unknown, stops the rest so nothing more is sent blind.
-            for node in nodes {
+            let mut nodes = nodes.into_iter();
+            while let Some(node) = nodes.next() {
                 let operation = uuid::Uuid::new_v4().simple().to_string();
                 let intent = serde_json::json!({
                     "time": chrono::Utc::now().to_rfc3339(),
@@ -379,6 +380,11 @@ impl DatabaseView {
                     "environment": connection.environment,
                     "target": format!("node {}", node.label),
                     "kind": write.name(),
+                    // The requested value, so an unknown outcome can be checked against it later.
+                    "value": match &write {
+                        AdminWrite::SlowlogThreshold { micros } => Some(micros.to_string()),
+                        AdminWrite::SlowlogReset => None,
+                    },
                     "phase": "intent",
                 });
                 let summary = mongo_write::summarize_intent(&intent);
@@ -421,6 +427,14 @@ impl DatabaseView {
                     break;
                 }
             }
+            // Every node gets a line, including those never tried after a stop.
+            for node in nodes {
+                outcomes.push(NodeOutcome {
+                    node: node.label,
+                    result: Err("not sent: stopped after an earlier node".into()),
+                    unlogged: None,
+                });
+            }
             anyhow::Ok(outcomes)
         });
         form._task = Some(cx.spawn(async move |this, cx| {
@@ -449,7 +463,7 @@ impl DatabaseView {
                             if all_ok {
                                 "Done on every node."
                             } else {
-                                "Not every node was done; see below. Nodes not listed were not sent."
+                                "Not every node was done; see each node below."
                             }
                             .into(),
                         );
