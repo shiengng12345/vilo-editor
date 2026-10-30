@@ -2444,6 +2444,7 @@ impl DatabaseView {
                 .then(|| redis_docs::command_for_line(&self.workbench_input.read(cx).text(cx)))
                 .flatten()
         });
+        let docs = redis_docs::command_docs();
         let group_menu = PopoverMenu::new("database-redis-helper-group")
             .trigger(
                 Button::new(
@@ -2459,9 +2460,11 @@ impl DatabaseView {
                 move |window, cx| {
                     let view = view.clone();
                     Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        for group in std::iter::once(None)
-                            .chain(redis_docs::command_groups().into_iter().map(Some))
-                        {
+                        for group in std::iter::once(None).chain(
+                            docs.iter()
+                                .flat_map(|docs| redis_docs::command_groups(docs))
+                                .map(Some),
+                        ) {
                             let view = view.clone();
                             menu = menu.entry(group.unwrap_or("All groups"), None, move |_, cx| {
                                 view.update(cx, |this, cx| {
@@ -2478,7 +2481,7 @@ impl DatabaseView {
                     }))
                 }
             });
-        let body = match (redis_docs::command_docs(), shown) {
+        let body = match (docs, shown) {
             (Err(problem), _) => Label::new(problem)
                 .size(LabelSize::Small)
                 .color(Color::Error)
@@ -2492,8 +2495,8 @@ impl DatabaseView {
             .size(LabelSize::Small)
             .color(Color::Muted)
             .into_any_element(),
-            (Ok(_), None) => {
-                let found = redis_docs::search_commands(&query, state.helper_group);
+            (Ok(docs), None) => {
+                let found = redis_docs::search_commands(docs, &query, state.helper_group);
                 if found.is_empty() {
                     Label::new("No command matches.")
                         .size(LabelSize::Small)

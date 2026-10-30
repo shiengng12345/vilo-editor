@@ -5,6 +5,7 @@ Usage: generate_redis_commands.py <redis-source>/src/commands > redis_commands.j
 """
 import json
 import os
+import re
 import sys
 
 GROUPS = {
@@ -53,6 +54,11 @@ def optional(spec, text):
     return f"[{text}]" if spec.get("optional") else text
 
 
+def plain(text):
+    """Drops redis.io markdown code marks: `SET` and `!GET` (a mark that suppresses a link)."""
+    return re.sub(r"`!?([^`]*)`", r"\1", text)
+
+
 def main(folder):
     commands = []
     for file in sorted(os.listdir(folder)):
@@ -65,15 +71,15 @@ def main(folder):
         arguments = " ".join(argument(inner) for inner in spec.get("arguments", []))
         entry = {
             "name": name,
-            "summary": spec.get("summary", ""),
+            "summary": plain(spec.get("summary", "")),
             "group": GROUPS.get(spec.get("group", ""), spec.get("group", "")),
             "since": spec.get("since", ""),
-            "complexity": spec.get("complexity", ""),
+            "complexity": plain(spec.get("complexity", "")),
             "syntax": f"{name} {arguments}".strip(),
         }
         if "deprecated_since" in spec:
             entry["deprecated_since"] = spec["deprecated_since"]
-            entry["replaced_by"] = spec.get("replaced_by", "")
+            entry["replaced_by"] = plain(spec.get("replaced_by", ""))
         commands.append(entry)
     commands.sort(key=lambda entry: entry["name"])
     json.dump(commands, sys.stdout, indent=0, ensure_ascii=False)

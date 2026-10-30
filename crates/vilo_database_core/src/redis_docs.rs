@@ -27,9 +27,8 @@ pub fn command_docs() -> Result<&'static [CommandDoc], &'static str> {
 }
 
 /// The groups in the order the helper lists them.
-pub fn command_groups() -> Vec<&'static str> {
-    let mut groups = command_docs()
-        .unwrap_or_default()
+pub fn command_groups(docs: &[CommandDoc]) -> Vec<&str> {
+    let mut groups = docs
         .iter()
         .map(|doc| doc.group.as_str())
         .collect::<Vec<_>>();
@@ -40,10 +39,13 @@ pub fn command_groups() -> Vec<&'static str> {
 
 /// Commands matching `query` (case ignored) in `group`: names starting with it first, then names
 /// containing it, then summaries containing it. An empty query lists the whole group.
-pub fn search_commands(query: &str, group: Option<&str>) -> Vec<&'static CommandDoc> {
+pub fn search_commands<'a>(
+    docs: &'a [CommandDoc],
+    query: &str,
+    group: Option<&str>,
+) -> Vec<&'a CommandDoc> {
     let query = query.trim().to_lowercase();
-    let mut ranked = command_docs()
-        .unwrap_or_default()
+    let mut ranked = docs
         .iter()
         .filter(|doc| group.is_none_or(|group| doc.group == group))
         .filter_map(|doc| {
@@ -66,9 +68,17 @@ pub fn search_commands(query: &str, group: Option<&str>) -> Vec<&'static Command
 }
 
 /// The command a typed line starts with, preferring a subcommand (`CONFIG GET`) over its
-/// container (`CONFIG`).
+/// container (`CONFIG`). Words are split as the CLI runs them, quotes included.
 pub fn command_for_line(line: &str) -> Option<&'static CommandDoc> {
-    let mut words = line.split_whitespace().map(str::to_uppercase);
+    let words = match crate::redis::split_command(line) {
+        Ok(words) => words
+            .iter()
+            .map(|word| String::from_utf8_lossy(word).to_uppercase())
+            .collect::<Vec<_>>(),
+        // Half-typed, e.g. an open quote: the words so far still name the command.
+        Err(_) => line.split_whitespace().map(str::to_uppercase).collect(),
+    };
+    let mut words = words.into_iter();
     let first = words.next()?;
     let docs = command_docs().ok()?;
     let find = |name: &str| docs.iter().find(|doc| doc.name == name);
@@ -91,17 +101,17 @@ mod tests {
         assert!(set.syntax.starts_with("SET key value [NX | XX]"));
         let georadius = docs.iter().find(|doc| doc.name == "GEORADIUS").unwrap();
         assert_eq!(georadius.deprecated_since.as_deref(), Some("6.2.0"));
-        assert!(command_groups().contains(&"Sorted Set"));
+        assert!(command_groups(command_docs().unwrap()).contains(&"Sorted Set"));
     }
 
     #[test]
     fn test_search_ranks_names_before_summaries() {
-        let names = search_commands("hget", None)
+        let names = search_commands(command_docs().unwrap(), "hget", None)
             .iter()
             .map(|doc| doc.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, ["HGET", "HGETALL"]);
-        let names = search_commands("get", None)
+        let names = search_commands(command_docs().unwrap(), "get", None)
             .iter()
             .map(|doc| doc.name.as_str())
             .collect::<Vec<_>>();
@@ -113,16 +123,16 @@ mod tests {
         );
         // STRLEN's name has no "length", only its summary does.
         assert!(
-            search_commands("length", None)
+            search_commands(command_docs().unwrap(), "length", None)
                 .iter()
                 .any(|doc| doc.name == "STRLEN")
         );
         assert!(
-            search_commands("", Some("Stream"))
+            search_commands(command_docs().unwrap(), "", Some("Stream"))
                 .iter()
                 .all(|doc| doc.group == "Stream")
         );
-        assert!(search_commands("no such thing", None).is_empty());
+        assert!(search_commands(command_docs().unwrap(), "no such thing", None).is_empty());
     }
 
     #[test]
@@ -134,6 +144,12 @@ mod tests {
         );
         assert_eq!(command_for_line("config").unwrap().name, "CONFIG");
         assert_eq!(command_for_line("get config").unwrap().name, "GET");
+        assert_eq!(command_for_line("\"GET\" key").unwrap().name, "GET");
+        assert_eq!(
+            command_for_line("XINFO \"STREAM\" key").unwrap().name,
+            "XINFO STREAM"
+        );
+        assert_eq!(command_for_line("HGET \"user").unwrap().name, "HGET");
         assert!(command_for_line("   ").is_none());
         assert!(command_for_line("nonsense").is_none());
     }

@@ -231,7 +231,7 @@
 "complexity": "O(1)",
 "syntax": "BRPOPLPUSH source destination timeout",
 "deprecated_since": "6.2.0",
-"replaced_by": "`BLMOVE` with the `RIGHT` and `LEFT` arguments"
+"replaced_by": "BLMOVE with the RIGHT and LEFT arguments"
 },
 {
 "name": "BZMPOP",
@@ -633,7 +633,7 @@
 "complexity": "O(N) where N is the number of replicas.",
 "syntax": "CLUSTER SLAVES node-id",
 "deprecated_since": "5.0.0",
-"replaced_by": "`CLUSTER REPLICAS`"
+"replaced_by": "CLUSTER REPLICAS"
 },
 {
 "name": "CLUSTER SLOTS",
@@ -643,7 +643,7 @@
 "complexity": "O(N) where N is the total number of Cluster nodes",
 "syntax": "CLUSTER SLOTS",
 "deprecated_since": "7.0.0",
-"replaced_by": "`CLUSTER SHARDS`"
+"replaced_by": "CLUSTER SHARDS"
 },
 {
 "name": "COMMAND",
@@ -1061,7 +1061,7 @@
 "complexity": "O(N+log(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
 "syntax": "GEORADIUS key longitude latitude radius <M | KM | FT | MI> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC] [STORE storekey | STOREDIST storedistkey]",
 "deprecated_since": "6.2.0",
-"replaced_by": "`GEOSEARCH` and `GEOSEARCHSTORE` with the `BYRADIUS` argument"
+"replaced_by": "GEOSEARCH and GEOSEARCHSTORE with the BYRADIUS argument"
 },
 {
 "name": "GEORADIUSBYMEMBER",
@@ -1071,7 +1071,7 @@
 "complexity": "O(N+log(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
 "syntax": "GEORADIUSBYMEMBER key member radius <M | KM | FT | MI> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC] [STORE storekey | STOREDIST storedistkey]",
 "deprecated_since": "6.2.0",
-"replaced_by": "`GEOSEARCH` and `GEOSEARCHSTORE` with the `BYRADIUS` and `FROMMEMBER` arguments"
+"replaced_by": "GEOSEARCH and GEOSEARCHSTORE with the BYRADIUS and FROMMEMBER arguments"
 },
 {
 "name": "GEORADIUSBYMEMBER_RO",
@@ -1081,7 +1081,7 @@
 "complexity": "O(N+log(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
 "syntax": "GEORADIUSBYMEMBER_RO key member radius <M | KM | FT | MI> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC]",
 "deprecated_since": "6.2.0",
-"replaced_by": "`GEOSEARCH` with the `BYRADIUS` and `FROMMEMBER` arguments"
+"replaced_by": "GEOSEARCH with the BYRADIUS and FROMMEMBER arguments"
 },
 {
 "name": "GEORADIUS_RO",
@@ -1091,7 +1091,7 @@
 "complexity": "O(N+log(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
 "syntax": "GEORADIUS_RO key longitude latitude radius <M | KM | FT | MI> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC]",
 "deprecated_since": "6.2.0",
-"replaced_by": "`GEOSEARCH` with the `BYRADIUS` argument"
+"replaced_by": "GEOSEARCH with the BYRADIUS argument"
 },
 {
 "name": "GEOSEARCH",
@@ -1157,7 +1157,7 @@
 "complexity": "O(1)",
 "syntax": "GETSET key value",
 "deprecated_since": "6.2.0",
-"replaced_by": "`SET` with the `!GET` argument"
+"replaced_by": "SET with the GET argument"
 },
 {
 "name": "HDEL",
@@ -1247,7 +1247,7 @@
 "complexity": "O(N) where N is the number of fields being set.",
 "syntax": "HMSET key field value [field value ...]",
 "deprecated_since": "4.0.0",
-"replaced_by": "`HSET` with multiple field-value pairs"
+"replaced_by": "HSET with multiple field-value pairs"
 },
 {
 "name": "HRANDFIELD",
@@ -1825,7 +1825,7 @@
 "complexity": "O(1)",
 "syntax": "PSETEX key milliseconds value",
 "deprecated_since": "2.6.12",
-"replaced_by": "`SET` with the `PX` argument"
+"replaced_by": "SET with the PX argument"
 },
 {
 "name": "PSUBSCRIBE",
@@ -2037,7 +2037,7 @@
 "complexity": "O(1)",
 "syntax": "RPOPLPUSH source destination",
 "deprecated_since": "6.2.0",
-"replaced_by": "`LMOVE` with the `RIGHT` and `LEFT` arguments"
+"replaced_by": "LMOVE with the RIGHT and LEFT arguments"
 },
 {
 "name": "RPUSH",
@@ -2233,7 +2233,7 @@
 },
 {
 "name": "SENTINEL INFO-CACHE",
-"summary": "Returns the cached `INFO` replies from the deployment's instances.",
+"summary": "Returns the cached INFO replies from the deployment's instances.",
 "group": "Sentinel",
 "since": "3.2.0",
 "complexity": "O(N) where N is the number of instances",
@@ -2343,7 +2343,7 @@
 "complexity": "O(N) where N is the number of replicas.",
 "syntax": "SENTINEL SLAVES master-name",
 "deprecated_since": "5.0.0",
-"replaced_by": "`SENTINEL REPLICAS`"
+"replaced_by": "SENTINEL REPLICAS"
 },
 {
 "name": "SET",
@@ -2369,7 +2369,7 @@
 "complexity": "O(1)",
 "syntax": "SETEX key seconds value",
 "deprecated_since": "2.6.12",
-"replaced_by": "`SET` with the `EX` argument"
+"replaced_by": "SET with the EX argument"
 },
 {
 "name": "SETNX",
@@ -2379,7 +2379,7 @@
 "complexity": "O(1)",
 "syntax": "SETNX key value",
 "deprecated_since": "2.6.12",
-"replaced_by": "`SET` with the `NX` argument"
+"replaced_by": "SET with the NX argument"
 },
 {
 "name": "SETRANGE",
@@ -2437,7 +2437,7 @@
 "complexity": "O(1)",
 "syntax": "SLAVEOF <host port | NO ONE>",
 "deprecated_since": "5.0.0",
-"replaced_by": "`REPLICAOF`"
+"replaced_by": "REPLICAOF"
 },
 {
 "name": "SLOWLOG",
@@ -2591,7 +2591,7 @@
 "complexity": "O(N) where N is the length of the returned string. The complexity is ultimately determined by the returned length, but because creating a substring from an existing string is very cheap, it can be considered O(1) for small strings.",
 "syntax": "SUBSTR key start end",
 "deprecated_since": "2.0.0",
-"replaced_by": "`GETRANGE`"
+"replaced_by": "GETRANGE"
 },
 {
 "name": "SUNION",
@@ -3049,7 +3049,7 @@
 "complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements being returned. If M is constant (e.g. always asking for the first 10 elements with LIMIT), you can consider it O(log(N)).",
 "syntax": "ZRANGEBYLEX key min max [LIMIT offset count]",
 "deprecated_since": "6.2.0",
-"replaced_by": "`ZRANGE` with the `BYLEX` argument"
+"replaced_by": "ZRANGE with the BYLEX argument"
 },
 {
 "name": "ZRANGEBYSCORE",
@@ -3059,7 +3059,7 @@
 "complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements being returned. If M is constant (e.g. always asking for the first 10 elements with LIMIT), you can consider it O(log(N)).",
 "syntax": "ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]",
 "deprecated_since": "6.2.0",
-"replaced_by": "`ZRANGE` with the `BYSCORE` argument"
+"replaced_by": "ZRANGE with the BYSCORE argument"
 },
 {
 "name": "ZRANGESTORE",
@@ -3117,7 +3117,7 @@
 "complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements returned.",
 "syntax": "ZREVRANGE key start stop [WITHSCORES]",
 "deprecated_since": "6.2.0",
-"replaced_by": "`ZRANGE` with the `REV` argument"
+"replaced_by": "ZRANGE with the REV argument"
 },
 {
 "name": "ZREVRANGEBYLEX",
@@ -3127,7 +3127,7 @@
 "complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements being returned. If M is constant (e.g. always asking for the first 10 elements with LIMIT), you can consider it O(log(N)).",
 "syntax": "ZREVRANGEBYLEX key max min [LIMIT offset count]",
 "deprecated_since": "6.2.0",
-"replaced_by": "`ZRANGE` with the `REV` and `BYLEX` arguments"
+"replaced_by": "ZRANGE with the REV and BYLEX arguments"
 },
 {
 "name": "ZREVRANGEBYSCORE",
@@ -3137,7 +3137,7 @@
 "complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements being returned. If M is constant (e.g. always asking for the first 10 elements with LIMIT), you can consider it O(log(N)).",
 "syntax": "ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]",
 "deprecated_since": "6.2.0",
-"replaced_by": "`ZRANGE` with the `REV` and `BYSCORE` arguments"
+"replaced_by": "ZRANGE with the REV and BYSCORE arguments"
 },
 {
 "name": "ZREVRANK",
