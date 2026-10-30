@@ -21,7 +21,7 @@ fred = { version = "10.1", default-features = false, features = ["i-std", "i-mem
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["time", "macros", "sync"] }
+tokio = { workspace = true, features = ["time", "macros", "sync", "net", "io-util"] }
 
 [dev-dependencies]
 rmpv = "1.3"

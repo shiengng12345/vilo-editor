@@ -281,6 +281,7 @@ pub(crate) struct RedisState {
     format: Format,
     cli_open: bool,
     helper_open: bool,
+    profiler_open: bool,
     helper_group: Option<&'static str>,
     /// The command picked from the helper's list; with none, the helper follows what is typed.
     helper_selected: Option<&'static CommandDoc>,
@@ -312,6 +313,7 @@ pub(crate) struct RedisState {
     pub(crate) analyze: crate::redis_analyze::AnalyzeState,
     pub(crate) pubsub: crate::redis_pubsub::PubSubState,
     pub(crate) search: crate::redis_search::SearchState,
+    pub(crate) profiler: crate::redis_profiler::ProfilerState,
     /// The consumer group opened under a stream key.
     pub(crate) stream_group: Option<crate::redis_stream::StreamGroupView>,
     /// A database number typed in when the menu cannot know how many there are.
@@ -358,6 +360,7 @@ impl RedisState {
             format: Format::Unicode,
             cli_open: false,
             helper_open: false,
+            profiler_open: false,
             helper_group: None,
             helper_selected: None,
             helper_scroll: UniformListScrollHandle::new(),
@@ -382,6 +385,7 @@ impl RedisState {
             analyze: Default::default(),
             pubsub: Default::default(),
             search: Default::default(),
+            profiler: Default::default(),
             stream_group: None,
             database_input: None,
         }
@@ -3765,7 +3769,7 @@ impl DatabaseView {
                 )
             })
             .child(div().flex_1().min_h_0().child(body))
-            .when(state.cli_open || state.helper_open, |this| {
+            .when(state.cli_open || state.helper_open || state.profiler_open, |this| {
                 this.child(
                     h_flex()
                         .h(px(220.))
@@ -3800,6 +3804,18 @@ impl DatabaseView {
                                         this.border_l_1().border_color(colors.border)
                                     })
                                     .child(self.render_command_helper(state, cx)),
+                            )
+                        })
+                        .when(state.profiler_open, |this| {
+                            this.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .when(state.cli_open || state.helper_open, |this| {
+                                        this.border_l_1().border_color(colors.border)
+                                    })
+                                    .child(self.render_profiler(&state.profiler, cx)),
                             )
                         }),
                 )
@@ -3847,10 +3863,27 @@ impl DatabaseView {
                         Button::new("database-redis-profiler", "Profiler")
                             .label_size(LabelSize::Small)
                             .start_icon(Icon::new(IconName::Rerun).size(IconSize::XSmall))
-                            .disabled(true)
+                            .style(if state.profiler_open {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
                             .tooltip(Tooltip::text(
-                                "The profiler uses MONITOR, which loads the server; not in Vilo",
-                            )),
+                                "MONITOR one node for a few seconds; closing the panel stops it",
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let open = this.redis_state().map(|state| {
+                                    state.profiler_open = !state.profiler_open;
+                                    if !state.profiler_open {
+                                        state.profiler.stop("Stopped: the panel was closed.");
+                                    }
+                                    state.profiler_open
+                                });
+                                if open == Some(true) {
+                                    this.open_profiler(window, cx);
+                                }
+                                cx.notify();
+                            })),
                     ),
             )
             .into_any_element()

@@ -1,0 +1,642 @@
+//! The Profiler, as RedisInsight's: MONITOR on one node for a limited time. MONITOR makes the
+//! server copy every command it runs to this connection, which costs it throughput, so a run is
+//! short and ends by itself.
+//!
+//! The connection is Vilo's own: fred's MONITOR parser drops arguments that contain escapes, and
+//! reading the lines here bounds each one as it arrives. Closing it ends MONITOR at once.
+
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
+
+use anyhow::{Context as _, Result, bail};
+use fred::types::config::ServerConfig;
+use futures::channel::oneshot;
+use tokio::{
+    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
+    net::TcpStream,
+};
+
+use crate::redis::{Bytes, RedisSession, ScanNode};
+
+pub const DEFAULT_SECONDS: u64 = 10;
+pub const MAX_SECONDS: u64 = 60;
+/// A line longer than this is cut, and says so; the rest is read past without being kept.
+pub const MAX_LINE_BYTES: usize = 16 * 1024;
+/// Lines waiting for the view; lines beyond this are dropped and counted as lost.
+const QUEUE_BYTES: usize = 4 * 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitorLine {
+    /// Unix seconds with microseconds, as the server wrote it.
+    pub time: String,
+    pub db: String,
+    /// The client's address, `lua` for a script, or `unix:…`.
+    pub client: String,
+    /// The command name first, then its arguments, unescaped.
+    pub args: Vec<Bytes>,
+    /// The line was longer than `MAX_LINE_BYTES`; the last argument shown may be partial.
+    pub cut: bool,
+    /// The line could not be read as MONITOR output; `args` holds it as received.
+    pub raw: bool,
+}
+
+impl MonitorLine {
+    /// What keeping the line costs against the queue and view budgets, with a fixed share for
+    /// the entry so short lines are not free.
+    pub fn cost(&self) -> usize {
+        self.args.iter().map(Vec::len).sum::<usize>()
+            + self.time.len()
+            + self.db.len()
+            + self.client.len()
+            + 64
+    }
+}
+
+#[derive(Default)]
+struct Shared {
+    lines: VecDeque<MonitorLine>,
+    bytes: usize,
+    lost: u64,
+    ended: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct MonitorBatch {
+    pub lines: Vec<MonitorLine>,
+    /// Lines dropped since the last batch because the view did not keep up.
+    pub lost: u64,
+    /// Why the run ended, once it has; nothing arrives after it.
+    pub ended: Option<String>,
+}
+
+/// A running MONITOR. Dropping it closes the connection.
+pub struct Monitor {
+    shared: Arc<Mutex<Shared>>,
+    _stop: oneshot::Sender<()>,
+}
+
+fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
+    // The reader only pushes and counts; a panic there leaves nothing half-done worth refusing.
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Monitor {
+    pub fn take(&self) -> MonitorBatch {
+        let mut shared = lock(&self.shared);
+        shared.bytes = 0;
+        MonitorBatch {
+            lines: shared.lines.drain(..).collect(),
+            lost: std::mem::take(&mut shared.lost),
+            ended: shared.ended.take(),
+        }
+    }
+}
+
+fn encode(args: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        out.extend_from_slice(arg);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+/// Reads one line into `line`, keeping at most `MAX_LINE_BYTES`. `None` at the end of the
+/// stream; otherwise whether the line was cut.
+async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> Result<Option<bool>> {
+    line.clear();
+    let mut cut = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(None);
+        }
+        let (end, used) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => (Some(newline), newline + 1),
+            None => (None, available.len()),
+        };
+        let content = &available[..end.unwrap_or(available.len())];
+        let room = MAX_LINE_BYTES.saturating_sub(line.len());
+        if content.len() > room {
+            cut = true;
+        }
+        line.extend_from_slice(&content[..content.len().min(room)]);
+        reader.consume(used);
+        if end.is_some() {
+            if !cut && line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(cut));
+        }
+    }
+}
+
+/// One reply line of the handshake: `+…` is fine, `-…` is the server's refusal.
+async fn expect_ok<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, step: &str) -> Result<()> {
+    let mut line = Vec::new();
+    match read_line(reader, &mut line).await? {
+        None => bail!("The server closed the connection during {step}."),
+        Some(_) if line.first() == Some(&b'+') => Ok(()),
+        Some(_) => bail!(
+            "{step} was refused: {}",
+            String::from_utf8_lossy(line.strip_prefix(b"-").unwrap_or(&line))
+        ),
+    }
+}
+
+/// Reads a quoted argument as Redis writes it (sdscatrepr): `\\`, `\"`, `\n`, `\r`, `\t`, `\a`,
+/// `\b` and `\xHH`. Returns the argument and the rest; `None` when the quote never closes.
+fn quoted(input: &[u8]) -> Option<(Bytes, &[u8])> {
+    let mut rest = input.strip_prefix(b"\"")?;
+    let mut out = Vec::new();
+    loop {
+        match rest {
+            [] => return None,
+            [b'"', after @ ..] => return Some((out, after)),
+            [b'\\', b'x', high, low, after @ ..]
+                if high.is_ascii_hexdigit() && low.is_ascii_hexdigit() =>
+            {
+                let digit = |byte: u8| (byte as char).to_digit(16).unwrap_or(0) as u8;
+                out.push(digit(*high) * 16 + digit(*low));
+                rest = after;
+            }
+            [b'\\', escaped, after @ ..] => {
+                out.push(match escaped {
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'a' => 0x07,
+                    b'b' => 0x08,
+                    other => *other,
+                });
+                rest = after;
+            }
+            [byte, after @ ..] => {
+                out.push(*byte);
+                rest = after;
+            }
+        }
+    }
+}
+
+/// Parses `+1700000000.123456 [0 127.0.0.1:5000] "SET" "k" "v"`. A cut line keeps the
+/// arguments read so far plus the partial last one.
+pub fn parse_line(line: &[u8], cut: bool) -> MonitorLine {
+    let raw = || MonitorLine {
+        time: String::new(),
+        db: String::new(),
+        client: String::new(),
+        args: vec![line.to_vec()],
+        cut,
+        raw: true,
+    };
+    let Some(body) = line.strip_prefix(b"+") else {
+        return raw();
+    };
+    let Some(space) = body.iter().position(|byte| *byte == b' ') else {
+        return raw();
+    };
+    let (time, rest) = body.split_at(space);
+    let Some(rest) = rest.strip_prefix(b" [") else {
+        return raw();
+    };
+    let Some(close) = rest.iter().position(|byte| *byte == b']') else {
+        return raw();
+    };
+    let (inside, rest) = rest.split_at(close);
+    let mut rest = rest.strip_prefix(b"]").unwrap_or(rest);
+    let inside = String::from_utf8_lossy(inside);
+    let Some((db, client)) = inside.split_once(' ') else {
+        return raw();
+    };
+    let mut args = Vec::new();
+    loop {
+        rest = rest.strip_prefix(b" ").unwrap_or(rest);
+        if rest.is_empty() {
+            break;
+        }
+        match quoted(rest) {
+            Some((arg, after)) => {
+                args.push(arg);
+                rest = after;
+            }
+            // Only a cut line may end inside an argument; keep what arrived of it.
+            None if cut => {
+                if let Some((arg, _)) = quoted(&[rest, b"\""].concat()) {
+                    args.push(arg);
+                }
+                break;
+            }
+            None => return raw(),
+        }
+    }
+    if args.is_empty() {
+        return raw();
+    }
+    MonitorLine {
+        time: String::from_utf8_lossy(time).into_owned(),
+        db: db.to_string(),
+        client: client.to_string(),
+        args,
+        cut,
+        raw: false,
+    }
+}
+
+impl RedisSession {
+    /// Starts MONITOR on `node` for `seconds` (1–`MAX_SECONDS`) on a connection of its own.
+    pub async fn monitor(&self, node: &ScanNode, seconds: u64) -> Result<Monitor> {
+        anyhow::ensure!(
+            (1..=MAX_SECONDS).contains(&seconds),
+            "A profiler run lasts between 1 and {MAX_SECONDS} seconds."
+        );
+        let server = match (&node.server, &self.config.server) {
+            (Some(server), _) => server.clone(),
+            (None, ServerConfig::Centralized { server }) => server.clone(),
+            _ => bail!(
+                "The profiler works on a single server or one cluster node; this connection is neither."
+            ),
+        };
+        let address = format!("{}:{}", server.host, server.port);
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&address))
+            .await
+            .context("Connecting for the profiler timed out")?
+            .with_context(|| format!("Could not connect to {address} for the profiler"))?;
+        let mut reader = BufReader::new(stream);
+        let handshake = async {
+            if let Some(password) = &self.config.password {
+                let mut args: Vec<&[u8]> = vec![b"AUTH"];
+                if let Some(username) = &self.config.username {
+                    args.push(username.as_bytes());
+                }
+                args.push(password.as_bytes());
+                reader.get_mut().write_all(&encode(&args)).await?;
+                expect_ok(&mut reader, "Signing in").await?;
+            }
+            reader.get_mut().write_all(&encode(&[b"MONITOR"])).await?;
+            expect_ok(&mut reader, "MONITOR").await
+        };
+        tokio::time::timeout(CONNECT_TIMEOUT, handshake)
+            .await
+            .context("Starting MONITOR timed out")??;
+
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let (stop, mut stopped) = oneshot::channel::<()>();
+        tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                let deadline = tokio::time::sleep(Duration::from_secs(seconds));
+                tokio::pin!(deadline);
+                let mut line = Vec::new();
+                let ended = loop {
+                    tokio::select! {
+                        _ = &mut stopped => break "Stopped.".to_string(),
+                        _ = &mut deadline => break format!("Stopped after {seconds} s."),
+                        read = read_line(&mut reader, &mut line) => match read {
+                            Ok(Some(cut)) => {
+                                let parsed = parse_line(&line, cut);
+                                let mut shared = lock(&shared);
+                                let cost = parsed.cost();
+                                if shared.bytes + cost > QUEUE_BYTES {
+                                    shared.lost += 1;
+                                } else {
+                                    shared.bytes += cost;
+                                    shared.lines.push_back(parsed);
+                                }
+                            }
+                            Ok(None) => break "The server closed the connection.".to_string(),
+                            Err(error) => break format!("The connection failed: {error}"),
+                        },
+                    }
+                };
+                // Dropping the reader below closes the socket, which ends MONITOR on the server.
+                lock(&shared).ended = Some(ended);
+            }
+        });
+        Ok(Monitor {
+            shared,
+            _stop: stop,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fred::prelude::Value;
+
+    #[test]
+    fn test_monitor_lines_are_unescaped() {
+        let line = parse_line(
+            br#"+1700000000.123456 [0 172.17.0.1:49896] "SET" "probe:\"q\"" "a\x00\xff\\b \n""#,
+            false,
+        );
+        assert_eq!(line.time, "1700000000.123456");
+        assert_eq!(line.db, "0");
+        assert_eq!(line.client, "172.17.0.1:49896");
+        assert_eq!(
+            line.args,
+            vec![
+                b"SET".to_vec(),
+                b"probe:\"q\"".to_vec(),
+                b"a\x00\xff\\b \n".to_vec()
+            ]
+        );
+        assert!(!line.raw && !line.cut);
+
+        let script = parse_line(br#"+1.5 [3 lua] "get" "k""#, false);
+        assert_eq!((script.db.as_str(), script.client.as_str()), ("3", "lua"));
+        let unix = parse_line(br#"+1.5 [0 unix:/tmp/redis.sock] "PING""#, false);
+        assert_eq!(unix.client, "unix:/tmp/redis.sock");
+
+        let partial = parse_line(br#"+1.5 [0 1.2.3.4:5] "SET" "k" "abc"#, true);
+        assert_eq!(
+            partial.args,
+            vec![b"SET".to_vec(), b"k".to_vec(), b"abc".to_vec()]
+        );
+        assert!(partial.cut && !partial.raw);
+
+        for bad in [
+            &b"-ERR something"[..],
+            b"+1.5 no brackets",
+            br#"+1.5 [0 c] "open"#,
+            b"+1.5 [0 c]",
+        ] {
+            let line = parse_line(bad, false);
+            assert!(line.raw, "{}", String::from_utf8_lossy(bad));
+            assert_eq!(line.args, vec![bad.to_vec()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lines_are_read_within_their_limit() {
+        let mut long = vec![b'x'; MAX_LINE_BYTES * 3];
+        long.extend_from_slice(b"\r\nnext\r\n");
+        let mut reader = BufReader::with_capacity(1000, &long[..]);
+        let mut line = Vec::new();
+        assert_eq!(read_line(&mut reader, &mut line).await.unwrap(), Some(true));
+        assert_eq!(line.len(), MAX_LINE_BYTES);
+        assert_eq!(
+            read_line(&mut reader, &mut line).await.unwrap(),
+            Some(false)
+        );
+        assert_eq!(line, b"next");
+        assert_eq!(read_line(&mut reader, &mut line).await.unwrap(), None);
+    }
+
+    async fn wait_for(
+        monitor: &Monitor,
+        seen: &mut Vec<MonitorLine>,
+        done: impl Fn(&[MonitorLine]) -> bool,
+    ) {
+        for _ in 0..100 {
+            seen.extend(monitor.take().lines);
+            if done(seen) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn monitors(session: &RedisSession) -> usize {
+        let clients = session.clients().await;
+        clients
+            .items
+            .iter()
+            .filter(|client| client.get("flags").contains('O'))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_monitor_against_redis() {
+        let Ok(url) = std::env::var("VILO_TEST_REDIS") else {
+            return;
+        };
+        let session = RedisSession::connect(&url).await.unwrap();
+        let node = session.scan_nodes().remove(0);
+        let before = monitors(&session).await;
+        let monitor = session.monitor(&node, 30).await.unwrap();
+        assert_eq!(monitors(&session).await, before + 1);
+        let key = b"vilo_test:monitor:\"q\"".to_vec();
+        let value = b"a\x00\xff\\b \n".to_vec();
+        session
+            .call(
+                "SET",
+                vec![
+                    Value::Bytes(key.clone().into()),
+                    Value::Bytes(value.clone().into()),
+                ],
+            )
+            .await
+            .unwrap();
+        let big = vec![b'z'; MAX_LINE_BYTES * 2];
+        session
+            .call(
+                "SET",
+                vec!["vilo_test:monitor:big".into(), Value::Bytes(big.into())],
+            )
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        wait_for(&monitor, &mut seen, |seen| {
+            seen.iter()
+                .any(|line| line.args.get(1).is_some_and(|arg| arg.ends_with(b":big")))
+        })
+        .await;
+        let set = seen
+            .iter()
+            .find(|line| line.args.get(1) == Some(&key))
+            .expect("the SET was seen");
+        assert_eq!(set.args, vec![b"SET".to_vec(), key.clone(), value]);
+        let cut = seen
+            .iter()
+            .find(|line| line.args.get(1).is_some_and(|arg| arg.ends_with(b":big")))
+            .expect("the big SET was seen");
+        assert!(cut.cut && !cut.raw);
+        assert!(
+            cut.args
+                .get(2)
+                .is_some_and(|arg| arg.len() < MAX_LINE_BYTES)
+        );
+
+        drop(monitor);
+        for _ in 0..50 {
+            if monitors(&session).await == before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            monitors(&session).await,
+            before,
+            "stopping closes the connection"
+        );
+        session
+            .call(
+                "DEL",
+                vec![Value::Bytes(key.into()), "vilo_test:monitor:big".into()],
+            )
+            .await
+            .unwrap();
+
+        let short = session.monitor(&node, 1).await.unwrap();
+        let mut ended = None;
+        for _ in 0..60 {
+            ended = short.take().ended;
+            if ended.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(ended.as_deref(), Some("Stopped after 1 s."));
+        assert!(session.monitor(&node, 0).await.is_err());
+        assert!(session.monitor(&node, MAX_SECONDS + 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_monitor_signs_in_as_the_connection_does() {
+        let Ok(url) = std::env::var("VILO_TEST_REDIS") else {
+            return;
+        };
+        let admin = RedisSession::connect(&url).await.unwrap();
+        let address = url.trim_start_matches("redis://");
+        for (user, rules) in [
+            ("vilo_test_monitor", &["+@all"][..]),
+            ("vilo_test_no_monitor", &["+@all", "-monitor"][..]),
+        ] {
+            let mut args: Vec<Value> = vec![
+                "SETUSER".into(),
+                user.into(),
+                "reset".into(),
+                "on".into(),
+                ">secret-pw".into(),
+                "~*".into(),
+            ];
+            args.extend(rules.iter().map(|rule| Value::from(*rule)));
+            admin.call("ACL", args).await.unwrap();
+        }
+        let allowed =
+            RedisSession::connect(&format!("redis://vilo_test_monitor:secret-pw@{address}"))
+                .await
+                .unwrap();
+        let node = allowed.scan_nodes().remove(0);
+        let run = allowed.monitor(&node, 5).await;
+        assert!(run.is_ok(), "{:?}", run.err());
+        drop(run);
+
+        let refused =
+            RedisSession::connect(&format!("redis://vilo_test_no_monitor:secret-pw@{address}"))
+                .await
+                .unwrap();
+        let error = refused
+            .monitor(&node, 5)
+            .await
+            .err()
+            .expect("MONITOR is not allowed");
+        assert!(
+            format!("{error:#}").contains("MONITOR was refused"),
+            "{error:#}"
+        );
+
+        // The open session stays signed in; the profiler's new connection uses the old password.
+        admin
+            .call(
+                "ACL",
+                vec![
+                    "SETUSER".into(),
+                    "vilo_test_monitor".into(),
+                    "resetpass".into(),
+                    ">changed-pw".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        let error = allowed
+            .monitor(&node, 5)
+            .await
+            .err()
+            .expect("a wrong password");
+        assert!(
+            format!("{error:#}").contains("Signing in was refused"),
+            "{error:#}"
+        );
+        for user in ["vilo_test_monitor", "vilo_test_no_monitor"] {
+            admin
+                .call("ACL", vec!["DELUSER".into(), user.into()])
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_monitor_one_cluster_node() {
+        let Ok(url) = std::env::var("VILO_TEST_REDIS_CLUSTER") else {
+            return;
+        };
+        let session = RedisSession::connect(&url).await.unwrap();
+        let nodes = session.scan_nodes();
+        assert!(nodes.len() > 1);
+        let mut runs = Vec::new();
+        for node in &nodes {
+            runs.push(session.monitor(node, 30).await.unwrap());
+        }
+        let keys = (0..20)
+            .map(|number| format!("vilo_test:monitor:{number}"))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            session
+                .call("SET", vec![key.as_str().into(), "1".into()])
+                .await
+                .unwrap();
+        }
+        let mut seen = vec![Vec::new(); runs.len()];
+        for _ in 0..100 {
+            for (run, lines) in runs.iter().zip(seen.iter_mut()) {
+                lines.extend(run.take().lines);
+            }
+            let found = keys
+                .iter()
+                .filter(|key| {
+                    seen.iter().flatten().any(|line| {
+                        line.args
+                            .first()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(b"set"))
+                            && line.args.get(1) == Some(&key.as_bytes().to_vec())
+                    })
+                })
+                .count();
+            if found == keys.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for key in &keys {
+            let nodes_seeing = seen
+                .iter()
+                .filter(|lines| {
+                    lines.iter().any(|line| {
+                        line.args
+                            .first()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(b"set"))
+                            && line.args.get(1) == Some(&key.as_bytes().to_vec())
+                    })
+                })
+                .count();
+            assert_eq!(nodes_seeing, 1, "{key} runs on exactly one primary");
+            session
+                .call("DEL", vec![key.as_str().into()])
+                .await
+                .unwrap();
+        }
+    }
+}

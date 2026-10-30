@@ -1,6 +1,7 @@
 mod mongo_tab;
 mod mongo_write;
 mod redis_analyze;
+mod redis_profiler;
 mod redis_pubsub;
 mod redis_search;
 mod redis_stream;

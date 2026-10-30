@@ -39,7 +39,7 @@ pub struct KeyInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanNode {
     pub label: String,
-    server: Option<Server>,
+    pub(crate) server: Option<Server>,
 }
 
 /// Marks a consumer group whose name is not text, so nothing is sent with its shown name.
