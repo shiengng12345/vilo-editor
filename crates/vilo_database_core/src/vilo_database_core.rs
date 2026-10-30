@@ -5,6 +5,7 @@ pub use mongodb::bson;
 
 pub mod display;
 pub mod edit;
+pub mod formats;
 pub mod mongo;
 pub mod redis;
 pub mod redis_analysis;

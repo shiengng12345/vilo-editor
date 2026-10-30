@@ -24,4 +24,5 @@ time.workspace = true
 tokio = { workspace = true, features = ["time", "macros", "sync"] }
 
 [dev-dependencies]
+rmpv = "1.3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

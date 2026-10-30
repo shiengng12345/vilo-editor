@@ -15,6 +15,7 @@ use gpui::{
     uniform_list,
 };
 use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
+use vilo_database_core::formats::Decoder;
 use vilo_database_core::redis::{
     Bytes, ClusterNode, KeyInfo, RedisWrite, ScanNode, StreamEntry, format_reply, quote_bytes,
     split_command,
@@ -128,6 +129,7 @@ enum Format {
     Hex,
     Binary,
     Json,
+    Decoded(Decoder),
 }
 
 impl Format {
@@ -138,6 +140,12 @@ impl Format {
             Format::Hex => "HEX",
             Format::Binary => "Binary",
             Format::Json => "JSON",
+            Format::Decoded(Decoder::Msgpack) => "Msgpack",
+            Format::Decoded(Decoder::Php) => "PHP serialized",
+            Format::Decoded(Decoder::Pickle) => "Pickle",
+            Format::Decoded(Decoder::Java) => "Java serialized",
+            Format::Decoded(Decoder::Float32Vector) => "Vector 32-bit",
+            Format::Decoded(Decoder::Float64Vector) => "Vector 64-bit",
         }
     }
 }
@@ -762,6 +770,9 @@ fn formatted(bytes: &[u8], format: Format) -> String {
             .and_then(|value| serde_json::to_string_pretty(&value).ok())
             .unwrap_or_else(text),
         Format::Unicode => text(),
+        // Read for its structure only; a value in another form says why and shows as text.
+        Format::Decoded(decoder) => vilo_database_core::formats::decode(decoder, bytes)
+            .unwrap_or_else(|error| format!("({error})\n{}", text())),
     }
 }
 
@@ -2434,6 +2445,12 @@ impl DatabaseView {
                         Format::Binary,
                         Format::Hex,
                         Format::Json,
+                        Format::Decoded(Decoder::Msgpack),
+                        Format::Decoded(Decoder::Php),
+                        Format::Decoded(Decoder::Pickle),
+                        Format::Decoded(Decoder::Java),
+                        Format::Decoded(Decoder::Float32Vector),
+                        Format::Decoded(Decoder::Float64Vector),
                     ] {
                         let view = view.clone();
                         menu = menu.entry(format.label(), None, move |_, cx| {
@@ -4037,6 +4054,15 @@ mod tests {
         assert_eq!(formatted(b"\xff", Format::Unicode), "\\xff");
         assert_eq!(formatted(b"\x01\xab", Format::Hex), "01 ab");
         assert_eq!(formatted(b"\x05", Format::Binary), "00000101");
+        assert_eq!(
+            formatted(b"i:5;", Format::Decoded(Decoder::Php)),
+            "5",
+            "a decoder's text is shown"
+        );
+        assert!(
+            formatted(b"plain", Format::Decoded(Decoder::Java)).ends_with(")\nplain"),
+            "a value in another form says why, then shows as text"
+        );
         assert_eq!(describe_ttl(-1), "No limit");
         assert_eq!(describe_ttl(90_000), "1 min");
         assert_eq!(group_thousands(36_300), "36 300");
