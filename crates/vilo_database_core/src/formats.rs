@@ -920,18 +920,13 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
         }
         Ok(name.to_string())
     };
-    let small = |bytes: &[u8]| -> String {
-        // Little-endian two's complement of any length.
-        let negative = bytes.last().is_some_and(|byte| byte & 0x80 != 0);
-        let mut value: i128 = if negative { -1 } else { 0 };
-        if bytes.len() <= 15 {
-            for byte in bytes.iter().rev() {
-                value = (value << 8) | i128::from(*byte);
-            }
-            value.to_string()
-        } else {
-            format!("<{}-byte integer>", bytes.len())
-        }
+    let small = |bytes: &[u8]| -> Result<String, String> {
+        decimal(bytes).ok_or_else(|| {
+            format!(
+                "not a pickle Vilo shows: a {}-byte integer is too large",
+                bytes.len()
+            )
+        })
     };
     loop {
         if stack.len() > MAX_NODES {
@@ -1008,12 +1003,12 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             }
             0x8a => {
                 let length = usize::from(take!(1)[0]);
-                let digits = small(take!(length));
+                let digits = small(take!(length))?;
                 push(arena, &mut stack, Node::Int(digits))?
             }
             0x8b => {
                 let length = u32::from_le_bytes(take!(4).try_into().map_err(|_| "ends early")?);
-                let digits = small(take!(length as usize));
+                let digits = small(take!(length as usize))?;
                 push(arena, &mut stack, Node::Int(digits))?
             }
             b'F' => {
@@ -1136,7 +1131,9 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             0x91 => {
                 let items = pop_mark(&mut stack, at)?;
                 arena.entries(items.len())?;
-                push(arena, &mut stack, Node::Set(items))?
+                let set = arena.add(Node::Set(Vec::new()))?;
+                add_to_set(arena, &mut keys_of, set, items)?;
+                stack.push(Slot::Value(set));
             }
             0x85..=0x87 => {
                 let count = usize::from(opcode - 0x84);
@@ -1170,7 +1167,8 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                     _ => target,
                 };
                 match arena.get_mut(target)? {
-                    Node::List(list) | Node::Set(list) => list.extend(items),
+                    Node::List(list) => list.extend(items),
+                    Node::Set(_) => add_to_set(arena, &mut keys_of, target, items)?,
                     _ => return fail(at, "items added to something that is not a list"),
                 }
             }
@@ -1286,7 +1284,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             }
             0x82..=0x84 => {
                 let width = [1, 2, 4][usize::from(opcode - 0x82)];
-                let code = small(take!(width));
+                let code = small(take!(width))?;
                 push(arena, &mut stack, Node::Name(format!("<extension {code}>")))?
             }
             0x97 => push(arena, &mut stack, Node::Name("<out-of-band buffer>".into()))?,
@@ -1401,7 +1399,11 @@ impl Java<'_> {
         if length > MAX_NAME {
             return self.error("a name too long");
         }
-        Ok(modified_utf8(self.take(length)?))
+        let bytes = self.take(length)?;
+        match modified_utf8(bytes) {
+            Some(text) => Ok(text),
+            None => self.error("a name that is not modified UTF-8"),
+        }
     }
 
     /// A string object's text as UTF-16 units, as Java holds it.
@@ -1413,7 +1415,11 @@ impl Java<'_> {
             usize::from(u16::from_be_bytes(self.array()?))
         };
         self.arena.fits(length.saturating_mul(2))?;
-        Ok(modified_utf8_units(self.take(length)?))
+        let bytes = self.take(length)?;
+        match modified_utf8_units(bytes) {
+            Some(units) => Ok(units),
+            None => self.error("a string that is not modified UTF-8"),
+        }
     }
 
     fn read_all(mut self) -> Result<Id, String> {
@@ -2010,6 +2016,81 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
     })
 }
 
+/// Adds members the way Python's set does: one equal to a member already there is dropped.
+fn add_to_set(
+    arena: &mut Arena,
+    keys_of: &mut std::collections::HashMap<(Id, Vec<u8>), usize>,
+    set: Id,
+    items: Vec<Id>,
+) -> Result<(), String> {
+    for item in items {
+        let fingerprint = dict_key(arena, item, 0);
+        if let Some(fingerprint) = &fingerprint {
+            if keys_of.contains_key(&(set, fingerprint.clone())) {
+                continue;
+            }
+            arena.charge(fingerprint.len())?;
+        }
+        let Node::Set(members) = arena.get_mut(set)? else {
+            return Err("not a pickle: items added to something that is not a set".into());
+        };
+        if let Some(fingerprint) = fingerprint {
+            keys_of.insert((set, fingerprint), members.len());
+        }
+        members.push(item);
+    }
+    Ok(())
+}
+
+/// A little-endian two's complement integer in decimal, for up to 4,096 bytes.
+fn decimal(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > 4096 {
+        return None;
+    }
+    let negative = bytes.last().is_some_and(|byte| byte & 0x80 != 0);
+    // The magnitude, most significant byte first.
+    let mut magnitude = bytes.iter().rev().copied().collect::<Vec<_>>();
+    if negative {
+        // Two's complement: invert, then add one.
+        for byte in &mut magnitude {
+            *byte = !*byte;
+        }
+        for byte in magnitude.iter_mut().rev() {
+            let (sum, carry) = byte.overflowing_add(1);
+            *byte = sum;
+            if !carry {
+                break;
+            }
+        }
+    }
+    let mut chunks = Vec::new();
+    while magnitude.iter().any(|byte| *byte != 0) {
+        // Divide by 10^9, keeping the remainder as the next nine digits.
+        let mut remainder = 0_u64;
+        for byte in &mut magnitude {
+            let current = (remainder << 8) | u64::from(*byte);
+            *byte = (current / 1_000_000_000) as u8;
+            remainder = current % 1_000_000_000;
+        }
+        chunks.push(remainder);
+    }
+    let mut text = if negative {
+        "-".to_string()
+    } else {
+        String::new()
+    };
+    match chunks.split_last() {
+        None => text.push('0'),
+        Some((first, rest)) => {
+            text.push_str(&first.to_string());
+            for chunk in rest.iter().rev() {
+                text.push_str(&format!("{chunk:09}"));
+            }
+        }
+    }
+    Some(text)
+}
+
 /// Sets entries the way Python's dict does: a key already present keeps its place and takes
 /// the new value.
 fn set_items(
@@ -2047,17 +2128,20 @@ fn set_items(
 
 /// Java's modified UTF-8: NUL as C0 80, characters outside the BMP as two 3-byte surrogates.
 /// A lone surrogate or a broken sequence is kept visible as \u{…} rather than replaced.
-fn modified_utf8(bytes: &[u8]) -> String {
-    char::decode_utf16(modified_utf8_units(bytes))
-        .map(|decoded| match decoded {
-            Ok(character) => character.to_string(),
-            Err(error) => format!("\\u{{{:x}}}", error.unpaired_surrogate()),
-        })
-        .collect()
+fn modified_utf8(bytes: &[u8]) -> Option<String> {
+    Some(
+        char::decode_utf16(modified_utf8_units(bytes)?)
+            .map(|decoded| match decoded {
+                Ok(character) => character.to_string(),
+                Err(error) => format!("\\u{{{:x}}}", error.unpaired_surrogate()),
+            })
+            .collect(),
+    )
 }
 
-/// Java's modified UTF-8 as UTF-16 units; a broken sequence becomes U+FFFD.
-fn modified_utf8_units(bytes: &[u8]) -> Vec<u16> {
+/// Java's modified UTF-8 as UTF-16 units; `None` when it is malformed (a stray byte, a cut
+/// sequence or an overlong form other than C0 80 for NUL).
+fn modified_utf8_units(bytes: &[u8]) -> Option<Vec<u16>> {
     let mut units = Vec::new();
     let mut at = 0;
     while let Some(&first) = bytes.get(at) {
@@ -2070,31 +2154,34 @@ fn modified_utf8_units(bytes: &[u8]) -> Vec<u16> {
         let unit = match first {
             0x01..=0x7F => {
                 at += 1;
-                Some(u16::from(first))
+                u16::from(first)
             }
-            0xC0..=0xDF => continuation(at + 1).map(|second| {
+            0xC0..=0xDF => {
+                let second = continuation(at + 1)?;
+                let unit = (u16::from(first & 0x1F) << 6) | u16::from(second & 0x3F);
+                if unit != 0 && unit < 0x80 {
+                    return None;
+                }
                 at += 2;
-                (u16::from(first & 0x1F) << 6) | u16::from(second & 0x3F)
-            }),
-            0xE0..=0xEF => continuation(at + 1)
-                .zip(continuation(at + 2))
-                .map(|(second, third)| {
-                    at += 3;
-                    (u16::from(first & 0x0F) << 12)
-                        | (u16::from(second & 0x3F) << 6)
-                        | u16::from(third & 0x3F)
-                }),
-            _ => None,
-        };
-        match unit {
-            Some(unit) => units.push(unit),
-            None => {
-                units.push(0xFFFD);
-                at += 1;
+                unit
             }
-        }
+            0xE0..=0xEF => {
+                let second = continuation(at + 1)?;
+                let third = continuation(at + 2)?;
+                let unit = (u16::from(first & 0x0F) << 12)
+                    | (u16::from(second & 0x3F) << 6)
+                    | u16::from(third & 0x3F);
+                if unit < 0x800 {
+                    return None;
+                }
+                at += 3;
+                unit
+            }
+            _ => return None,
+        };
+        units.push(unit);
     }
-    units
+    Some(units)
 }
 
 #[cfg(test)]
@@ -2328,11 +2415,19 @@ mod tests {
         resets.push(0x70);
         assert_eq!(decode(Decoder::Java, &resets).unwrap(), "null");
         // Java's modified UTF-8: NUL as C0 80 and 😀 as two surrogates.
-        assert_eq!(modified_utf8(b"a\xc0\x80\xed\xa0\xbd\xed\xb8\x80"), "a\0😀");
         assert_eq!(
-            modified_utf8(b"\xed\xa0\xbd"),
-            "\\u{d83d}",
+            modified_utf8(b"a\xc0\x80\xed\xa0\xbd\xed\xb8\x80").as_deref(),
+            Some("a\0😀")
+        );
+        assert_eq!(
+            modified_utf8(b"\xed\xa0\xbd").as_deref(),
+            Some("\\u{d83d}"),
             "a lone surrogate stays visible"
+        );
+        assert_eq!(modified_utf8(b"\xc1\x81"), None, "overlong");
+        assert!(
+            decode(Decoder::Java, b"\xac\xed\x00\x05\x74\x00\x01\xff").is_err(),
+            "a stray byte"
         );
         // An array class must name an array.
         let not_array = b"\xac\xed\x00\x05\x75\x72\x00\x01X\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x78\x70\x00\x00\x00\x01";
@@ -2682,6 +2777,44 @@ mod tests {
         global.extend(std::iter::repeat_n(0xff, 5000));
         global.extend_from_slice(b"\nx\n.");
         assert!(decode(Decoder::Pickle, &global).is_err());
+    }
+
+    #[test]
+    fn test_sets_ints_and_pop_like_python() {
+        // Each expected value is what python3's pickle.loads returns.
+        assert_eq!(
+            decode(Decoder::Pickle, b"\x8f(K\x01K\x01\x90.").unwrap(),
+            "{\n  1,\n}"
+        );
+        assert_eq!(decode(Decoder::Pickle, b"(K\x01(K\x020t.").unwrap(), "()");
+        assert_eq!(
+            decode(Decoder::Pickle, b"(K\x01(0t.").unwrap(),
+            "(\n  1,\n)"
+        );
+        assert_eq!(
+            decode(Decoder::Pickle, b"(K\x01(K\x021t.").unwrap(),
+            "(\n  1,\n)"
+        );
+        assert_eq!(
+            decode(
+                Decoder::Pickle,
+                &hex("80049513000000000000008a10000000000000000000000000000000012e")
+            )
+            .unwrap(),
+            "1329227995784915872903807060280344576",
+            "2**120"
+        );
+        assert_eq!(
+            decode(
+                Decoder::Pickle,
+                &hex("80028a1a00000000000000000000000000000000000000000000000000ff2e")
+            )
+            .unwrap(),
+            "-1606938044258990275541962092341162602522202993782792835301376",
+            "-(2**200)"
+        );
+        assert_eq!(decimal(&[]).as_deref(), Some("0"));
+        assert_eq!(decimal(&[0xff]).as_deref(), Some("-1"));
     }
 
     #[test]
