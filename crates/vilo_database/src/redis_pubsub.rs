@@ -27,6 +27,8 @@ const BATCH: usize = 500;
 
 enum Entry {
     Message(PubSubMessage),
+    /// Messages lost at this point; consecutive losses share one row.
+    Lost(u64),
     /// Messages lost, or the end of the subscription, at this point in the stream.
     Note(SharedString),
 }
@@ -101,18 +103,19 @@ impl PubSubState {
     }
 
     fn push(&mut self, entry: Entry) {
-        if let Entry::Message(message) = &entry {
-            self.bytes += message.cost();
+        if let (Entry::Lost(more), Some(Entry::Lost(count))) = (&entry, self.entries.back_mut()) {
+            *count += more;
+            return;
         }
+        self.bytes += cost(&entry);
         self.entries.push_back(entry);
         while self.bytes > BUFFER_BYTES {
-            match self.entries.pop_front() {
-                Some(Entry::Message(message)) => {
-                    self.bytes -= message.cost();
-                    self.trimmed += 1;
-                }
-                Some(Entry::Note(_)) => {}
-                None => break,
+            let Some(oldest) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes -= cost(&oldest);
+            if matches!(oldest, Entry::Message(_)) {
+                self.trimmed += 1;
             }
         }
     }
@@ -125,12 +128,7 @@ impl PubSubState {
             }
             PubSubEvent::Lost(count) => {
                 self.lost += count;
-                self.push(Entry::Note(
-                    format!(
-                        "{count} messages lost here (they came faster than Vilo could show them)"
-                    )
-                    .into(),
-                ));
+                self.push(Entry::Lost(count));
             }
             PubSubEvent::Ended(reason) => {
                 self.live = None;
@@ -140,6 +138,15 @@ impl PubSubState {
                 ));
             }
         }
+    }
+}
+
+/// Notes count against the view's budget too, so they cannot pile up without limit.
+fn cost(entry: &Entry) -> usize {
+    match entry {
+        Entry::Message(message) => message.cost(),
+        Entry::Lost(_) => 64,
+        Entry::Note(note) => note.len() + 64,
     }
 }
 
@@ -238,7 +245,11 @@ impl DatabaseView {
                                 }
                                 let alive = this
                                     .update(cx, |this, cx| {
-                                        let Some(pubsub) = this.pubsub() else {
+                                        // A replaced subscription's pump must not touch the new one.
+                                        let Some(pubsub) = this
+                                            .pubsub()
+                                            .filter(|pubsub| pubsub.attempt == attempt)
+                                        else {
                                             return false;
                                         };
                                         for event in batch {
@@ -255,6 +266,7 @@ impl DatabaseView {
                             // The stream ended without saying why; never show it as still live.
                             this.update(cx, |this, cx| {
                                 if let Some(pubsub) = this.pubsub()
+                                    && pubsub.attempt == attempt
                                     && pubsub.live.is_some()
                                 {
                                     pubsub.take(PubSubEvent::Ended(
@@ -294,6 +306,7 @@ impl DatabaseView {
                 .map(|editor| editor.read(cx).text(cx))
                 .unwrap_or_default()
         };
+        let clustered = session.is_clustered();
         let Some(pubsub) = self.redis_state.as_ref().map(|state| &state.pubsub) else {
             return;
         };
@@ -383,6 +396,8 @@ impl DatabaseView {
                             ));
                         }
                         match outcome {
+                            // PUBLISH counts only the node that took it; a Cluster forwards to the others.
+                            Ok(count) if clustered && !sharded => (true, format!("Published; {count} subscribers on the node that took it received it. Subscribers on other nodes are not counted.")),
                             Ok(0) => (true, "Published; no subscriber was listening, so nobody received it.".to_string()),
                             Ok(count) => (true, format!("Published; {count} subscribers received it.")),
                             Err(WriteError::Refused(message)) => (false, format!("Not published: {message}")),
@@ -507,6 +522,14 @@ impl DatabaseView {
                         } else {
                             String::new()
                         }
+                    ),
+                ),
+                Entry::Lost(count) => (
+                    true,
+                    String::new(),
+                    String::new(),
+                    format!(
+                        "{count} messages lost here (they came faster than Vilo could show them)"
                     ),
                 ),
                 Entry::Note(note) => (true, String::new(), String::new(), note.to_string()),
@@ -716,9 +739,16 @@ mod tests {
         assert!(empty.trimmed > 0);
         state.take(PubSubEvent::Lost(3));
         assert_eq!(state.lost, 3);
+        state.take(PubSubEvent::Lost(2));
         assert!(
-            matches!(state.entries.back(), Some(Entry::Note(note)) if note.contains("3 messages lost"))
+            matches!(state.entries.back(), Some(Entry::Lost(5))),
+            "losses in a row share a row"
         );
+        let mut notes = PubSubState::default();
+        for _ in 0..200_000 {
+            notes.push(Entry::Note("a note".into()));
+        }
+        assert!(notes.bytes <= BUFFER_BYTES, "notes cost room too");
         state.take(PubSubEvent::Ended("The connection closed.".into()));
         assert!(state.live.is_none() && state.subscribed_to.is_none());
     }

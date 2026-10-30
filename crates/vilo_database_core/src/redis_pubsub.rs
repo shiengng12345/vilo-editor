@@ -28,6 +28,8 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// Message bytes waiting for the view; messages beyond this are dropped and counted as lost.
 /// Notes about losses and the end are always delivered, and are tiny.
 const QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// What a note (losses, the end) counts against the queue budget.
+const NOTE_COST: usize = 64;
 /// How soon losses are reported when no further message comes to carry them.
 const LOSS_REPORT: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -85,9 +87,12 @@ pub struct Events {
 
 impl Events {
     fn taken(&self, event: Option<PubSubEvent>) -> Option<PubSubEvent> {
-        if let Some(PubSubEvent::Message(message)) = &event {
-            self.queued.fetch_sub(message.cost(), Ordering::Relaxed);
-        }
+        let cost = match &event {
+            Some(PubSubEvent::Message(message)) => message.cost(),
+            Some(PubSubEvent::Lost(_)) => NOTE_COST,
+            _ => 0,
+        };
+        self.queued.fetch_sub(cost, Ordering::Relaxed);
         event
     }
 
@@ -168,8 +173,11 @@ impl RedisSession {
             async move {
                 let mut lost = 0_u64;
                 let mut report = tokio::time::interval(LOSS_REPORT);
+                // A loss note waits, still counting, while the queue is full, so a stalled view
+                // cannot pile notes up. A failed send means the view dropped the subscription.
                 let flush = |lost: &mut u64| {
-                    if *lost > 0 {
+                    if *lost > 0 && queued.load(Ordering::Relaxed) + NOTE_COST <= QUEUE_BYTES {
+                        queued.fetch_add(NOTE_COST, Ordering::Relaxed);
                         sender.unbounded_send(PubSubEvent::Lost(*lost)).ok();
                         *lost = 0;
                     }
@@ -204,7 +212,11 @@ impl RedisSession {
                     }
                 };
                 if let Some(reason) = ended {
-                    flush(&mut lost);
+                    // The last losses and the end always go out, so the view never shows a
+                    // finished subscription as live or hides what it missed.
+                    if lost > 0 {
+                        sender.unbounded_send(PubSubEvent::Lost(lost)).ok();
+                    }
                     sender.unbounded_send(PubSubEvent::Ended(reason)).ok();
                 }
                 // Unsubscribing happens by closing; there is no one left to tell if that fails.
