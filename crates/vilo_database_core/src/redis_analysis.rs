@@ -49,6 +49,8 @@ pub struct NodeCoverage {
     pub total_error: Option<String>,
     /// The node's SCAN came back to cursor 0, so every key it held was visited once.
     pub finished: bool,
+    /// The node stopped because it reached the sample size.
+    pub limit_reached: bool,
     pub error: Option<String>,
     /// Keys whose TYPE was not answered, so they are left out of the report.
     pub unread: u64,
@@ -57,6 +59,8 @@ pub struct NodeCoverage {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Analysis {
+    /// The sample size this report was made with.
+    pub keys_per_node: u64,
     pub nodes: Vec<NodeCoverage>,
     pub sampled: u64,
     pub memory: u64,
@@ -174,6 +178,7 @@ pub fn summarize(
     top_length.sort_by_key(|stat| std::cmp::Reverse(stat.length));
     top_length.truncate(TOP);
     Analysis {
+        keys_per_node: 0,
         nodes,
         sampled: stats.len() as u64,
         memory: stats.iter().filter_map(|stat| stat.memory).sum(),
@@ -198,8 +203,8 @@ enum Read {
 }
 
 impl RedisSession {
-    /// TYPE, PTTL and MEMORY USAGE (its default sampling, never SAMPLES 0) together, then the
-    /// length. A missing answer is kept as unknown, never taken as a real value.
+    /// TYPE, PTTL and MEMORY USAGE (its default sampling, never SAMPLES 0) of one key, sent
+    /// together. A missing answer is kept as unknown, never taken as a real value.
     async fn read_key(&self, key: &Bytes) -> Read {
         let (kind, ttl, memory) = futures::join!(
             self.call("TYPE", vec![bytes_arg(key)]),
@@ -216,12 +221,31 @@ impl RedisSession {
             return Read::Vanished;
         }
         Read::Stat(KeyStat {
-            length: self.length(key, &kind).await.ok().flatten(),
             key: key.clone(),
             kind,
             ttl_ms,
             memory: memory.ok().and_then(|memory| memory.as_u64()),
+            length: None,
         })
+    }
+
+    /// A batch of keys in two pipelined rounds: TYPE, PTTL and MEMORY USAGE of every key, then
+    /// the lengths, whose command depends on the type.
+    async fn read_batch(&self, batch: &[Bytes]) -> Vec<Read> {
+        let mut reads = futures::future::join_all(batch.iter().map(|key| self.read_key(key))).await;
+        let lengths = futures::future::join_all(reads.iter().map(|read| async move {
+            match read {
+                Read::Stat(stat) => self.length(&stat.key, &stat.kind).await.ok().flatten(),
+                _ => None,
+            }
+        }))
+        .await;
+        for (read, length) in reads.iter_mut().zip(lengths) {
+            if let Read::Stat(stat) = read {
+                stat.length = length;
+            }
+        }
+        reads
     }
 
     /// Samples up to `keys_per_node` distinct keys from every primary. Every server call waits
@@ -246,6 +270,7 @@ impl RedisSession {
                 total: None,
                 total_error: None,
                 finished: false,
+                limit_reached: false,
                 error: None,
                 unread: 0,
                 first_unread_error: None,
@@ -270,14 +295,17 @@ impl RedisSession {
             }
             nodes.push(coverage);
         }
-        summarize(
-            &stats,
-            nodes,
-            delimiter,
-            vanished,
-            stopped,
-            started.elapsed(),
-        )
+        Analysis {
+            keys_per_node,
+            ..summarize(
+                &stats,
+                nodes,
+                delimiter,
+                vanished,
+                stopped,
+                started.elapsed(),
+            )
+        }
     }
 
     /// One primary's part of the sample. `Err(None)` means the time limit ran out,
@@ -334,12 +362,9 @@ impl RedisSession {
             let taken = fresh.len().min(room);
             for batch in fresh[..taken].chunks(BATCH) {
                 check()?;
-                let reads = tokio::time::timeout_at(
-                    deadline,
-                    futures::future::join_all(batch.iter().map(|key| self.read_key(key))),
-                )
-                .await
-                .map_err(|_| None)?;
+                let reads = tokio::time::timeout_at(deadline, self.read_batch(batch))
+                    .await
+                    .map_err(|_| None)?;
                 for read in reads {
                     coverage.scanned += 1;
                     match read {
@@ -354,12 +379,14 @@ impl RedisSession {
             }
             cursor = page.cursor;
             if cursor == "0" {
-                // Only a page taken whole completes the node.
+                // Only a page taken whole completes the node; a page cut short hit the sample size.
                 coverage.finished = taken == fresh.len();
+                coverage.limit_reached = !coverage.finished;
                 return Ok(());
             }
             tokio::time::sleep(PAUSE).await;
         }
+        coverage.limit_reached = true;
         Ok(())
     }
 }
@@ -500,6 +527,9 @@ mod tests {
         assert!(full.memory > 0);
 
         let small = session.analyze(5, ":", &never).await;
+        assert_eq!(small.keys_per_node, 5);
+        assert!(small.nodes[0].limit_reached);
+        assert!(!full.nodes[0].limit_reached);
         assert_eq!(small.nodes[0].scanned, 5);
         assert!(!small.nodes[0].finished, "the sample size stops the node");
         let cancelled = session.analyze(1_000, ":", &AtomicBool::new(true)).await;

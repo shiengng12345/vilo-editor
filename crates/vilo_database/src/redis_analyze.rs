@@ -323,6 +323,11 @@ fn render_report(analysis: &Analysis, colors: &theme::ThemeColors, cx: &App) -> 
         )];
         if node.finished {
             parts.push("every key visited".to_string());
+        } else if node.limit_reached {
+            parts.push(format!(
+                "stopped at the sample size of {} keys",
+                analysis.keys_per_node
+            ));
         } else if node.scanned == 0
             && node.total.is_none()
             && node.total_error.is_none()
@@ -351,7 +356,10 @@ fn render_report(analysis: &Analysis, colors: &theme::ThemeColors, cx: &App) -> 
             .size(LabelSize::Small)
             .color(color)
     });
-    let in_report = format!("{} keys in the report", analysis.sampled);
+    let in_report = format!(
+        "{} keys in the report (sample size {} keys per node)",
+        analysis.sampled, analysis.keys_per_node
+    );
     v_flex()
         .gap_4()
         .child(
@@ -466,7 +474,7 @@ impl DatabaseView {
 
     /// A full report scans and reads many keys, so production asks for the connection name
     /// even though nothing is written.
-    fn start_analysis(&mut self, cx: &mut Context<Self>) {
+    fn start_analysis(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.redis() else {
             return;
         };
@@ -491,6 +499,10 @@ impl DatabaseView {
                 Some("Type the connection name exactly to start the analysis.".into());
             cx.notify();
             return;
+        }
+        // Each report is confirmed on its own.
+        if let Some(confirm) = &analyze.analysis_confirm {
+            confirm.update(cx, |editor, cx| editor.set_text("", window, cx));
         }
         let sample = Self::analysis_sample(analyze);
         let stop = Arc::new(AtomicBool::new(false));
@@ -1019,7 +1031,7 @@ impl DatabaseView {
             } else {
                 Button::new("database-analysis-start", "New report")
                     .style(ButtonStyle::Filled)
-                    .on_click(cx.listener(|this, _, _, cx| this.start_analysis(cx)))
+                    .on_click(cx.listener(|this, _, window, cx| this.start_analysis(window, cx)))
             });
         let note = Label::new(format!(
             "Samples up to {sample} keys on each primary with SCAN, in small batches with a pause between pages, and stops after {} seconds. Figures describe the keys sampled; the largest keys are the largest of those, not of the whole database.{}",
