@@ -277,16 +277,38 @@ pub fn parse_line(line: &[u8], cut: bool) -> MonitorLine {
     }
 }
 
+/// A plain or TLS connection to read MONITOR from.
+trait Connection: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Connection for T {}
+
+/// TLS settings and the name the server's certificate is checked against.
+type Tls = (Arc<rustls::ClientConfig>, String);
+
 async fn open(
     host: String,
     port: u16,
+    tls: Option<Tls>,
     username: Option<String>,
     password: Option<String>,
-) -> Result<BufReader<TcpStream>> {
+) -> Result<BufReader<Box<dyn Connection>>> {
     // As a (host, port) pair, so an IPv6 address needs no brackets.
     let stream = TcpStream::connect((host.as_str(), port))
         .await
         .with_context(|| format!("Could not connect to {host} port {port} for the profiler"))?;
+    let stream: Box<dyn Connection> = match tls {
+        None => Box::new(stream),
+        Some((config, name)) => {
+            let name = rustls::pki_types::ServerName::try_from(name.clone())
+                .with_context(|| format!("{name} is not a valid TLS server name"))?;
+            Box::new(
+                tokio_rustls::TlsConnector::from(config)
+                    .connect(name, stream)
+                    .await
+                    .context("The TLS handshake for the profiler failed")?,
+            )
+        }
+    };
     let mut reader = BufReader::new(stream);
     if let Some(password) = &password {
         let mut args: Vec<&[u8]> = vec![b"AUTH"];
@@ -319,6 +341,17 @@ impl RedisSession {
         };
         let host = server.host.to_string();
         let port = server.port;
+        // Checked against the host the session connected to, as the session's own TLS does.
+        let tls = self.tls.clone().map(|config| {
+            let name = match &self.config.server {
+                ServerConfig::Centralized { server } => server.host.to_string(),
+                ServerConfig::Clustered { hosts, .. } => hosts
+                    .first()
+                    .map_or_else(|| host.clone(), |first| first.host.to_string()),
+                _ => host.clone(),
+            };
+            (config, name)
+        });
         let username = self.config.username.clone();
         let password = self.config.password.clone();
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -328,7 +361,7 @@ impl RedisSession {
             async move {
                 let opened = tokio::select! {
                     _ = &mut stopped => Err(Ok("Stopped.".to_string())),
-                    opened = tokio::time::timeout(CONNECT_TIMEOUT, open(host, port, username, password)) => match opened {
+                    opened = tokio::time::timeout(CONNECT_TIMEOUT, open(host, port, tls, username, password)) => match opened {
                         Ok(Ok(reader)) => Ok(reader),
                         Ok(Err(error)) => Err(Err(format!("{error:#}"))),
                         Err(_) => Err(Err("Starting MONITOR timed out.".to_string())),
@@ -704,7 +737,7 @@ mod tests {
         // The handshake fails on this silent listener; only the connection matters here.
         tokio::time::timeout(
             Duration::from_millis(500),
-            open("::1".into(), port, None, None),
+            open("::1".into(), port, None, None, None),
         )
         .await
         .ok();

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context as _, Result, anyhow, bail};
 use fred::{
     cmd,
@@ -15,6 +17,8 @@ pub struct RedisSession {
     pub(crate) client: Client,
     /// Kept so Pub/Sub can open its own connection with the same settings.
     pub(crate) config: Config,
+    /// The TLS settings of a `rediss` connection, for the connections Vilo opens itself (MONITOR).
+    pub(crate) tls: Option<Arc<rustls::ClientConfig>>,
     clustered: bool,
     /// The logical database every connection of this session selects, also after a reconnect.
     database: u8,
@@ -715,7 +719,95 @@ impl RedisSession {
 
     /// Connects with `database` in place of the URL's; a cluster only has database 0.
     pub async fn connect_to_database(url: &str, database: Option<u8>) -> Result<Self> {
-        let mut config = Config::from_url(url).context("The Redis URL is not valid")?;
+        Self::connect_with(url, database, None).await
+    }
+
+    /// Connects with `database` in place of the URL's and, for a `rediss` URL, these TLS settings
+    /// (the system's roots when none are given). A server that turns out to be a cluster node is
+    /// connected to again as a cluster, as RedisInsight does, so every node it reports is reached.
+    pub async fn connect_with(
+        url: &str,
+        database: Option<u8>,
+        tls: Option<&crate::redis_tls::RedisTls>,
+    ) -> Result<Self> {
+        // Parsed without its TLS scheme: fred would build its own TLS settings for `rediss`,
+        // which needs a process-wide crypto provider; Vilo's own settings are set below.
+        let (url, tls_scheme) = match url.split_once("://") {
+            Some((scheme, rest))
+                if scheme.starts_with("rediss") || scheme.starts_with("valkeys") =>
+            {
+                (
+                    format!(
+                        "{}://{rest}",
+                        scheme
+                            .replacen("rediss", "redis", 1)
+                            .replacen("valkeys", "valkey", 1)
+                    ),
+                    true,
+                )
+            }
+            _ => (url.to_string(), false),
+        };
+        let mut config = Config::from_url(&url).context("The Redis URL is not valid")?;
+        let tls_config = match (tls_scheme, tls) {
+            (true, settings) => Some(Arc::new(crate::redis_tls::client_config(
+                &settings.cloned().unwrap_or_default(),
+            )?)),
+            (false, Some(_)) => bail!("TLS settings need a TLS connection; turn Use TLS on."),
+            (false, None) => None,
+        };
+        if let Some(tls_config) = &tls_config {
+            config.tls = Some(fred::types::config::TlsConfig {
+                connector: fred::types::config::TlsConnector::from(
+                    tokio_rustls::TlsConnector::from(tls_config.clone()),
+                ),
+                // Cluster nodes announce addresses; their certificates are checked against the
+                // host the connection was made to.
+                hostnames: fred::types::config::TlsHostMapping::DefaultHost,
+            });
+        }
+        let session = match Self::open(config, database, tls_config.clone()).await {
+            Err(error)
+                if format!("{error:#}").contains("SELECT is not allowed in cluster mode") =>
+            {
+                bail!("This server is a cluster node, and a cluster only has database 0.")
+            }
+            opened => opened?,
+        };
+        if session.clustered {
+            return Ok(session);
+        }
+        let info = session
+            .call("INFO", vec!["cluster".into()])
+            .await
+            .ok()
+            .and_then(|info| info.as_string())
+            .unwrap_or_default();
+        let Server { host, port, .. } = match &session.config.server {
+            fred::types::config::ServerConfig::Centralized { server }
+                if info.lines().any(|line| line.trim() == "cluster_enabled:1") =>
+            {
+                server.clone()
+            }
+            _ => return Ok(session),
+        };
+        anyhow::ensure!(
+            session.database == 0,
+            "This server is a cluster node, and a cluster only has database 0."
+        );
+        let mut cluster = session.config.clone();
+        session.quit().await.ok();
+        cluster.server =
+            fred::types::config::ServerConfig::new_clustered(vec![(host.to_string(), port)]);
+        cluster.database = None;
+        Self::open(cluster, None, tls_config).await
+    }
+
+    async fn open(
+        mut config: Config,
+        database: Option<u8>,
+        tls: Option<Arc<rustls::ClientConfig>>,
+    ) -> Result<Self> {
         let clustered = config.server.is_clustered();
         if let Some(database) = database {
             anyhow::ensure!(
@@ -740,6 +832,7 @@ impl RedisSession {
         Ok(Self {
             client,
             config,
+            tls,
             clustered,
             database: selected,
         })

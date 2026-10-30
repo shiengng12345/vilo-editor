@@ -6700,9 +6700,12 @@ dependencies = [
  "parking_lot",
  "rand 0.8.6",
  "redis-protocol",
+ "rustls",
+ "rustls-native-certs",
  "semver",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "url",
@@ -20170,10 +20173,13 @@ dependencies = [
  "futures 0.3.34",
  "mongodb",
  "rmpv",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "time",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

@@ -94,6 +94,10 @@ struct Connection {
     /// Saved only for non-production connections; production asks again on every run of Vilo.
     #[serde(default)]
     allow_writes: bool,
+    /// For a `rediss` connection: certificate files (paths only) and whether the server's
+    /// certificate is checked. None uses the system's roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redis_tls: Option<vilo_database_core::redis_tls::RedisTls>,
 }
 
 impl Connection {
@@ -248,6 +252,26 @@ struct RedisFields {
     password: Entity<Editor>,
     database: Entity<Editor>,
     tls: bool,
+    ca_file: Entity<Editor>,
+    cert_file: Entity<Editor>,
+    key_file: Entity<Editor>,
+    verify: bool,
+}
+
+impl RedisFields {
+    /// The TLS settings as typed; empty paths are left out.
+    fn tls_settings(&self, cx: &App) -> vilo_database_core::redis_tls::RedisTls {
+        let path = |editor: &Entity<Editor>| {
+            let text = editor.read(cx).text(cx).trim().to_string();
+            (!text.is_empty()).then(|| PathBuf::from(text))
+        };
+        vilo_database_core::redis_tls::RedisTls {
+            ca_file: path(&self.ca_file),
+            cert_file: path(&self.cert_file),
+            key_file: path(&self.key_file),
+            verify: self.verify,
+        }
+    }
 }
 
 /// The parts of a Redis connection, as the form shows them.
@@ -427,11 +451,20 @@ async fn connect(connection: &Connection, uri: String, cx: &AsyncApp) -> Result<
                 Ok(Session::Mongo(Arc::new(MongoSession::connect(&uri).await?)))
             })
         }),
-        Kind::Redis => cx.update(|cx| {
-            run(cx, async move {
-                Ok(Session::Redis(Arc::new(RedisSession::connect(&uri).await?)))
+        Kind::Redis => {
+            // Settings saved for TLS apply only to a TLS connection string.
+            let tls = connection
+                .redis_tls
+                .clone()
+                .filter(|_| uri.starts_with("rediss://"));
+            cx.update(|cx| {
+                run(cx, async move {
+                    Ok(Session::Redis(Arc::new(
+                        RedisSession::connect_with(&uri, None, tls.as_ref()).await?,
+                    )))
+                })
             })
-        }),
+        }
     };
     handle_task.await
 }
@@ -948,6 +981,14 @@ impl DatabaseView {
             .as_ref()
             .and_then(|id| self.connections.iter().find(|c| &c.id == id))
             .cloned();
+        let tls_path = |path: fn(&vilo_database_core::redis_tls::RedisTls) -> &Option<PathBuf>| {
+            existing
+                .as_ref()
+                .and_then(|c| c.redis_tls.as_ref())
+                .and_then(|tls| path(tls).as_ref())
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+        };
         self.form = Some(Form {
             kind: existing.as_ref().map_or(self.kind_view, |c| c.kind),
             site: existing
@@ -998,6 +1039,31 @@ impl DatabaseView {
                         cx,
                     ),
                     database: editor("0", "", false, window, cx),
+                    ca_file: editor(
+                        "CA certificate file (PEM); empty uses the system's",
+                        &tls_path(|tls| &tls.ca_file),
+                        false,
+                        window,
+                        cx,
+                    ),
+                    cert_file: editor(
+                        "Client certificate file (PEM), if the server asks for one",
+                        &tls_path(|tls| &tls.cert_file),
+                        false,
+                        window,
+                        cx,
+                    ),
+                    key_file: editor(
+                        "Client key file (PEM)",
+                        &tls_path(|tls| &tls.key_file),
+                        false,
+                        window,
+                        cx,
+                    ),
+                    verify: existing
+                        .as_ref()
+                        .and_then(|c| c.redis_tls.as_ref())
+                        .is_none_or(|tls| tls.verify),
                     tls: false,
                 },
             ),
@@ -1121,6 +1187,12 @@ impl DatabaseView {
             environment: environment.clone(),
             // A new address starts with writes off again.
             allow_writes: uri.is_empty() && existing.as_ref().is_some_and(|c| c.allow_writes),
+            // Fields that never loaded keep the saved settings.
+            redis_tls: match &form.redis {
+                Some(redis) if redis.tls && !uri.is_empty() => Some(redis.tls_settings(cx)),
+                Some(_) if !uri.is_empty() => None,
+                _ => existing.as_ref().and_then(|c| c.redis_tls.clone()),
+            },
         };
         if !uri.is_empty() {
             self.session_writes.remove(&connection.id);
@@ -1883,7 +1955,29 @@ impl DatabaseView {
                                         cx.notify();
                                     })),
                             ),
-                    ),
+                    )
+                    .when(redis.tls, |this| {
+                        this.child(input("CA certificate", &redis.ca_file, cx))
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .child(div().flex_1().child(input("Client certificate", &redis.cert_file, cx)))
+                                    .child(div().flex_1().child(input("Client key", &redis.key_file, cx))),
+                            )
+                            .child(
+                                Button::new("database-redis-verify", "Verify the server's certificate")
+                                    .style(if redis.verify { ButtonStyle::Filled } else { ButtonStyle::Outlined })
+                                    .start_icon(Icon::new(if redis.verify { IconName::Check } else { IconName::Circle }).size(IconSize::XSmall))
+                                    .toggle_state(redis.verify)
+                                    .tooltip(Tooltip::text("Off accepts any certificate, for servers with self-signed ones; the connection is still encrypted"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(redis) = this.form.as_mut().and_then(|form| form.redis.as_mut()) {
+                                            redis.verify = !redis.verify;
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                    }),
             })
             .child(
                 Label::new(
