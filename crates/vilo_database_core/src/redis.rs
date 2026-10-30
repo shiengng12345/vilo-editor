@@ -1634,10 +1634,14 @@ const LIST_REMOVE_AT: &str = "if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[
        and redis.acl_check_cmd('LREM', KEYS[1], 1, ARGV[3])) then return -2 end \
      redis.call('LSET', KEYS[1], ARGV[1], ARGV[3]) \
      return redis.call('LREM', KEYS[1], 1, ARGV[3])";
-/// ARGV: group, consumer, min idle, id. XCLAIM of an entry deleted from the stream drops it
-/// from the pending list yet answers nothing claimed (Redis 7), so a missing entry is refused
-/// (-3) before claiming; in this script an empty answer then really means nothing changed.
+/// ARGV: group, consumer, min idle, id. XCLAIM has side effects even when it claims nothing:
+/// it creates the receiving consumer (and refreshes its idle) before checking the entry, and
+/// drops an entry deleted from the stream from the pending list (Redis 7). So the script first
+/// checks the entry is in the stream (-3 when not) and still pending and idle long enough
+/// (0 when not), and only then claims; a 0 then means nothing changed at all.
 const STREAM_CLAIM_GUARDED: &str = "if #redis.call('XRANGE', KEYS[1], ARGV[4], ARGV[4]) == 0 then return -3 end \
+     local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[4], ARGV[4], 1) \
+     if #pending == 0 or tonumber(pending[1][3]) < tonumber(ARGV[3]) then return 0 end \
      return #redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[2], ARGV[3], ARGV[4], 'JUSTID')";
 const ENTRY_GONE: i64 = -3;
 /// ARGV: the document as read, the new document.
@@ -2548,6 +2552,15 @@ broken line";
         assert!(
             !write(claim(3_600_000)).await.unwrap(),
             "not idle long enough: left with its consumer"
+        );
+        assert!(
+            session
+                .stream_consumers(&key, "g")
+                .await
+                .unwrap()
+                .iter()
+                .all(|consumer| consumer.name != "c2"),
+            "a refused claim does not create its receiving consumer"
         );
         assert!(write(claim(0)).await.unwrap());
         // On a stream of its own: an entry deleted from the stream is refused, and stays pending.
