@@ -675,10 +675,9 @@ impl Php<'_> {
                 self.remember(Node::Bool(flag))
             }
             b'i' => {
-                let number = self.number(b';')?;
-                if !is_integer(&number) {
+                let Some(number) = canonical_integer(&self.number(b';')?) else {
                     return self.error("an integer that is not a number");
-                }
+                };
                 self.remember(Node::Int(number))
             }
             b'd' => {
@@ -784,10 +783,9 @@ impl Php<'_> {
             Some(b'i') => {
                 self.at += 1;
                 self.expect(b':')?;
-                let number = self.number(b';')?;
-                if !is_integer(&number) {
+                let Some(number) = canonical_integer(&self.number(b';')?) else {
                     return self.error("an integer that is not a number");
-                }
+                };
                 self.arena.add(Node::Int(number))
             }
             Some(b's') => {
@@ -817,18 +815,20 @@ impl Php<'_> {
         if name.len() > MAX_NAME {
             return self.error("a property name too long");
         }
-        let name = String::from_utf8(name)
-            .unwrap_or_else(|error| crate::redis::quote_bytes(error.as_bytes()));
-        Ok(
-            match name
-                .strip_prefix('\0')
-                .and_then(|rest| rest.split_once('\0'))
-            {
-                Some(("*", property)) => format!("{property} (protected)"),
-                Some((class, property)) => format!("{property} (private to {class})"),
-                None => name,
-            },
-        )
+        // Visibility is read from the bytes, before a name that is not text is escaped.
+        let text = |bytes: &[u8]| {
+            String::from_utf8(bytes.to_vec())
+                .unwrap_or_else(|error| crate::redis::quote_bytes(error.as_bytes()))
+        };
+        let split = name.strip_prefix(b"\0").and_then(|rest| {
+            let end = rest.iter().position(|byte| *byte == 0)?;
+            Some((&rest[..end], &rest[end + 1..]))
+        });
+        Ok(match split {
+            Some((b"*", property)) => format!("{} (protected)", text(property)),
+            Some((class, property)) => format!("{} (private to {})", text(property), text(class)),
+            None => text(&name),
+        })
     }
 }
 
@@ -981,23 +981,21 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 let node = match text.as_str() {
                     "00" => Node::Bool(false),
                     "01" => Node::Bool(true),
-                    text if is_integer(text) => Node::Int(text.to_string()),
-                    _ => return fail(at, "an INT that is not a number"),
+                    text => match canonical_integer(text) {
+                        Some(number) => Node::Int(number),
+                        None => return fail(at, "an INT that is not a number"),
+                    },
                 };
                 push(arena, &mut stack, node)?
             }
             b'L' => {
                 let text = line!();
-                let digits = text.trim_end_matches('L');
-                if digits.is_empty()
-                    || digits
-                        .trim_start_matches('-')
-                        .bytes()
-                        .any(|byte| !byte.is_ascii_digit())
-                {
+                // At most one trailing L, as Python writes it.
+                let digits = text.strip_suffix('L').unwrap_or(&text);
+                let Some(number) = canonical_integer(digits) else {
                     return fail(at, "a LONG that is not a number");
-                }
-                push(arena, &mut stack, Node::Int(digits.to_string()))?
+                };
+                push(arena, &mut stack, Node::Int(number))?
             }
             b'J' => {
                 let value = i32::from_le_bytes(take!(4).try_into().map_err(|_| "ends early")?);
@@ -1839,9 +1837,23 @@ fn object_items(
     Ok(items)
 }
 
-fn is_integer(text: &str) -> bool {
-    let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
-    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+/// An integer written as an optional sign and digits, in its plain form (no plus sign, no
+/// leading zeros, no "-0"), so equal numbers are equal text; `None` when it is not one.
+fn canonical_integer(text: &str) -> Option<String> {
+    let (negative, digits) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let digits = digits.trim_start_matches('0');
+    Some(match (negative, digits.is_empty()) {
+        (_, true) => "0".to_string(),
+        (true, false) => format!("-{digits}"),
+        (false, false) => digits.to_string(),
+    })
 }
 
 /// Python text as pickled: UTF-8 with surrogates passed through (Python allows lone
@@ -1987,11 +1999,12 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
     if depth > 16 {
         return None;
     }
-    let number = |text: &str| text.trim_start_matches('+').parse::<i128>().ok();
     Some(match arena.nodes.get(id)? {
         Node::Null => b"n".to_vec(),
         Node::Bool(flag) => format!("i{}", i128::from(*flag)).into_bytes(),
-        Node::Int(text) => format!("i{}", number(text)?).into_bytes(),
+        // Integers are kept in their plain form when read, so the text is the number.
+        Node::Int(text) if text.len() > MAX_KEY => return None,
+        Node::Int(text) => [b"i".as_slice(), text.as_bytes()].concat(),
         Node::Float(value) if value.fract() == 0.0 && value.abs() < 1e30 => {
             format!("i{}", *value as i128).into_bytes()
         }
@@ -2015,6 +2028,23 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
             let mut key = b"(".to_vec();
             for item in items {
                 let part = dict_key(arena, *item, depth + 1)?;
+                key.extend_from_slice(&part.len().to_le_bytes());
+                key.extend_from_slice(&part);
+                if key.len() > MAX_KEY {
+                    return None;
+                }
+            }
+            key
+        }
+        // A frozenset equals one with the same members, in any order.
+        Node::Set(members) => {
+            let mut parts = members
+                .iter()
+                .map(|member| dict_key(arena, *member, depth + 1))
+                .collect::<Option<Vec<_>>>()?;
+            parts.sort();
+            let mut key = b"{".to_vec();
+            for part in parts {
                 key.extend_from_slice(&part.len().to_le_bytes());
                 key.extend_from_slice(&part);
                 if key.len() > MAX_KEY {
@@ -2854,6 +2884,33 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(decode(Decoder::Pickle, &ints).is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_canonical_numbers_frozensets_and_visibility() {
+        // Each as python3 pickle.loads reads it.
+        assert_eq!(
+            decode(Decoder::Pickle, b"}(K\x01\x91K\x01s(K\x01\x91K\x02s.")
+                .unwrap()
+                .matches(": ")
+                .count(),
+            1
+        );
+        assert!(decode(Decoder::Pickle, b"L-\n.").is_err());
+        assert!(decode(Decoder::Pickle, b"L--12L\n.").is_err());
+        assert_eq!(decode(Decoder::Pickle, b"L+5L\n.").unwrap(), "5");
+        assert_eq!(decode(Decoder::Pickle, b"L007\n.").unwrap(), "7");
+        assert_eq!(decode(Decoder::Pickle, b"I007\n.").unwrap(), "7");
+        // 007 and 7 are one key.
+        assert_eq!(
+            decode(Decoder::Pickle, b"}I007\nK\x01sI7\nK\x02s.").unwrap(),
+            "{\n  7: 2,\n}"
+        );
+        let protected = decode(Decoder::Php, b"O:1:\"A\":1:{s:4:\"\x00*\x00\xff\";i:1;}").unwrap();
+        assert!(
+            protected.contains(r#""\xff" (protected): 1"#),
+            "{protected}"
+        );
     }
 
     #[test]
