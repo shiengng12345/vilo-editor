@@ -47,18 +47,22 @@ pub struct MonitorLine {
 }
 
 impl MonitorLine {
-    /// What keeping the line costs against the queue and view budgets. Each argument is an
-    /// allocation of its own, so many empty ones are not free.
+    /// What keeping the line costs against the queue and view budgets: the entry itself and
+    /// every allocation it holds. Each argument is an allocation of its own, so many empty ones
+    /// are not free.
     pub fn cost(&self) -> usize {
-        self.args
-            .iter()
-            .map(|arg| arg.capacity() + ALLOCATION_OVERHEAD)
-            .sum::<usize>()
-            + self.args.capacity() * std::mem::size_of::<Bytes>()
+        std::mem::size_of::<Self>()
+            // The three strings and the argument vector.
+            + 4 * ALLOCATION_OVERHEAD
             + self.time.capacity()
             + self.db.capacity()
             + self.client.capacity()
-            + 64
+            + self.args.capacity() * std::mem::size_of::<Bytes>()
+            + self
+                .args
+                .iter()
+                .map(|arg| arg.capacity() + ALLOCATION_OVERHEAD)
+                .sum::<usize>()
     }
 }
 
@@ -102,7 +106,8 @@ impl Monitor {
         shared.bytes = 0;
         MonitorBatch {
             started: std::mem::take(&mut shared.started),
-            lines: shared.lines.drain(..).collect(),
+            // Taken whole, so the queue does not keep a busy moment's capacity afterwards.
+            lines: std::mem::take(&mut shared.lines).into(),
             lost: std::mem::take(&mut shared.lost),
             ended: shared.ended.take(),
         }
@@ -171,13 +176,16 @@ async fn expect_ok<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, step: &st
 }
 
 /// Reads a quoted argument as Redis writes it (sdscatrepr): `\\`, `\"`, `\n`, `\r`, `\t`, `\a`,
-/// `\b` and `\xHH`. Returns the argument and the rest; `None` when the quote never closes.
-fn quoted(input: &[u8]) -> Option<(Bytes, &[u8])> {
+/// `\b` and `\xHH`. Returns the argument and the rest; `None` when the quote never closes,
+/// unless `partial`, where the line was cut: then the argument so far, without an escape the
+/// cut left unfinished.
+fn quoted(input: &[u8], partial: bool) -> Option<(Bytes, &[u8])> {
     let mut rest = input.strip_prefix(b"\"")?;
     let mut out = Vec::new();
     loop {
         match rest {
-            [] => return None,
+            [] => return partial.then_some((out, rest)),
+            [b'\\'] | [b'\\', b'x'] | [b'\\', b'x', _] if partial => return Some((out, &[])),
             [b'"', after @ ..] => return Some((out, after)),
             [b'\\', b'x', high, low, after @ ..]
                 if high.is_ascii_hexdigit() && low.is_ascii_hexdigit() =>
@@ -241,14 +249,14 @@ pub fn parse_line(line: &[u8], cut: bool) -> MonitorLine {
         if rest.is_empty() {
             break;
         }
-        match quoted(rest) {
+        match quoted(rest, false) {
             Some((arg, after)) => {
                 args.push(arg);
                 rest = after;
             }
             // Only a cut line may end inside an argument; keep what arrived of it.
             None if cut => {
-                if let Some((arg, _)) = quoted(&[rest, b"\""].concat()) {
+                if let Some((arg, _)) = quoted(rest, true) {
                     args.push(arg);
                 }
                 break;
@@ -401,6 +409,15 @@ mod tests {
             vec![b"SET".to_vec(), b"k".to_vec(), b"abc".to_vec()]
         );
         assert!(partial.cut && !partial.raw);
+        for (cut_inside, kept) in [
+            (&br#"+1.5 [0 c] "SET" "ab\x4"#[..], &b"ab"[..]),
+            (br#"+1.5 [0 c] "SET" "ab\"#, b"ab"),
+            (br#"+1.5 [0 c] "SET" "ab\x"#, b"ab"),
+            (br#"+1.5 [0 c] "SET" "a\"b"#, b"a\"b"),
+        ] {
+            let line = parse_line(cut_inside, true);
+            assert_eq!(line.args.get(1).map(Vec::as_slice), Some(kept));
+        }
 
         for bad in [
             &b"-ERR something"[..],
@@ -448,6 +465,8 @@ mod tests {
         );
         assert_eq!(many.args.len(), 5001);
         assert!(many.cost() >= 5001 * (std::mem::size_of::<Bytes>() + ALLOCATION_OVERHEAD));
+        let short = parse_line(br#"+1.5 [0 c] "PING""#, false);
+        assert!(short.cost() > std::mem::size_of::<MonitorLine>() + 4 * ALLOCATION_OVERHEAD);
     }
 
     /// Tests that count the single server's monitor clients run one at a time.
