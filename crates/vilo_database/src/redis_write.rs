@@ -7,7 +7,7 @@ use gpui::{Entity, Window, prelude::*};
 use ui::{Button, ButtonStyle, Tooltip, prelude::*};
 use vilo_database_core::{
     mongo::WriteError,
-    redis::{Bytes, RedisWrite, quote_bytes},
+    redis::{Bytes, NEW_KEY_ARGUMENTS, NewValue, RedisWrite, quote_bytes},
 };
 
 use crate::{DatabaseView, boxed, editor as single_line, mongo_write, run};
@@ -21,12 +21,22 @@ pub(crate) enum RedisOp {
     SetRemove,
     ZSetScore,
     ZSetRemove,
-    ListPush { head: bool },
+    ListPush {
+        head: bool,
+    },
     ListRemove,
     Delete,
     Rename,
     Expire,
     Persist,
+    /// A new key of this Redis type ("string", "hash", "list", "set", "zset").
+    AddKey(&'static str),
+    ListSet {
+        index: i64,
+    },
+    ListRemoveAt {
+        index: i64,
+    },
 }
 
 impl RedisOp {
@@ -46,6 +56,9 @@ impl RedisOp {
             RedisOp::Rename => "Rename key",
             RedisOp::Expire => "Set time to live",
             RedisOp::Persist => "Remove time to live",
+            RedisOp::AddKey(_) => "Add key",
+            RedisOp::ListSet { .. } => "Edit item",
+            RedisOp::ListRemoveAt { .. } => "Remove item",
         }
     }
 
@@ -82,7 +95,21 @@ impl RedisOp {
             RedisOp::ListPush { .. } | RedisOp::ListRemove => &["Value"],
             RedisOp::Rename => &["New name"],
             RedisOp::Expire => &["Seconds"],
-            RedisOp::Delete | RedisOp::Persist => &[],
+            RedisOp::ListSet { .. } => &["Value"],
+            RedisOp::AddKey(_) => &["Key name", "TTL in seconds (empty: no TTL)"],
+            RedisOp::Delete | RedisOp::Persist | RedisOp::ListRemoveAt { .. } => &[],
+        }
+    }
+
+    /// The inputs of one value row of a new key; hashes, lists, sets and sorted sets can add more.
+    fn row_inputs(self) -> &'static [&'static str] {
+        match self {
+            RedisOp::AddKey("string") => &["Value"],
+            RedisOp::AddKey("hash") => &["Field", "Value"],
+            RedisOp::AddKey("list") => &["Element"],
+            RedisOp::AddKey("set") => &["Member"],
+            RedisOp::AddKey("zset") => &["Member", "Score"],
+            _ => &[],
         }
     }
 }
@@ -91,6 +118,8 @@ pub(crate) struct RedisWriteForm {
     op: RedisOp,
     key: Bytes,
     inputs: Vec<(&'static str, Entity<Editor>)>,
+    /// The list item as it was shown, which a list row edit or removal must still find.
+    shown_item: Option<Bytes>,
     planned: Option<RedisWrite>,
     typed: Entity<Editor>,
     show_values: bool,
@@ -107,6 +136,73 @@ impl RedisWriteForm {
 
 fn lock_key(connection: &str, database: u8, key: &[u8]) -> String {
     format!("{connection}/redis/db{database}/{}", quote_bytes(key))
+}
+
+/// The new key from the form: name, optional TTL, then value rows. Rows left empty are skipped.
+fn new_key(kind: &'static str, values: &[String]) -> Result<RedisWrite> {
+    let name = values.first().cloned().unwrap_or_default();
+    if name.trim().is_empty() {
+        return Err(anyhow!("Name the key."));
+    }
+    let ttl = values.get(1).map(|text| text.trim()).unwrap_or_default();
+    let ttl_seconds = if ttl.is_empty() {
+        None
+    } else {
+        Some(
+            ttl.parse::<u64>()
+                .ok()
+                .filter(|seconds| *seconds > 0)
+                .ok_or_else(|| {
+                    anyhow!("The TTL must be a whole number of seconds above 0, or empty.")
+                })?,
+        )
+    };
+    let width = RedisOp::AddKey(kind).row_inputs().len().max(1);
+    let rows = values
+        .get(2..)
+        .unwrap_or_default()
+        .chunks(width)
+        .filter(|row| kind == "string" || row.iter().any(|text| !text.is_empty()))
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return Err(anyhow!("Add at least one value."));
+    }
+    let column = |row: &[String], index: usize| row.get(index).cloned().unwrap_or_default();
+    let value = match kind {
+        "string" => NewValue::String(column(rows[0], 0).into_bytes()),
+        "hash" => NewValue::Hash(
+            rows.iter()
+                .map(|row| {
+                    let field = column(row, 0);
+                    if field.is_empty() {
+                        return Err(anyhow!("Every field needs a name."));
+                    }
+                    Ok((field.into_bytes(), column(row, 1).into_bytes()))
+                })
+                .collect::<Result<_>>()?,
+        ),
+        "list" => NewValue::List(rows.iter().map(|row| column(row, 0).into_bytes()).collect()),
+        "set" => NewValue::Set(rows.iter().map(|row| column(row, 0).into_bytes()).collect()),
+        "zset" => NewValue::SortedSet(
+            rows.iter()
+                .map(|row| {
+                    let score = column(row, 1)
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|score| !score.is_nan())
+                        .ok_or_else(|| anyhow!("Every score must be a number."))?;
+                    Ok((score, column(row, 0).into_bytes()))
+                })
+                .collect::<Result<_>>()?,
+        ),
+        _ => return Err(anyhow!("Vilo cannot create {kind} keys.")),
+    };
+    Ok(RedisWrite::AddKey {
+        key: name.into_bytes(),
+        value,
+        ttl_seconds,
+    })
 }
 
 impl DatabaseView {
@@ -128,12 +224,14 @@ impl DatabaseView {
         }
     }
 
-    /// `current` prefills the value of a string edit; it must be text to be edited here.
+    /// `prefill` fills the inputs in order (a row's field and value, a string's value); it must be
+    /// text to be edited here. `shown_item` is the list item a row edit was started from.
     pub(crate) fn start_redis_write(
         &mut self,
         op: RedisOp,
         key: Bytes,
-        current: Option<Bytes>,
+        prefill: Vec<Bytes>,
+        shown_item: Option<Bytes>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -158,25 +256,34 @@ impl DatabaseView {
             cx.notify();
             return;
         }
+        let Ok(prefill) = prefill
+            .into_iter()
+            .map(String::from_utf8)
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            self.write_notice = Some("This value is not text, so Vilo cannot edit it here.".into());
+            cx.notify();
+            return;
+        };
+        if op == RedisOp::EditString && prefill.is_empty() {
+            self.write_notice = Some("This value is not text, so Vilo cannot edit it here.".into());
+            cx.notify();
+            return;
+        }
+        let multiline = |op: RedisOp, label: &str| {
+            matches!(op, RedisOp::EditString | RedisOp::AddKey("string")) && label == "Value"
+        };
         let mut inputs = Vec::new();
-        for label in op.inputs() {
-            let editor = if op == RedisOp::EditString {
-                let Some(text) = current
-                    .clone()
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                else {
-                    self.write_notice =
-                        Some("This value is not text, so Vilo cannot edit it here.".into());
-                    cx.notify();
-                    return;
-                };
+        for (index, label) in op.inputs().iter().chain(op.row_inputs()).enumerate() {
+            let text = prefill.get(index).cloned().unwrap_or_default();
+            let editor = if multiline(op, label) {
                 cx.new(|cx| {
                     let mut editor = Editor::auto_height(4, 24, window, cx);
                     editor.set_text(text, window, cx);
                     editor
                 })
             } else {
-                single_line(label, "", false, window, cx)
+                single_line(label, &text, false, window, cx)
             };
             inputs.push((*label, editor));
         }
@@ -184,6 +291,7 @@ impl DatabaseView {
             op,
             key,
             inputs,
+            shown_item,
             planned: None,
             typed: single_line("Type the connection name", "", false, window, cx),
             show_values: false,
@@ -193,16 +301,41 @@ impl DatabaseView {
         };
         // Operations without inputs go straight to review.
         if form.inputs.is_empty() {
-            form.planned = Some(match op {
-                RedisOp::Persist => RedisWrite::Persist {
+            // Spelled out, so an item removal can never fall through to deleting the key.
+            form.planned = match (op, form.shown_item.clone()) {
+                (RedisOp::Persist, _) => Some(RedisWrite::Persist {
                     key: form.key.clone(),
-                },
-                _ => RedisWrite::Delete {
+                }),
+                (RedisOp::Delete, _) => Some(RedisWrite::Delete {
                     key: form.key.clone(),
-                },
-            });
+                }),
+                (RedisOp::ListRemoveAt { index }, Some(expected)) => {
+                    Some(RedisWrite::ListRemoveAt {
+                        key: form.key.clone(),
+                        index,
+                        expected,
+                    })
+                }
+                _ => None,
+            };
+            if form.planned.is_none() {
+                self.write_notice = Some("Open the item from the list to remove it.".into());
+                cx.notify();
+                return;
+            }
         }
         self.redis_write = Some(form);
+        cx.notify();
+    }
+
+    fn add_redis_write_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.redis_write else {
+            return;
+        };
+        for label in form.op.row_inputs() {
+            let editor = single_line(label, "", false, window, cx);
+            form.inputs.push((*label, editor));
+        }
         cx.notify();
     }
 
@@ -218,7 +351,7 @@ impl DatabaseView {
             .iter()
             .map(|(_, editor)| editor.read(cx).text(cx))
             .collect::<Vec<_>>();
-        let (op, key) = (form.op, form.key.clone());
+        let (op, key, shown_item) = (form.op, form.key.clone(), form.shown_item.clone());
         form.message = Some("Reading the current value…".into());
         let task = run(cx, async move {
             let input = |index: usize| -> Result<Bytes> {
@@ -313,6 +446,18 @@ impl DatabaseView {
                 }
                 RedisOp::Delete => RedisWrite::Delete { key },
                 RedisOp::Persist => RedisWrite::Persist { key },
+                RedisOp::ListSet { index } => RedisWrite::ListSet {
+                    expected: shown_item.ok_or_else(|| anyhow!("Open the item from the list."))?,
+                    value: input(0)?,
+                    index,
+                    key,
+                },
+                RedisOp::ListRemoveAt { index } => RedisWrite::ListRemoveAt {
+                    expected: shown_item.ok_or_else(|| anyhow!("Open the item from the list."))?,
+                    index,
+                    key,
+                },
+                RedisOp::AddKey(kind) => new_key(kind, &values)?,
             })
         });
         form._task = Some(cx.spawn(async move |this, cx| {
@@ -434,6 +579,9 @@ impl DatabaseView {
                         if matches!(planned, RedisWrite::Delete { .. } | RedisWrite::Rename { .. }) {
                             this.close_redis_key();
                             this.scan(true, cx);
+                        } else if matches!(planned, RedisWrite::AddKey { .. }) {
+                            this.scan(true, cx);
+                            this.reopen_redis_key(key, cx);
                         } else {
                             this.reopen_redis_key(key, cx);
                         }
@@ -442,6 +590,8 @@ impl DatabaseView {
                         form.message = Some(
                             match planned {
                                 RedisWrite::Rename { .. } => "Nothing changed: the new name is already taken, or the key is gone.",
+                                RedisWrite::AddKey { .. } => "Nothing changed: a key with this name already exists.",
+                                RedisWrite::ListSet { .. } | RedisWrite::ListRemoveAt { .. } => "Nothing changed: the item is no longer there as shown (the list changed). Refresh and try again.",
                                 RedisWrite::ListRemoveFirst { .. } | RedisWrite::SetRemove { .. } | RedisWrite::ZSetRemove { .. } => "Nothing changed: the value is not there.",
                                 _ => "Nothing changed: the value changed since it was read, or the key is gone. Refresh and try again.",
                             }
@@ -487,7 +637,13 @@ impl DatabaseView {
                     connection.site,
                     connection.environment,
                     connection.name,
-                    quote_bytes(&form.key)
+                    match form.op {
+                        RedisOp::AddKey(kind) => format!("a new {kind} key"),
+                        RedisOp::ListSet { index } | RedisOp::ListRemoveAt { index } => {
+                            format!("{} item {index}", quote_bytes(&form.key))
+                        }
+                        _ => quote_bytes(&form.key),
+                    }
                 ))
                 .size(LabelSize::Small)
                 .weight(gpui::FontWeight::SEMIBOLD)
@@ -498,16 +654,49 @@ impl DatabaseView {
                 }),
             )
             .map(|this| match &form.planned {
-                None => this.children(form.inputs.iter().map(|(label, editor)| {
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            Label::new(*label)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(boxed(editor.clone(), cx))
-                })),
+                None => {
+                    let fixed = form.op.inputs().len().min(form.inputs.len());
+                    let (single, rows) = form.inputs.split_at(fixed);
+                    let width = form.op.row_inputs().len().max(1);
+                    let labelled = |label: &'static str, editor: &Entity<Editor>| {
+                        v_flex()
+                            .flex_1()
+                            .gap_1()
+                            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                            .child(boxed(editor.clone(), cx))
+                    };
+                    let growable = matches!(form.op, RedisOp::AddKey(kind) if kind != "string");
+                    this.children(single.iter().map(|(label, editor)| labelled(label, editor)))
+                        .children(rows.chunks(width).map(|row| {
+                            h_flex()
+                                .gap_2()
+                                .children(row.iter().map(|(label, editor)| labelled(label, editor)))
+                        }))
+                        .when(growable, |this| {
+                            // Each row adds up to two arguments; the script takes a bounded number.
+                            let full = rows.len() + width > NEW_KEY_ARGUMENTS;
+                            this.child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("database-redis-write-add-row", "Add another")
+                                            .start_icon(
+                                                Icon::new(IconName::Plus).size(IconSize::XSmall),
+                                            )
+                                            .label_size(LabelSize::Small)
+                                            .disabled(full)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.add_redis_write_row(window, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Label::new("Empty rows are skipped.")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                        })
+                }
                 Some(planned) => this
                     .child(
                         h_flex()
@@ -609,5 +798,75 @@ impl DatabaseView {
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn values(texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|text| text.to_string()).collect()
+    }
+
+    #[test]
+    fn test_new_key_from_the_form() {
+        let hash = new_key(
+            "hash",
+            &values(&["user:1", "60", "name", "Ann", "", "", "age", ""]),
+        )
+        .unwrap();
+        assert_eq!(
+            hash,
+            RedisWrite::AddKey {
+                key: b"user:1".to_vec(),
+                value: NewValue::Hash(vec![
+                    (b"name".to_vec(), b"Ann".to_vec()),
+                    (b"age".to_vec(), Vec::new()),
+                ]),
+                ttl_seconds: Some(60),
+            },
+            "an empty row is skipped, an empty value is kept"
+        );
+        let string = new_key("string", &values(&["s", "", ""])).unwrap();
+        assert_eq!(
+            string,
+            RedisWrite::AddKey {
+                key: b"s".to_vec(),
+                value: NewValue::String(Vec::new()),
+                ttl_seconds: None,
+            }
+        );
+        let zset = new_key("zset", &values(&["z", "", "m", " 2.5 ", "n", "-inf"])).unwrap();
+        assert_eq!(
+            zset,
+            RedisWrite::AddKey {
+                key: b"z".to_vec(),
+                value: NewValue::SortedSet(vec![
+                    (2.5, b"m".to_vec()),
+                    (f64::NEG_INFINITY, b"n".to_vec())
+                ]),
+                ttl_seconds: None,
+            }
+        );
+        assert!(
+            new_key("list", &values(&[" ", "", "a"])).is_err(),
+            "no name"
+        );
+        assert!(new_key("list", &values(&["l", "0", "a"])).is_err(), "TTL 0");
+        assert!(
+            new_key("list", &values(&["l", "1.5", "a"])).is_err(),
+            "TTL not whole"
+        );
+        assert!(new_key("set", &values(&["s", "", ""])).is_err(), "no value");
+        assert!(
+            new_key("hash", &values(&["h", "", "", "v"])).is_err(),
+            "unnamed field"
+        );
+        assert!(
+            new_key("zset", &values(&["z", "", "m", "NaN"])).is_err(),
+            "NaN score"
+        );
+        assert!(new_key("stream", &values(&["x", "", "a"])).is_err());
     }
 }

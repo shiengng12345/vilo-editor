@@ -1,6 +1,6 @@
 //! Redis, laid out like RedisInsight: a top bar with live server stats, Browse / Search / Workbench / Analyze /
 //! Pub/Sub tabs, keys as a tree or a list with type badges, TTL and size, key details by type, and a CLI bar.
-//! This release only reads; the write entry points are shown but switched off.
+//! Writes (Add key, the key's Edit menu, row edit and remove) go through redis_write's confirm step.
 
 use std::{
     cell::RefCell,
@@ -47,6 +47,57 @@ pub(crate) enum RedisTab {
     Browse,
     Workbench,
     Analyze,
+}
+
+/// One hash field, list item or member of the shown value, which its row can edit or remove.
+#[derive(Clone)]
+enum RowTarget {
+    HashField { field: Bytes, value: Bytes },
+    ListItem { index: i64, value: Bytes },
+    SetMember(Bytes),
+    ZSetMember { member: Bytes, score: String },
+}
+
+/// A write a row button starts: the operation, its prefilled inputs, and the list item shown.
+type RowWrite = (crate::redis_write::RedisOp, Vec<Bytes>, Option<Bytes>);
+
+impl RowTarget {
+    fn edit(&self) -> Option<RowWrite> {
+        use crate::redis_write::RedisOp;
+        Some(match self {
+            RowTarget::HashField { field, value } => {
+                (RedisOp::HashSet, vec![field.clone(), value.clone()], None)
+            }
+            RowTarget::ListItem { index, value } => (
+                RedisOp::ListSet { index: *index },
+                vec![value.clone()],
+                Some(value.clone()),
+            ),
+            // A member is its own identity; changing it is removing one and adding another.
+            RowTarget::SetMember(_) => return None,
+            RowTarget::ZSetMember { member, score } => (
+                RedisOp::ZSetScore,
+                vec![member.clone(), score.clone().into_bytes()],
+                None,
+            ),
+        })
+    }
+
+    fn remove(&self) -> RowWrite {
+        use crate::redis_write::RedisOp;
+        match self {
+            RowTarget::HashField { field, .. } => (RedisOp::HashDelete, vec![field.clone()], None),
+            RowTarget::ListItem { index, value } => (
+                RedisOp::ListRemoveAt { index: *index },
+                Vec::new(),
+                Some(value.clone()),
+            ),
+            RowTarget::SetMember(member) => (RedisOp::SetRemove, vec![member.clone()], None),
+            RowTarget::ZSetMember { member, .. } => {
+                (RedisOp::ZSetRemove, vec![member.clone()], None)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1967,26 +2018,41 @@ impl DatabaseView {
         .into_any_element()
     }
 
-    fn value_lines(&self, detail: &Detail, format: Format) -> Vec<SharedString> {
+    /// The value as text lines; the first line of each hash field, list item or member carries
+    /// the row it starts, for the row's edit and remove buttons.
+    fn value_lines(
+        &self,
+        detail: &Detail,
+        format: Format,
+    ) -> Vec<(SharedString, Option<RowTarget>)> {
         let show = |bytes: &[u8]| formatted(bytes, format);
         let mut lines = Vec::new();
-        let mut push_block = |prefix: String, text: String| {
+        let mut push_row = |prefix: String, text: String, target: Option<RowTarget>| {
             let mut iter = text.lines();
-            lines.push(SharedString::from(format!(
-                "{prefix}{}",
-                iter.next().unwrap_or_default()
-            )));
+            lines.push((
+                SharedString::from(format!("{prefix}{}", iter.next().unwrap_or_default())),
+                target,
+            ));
             let pad = " ".repeat(prefix.chars().count());
             for line in iter {
-                lines.push(SharedString::from(format!("{pad}{line}")));
+                lines.push((SharedString::from(format!("{pad}{line}")), None));
             }
         };
         match &detail.value {
-            Value::String(None) => push_block(String::new(), "(the key no longer exists)".into()),
-            Value::String(Some(bytes)) => push_block(String::new(), show(bytes)),
+            Value::String(None) => {
+                push_row(String::new(), "(the key no longer exists)".into(), None)
+            }
+            Value::String(Some(bytes)) => push_row(String::new(), show(bytes), None),
             Value::Hash { fields, .. } => {
                 for (field, value) in fields {
-                    push_block(format!("{:<28} ", escape_bytes(field)), show(value));
+                    push_row(
+                        format!("{:<28} ", escape_bytes(field)),
+                        show(value),
+                        Some(RowTarget::HashField {
+                            field: field.clone(),
+                            value: value.clone(),
+                        }),
+                    );
                 }
             }
             Value::List { items, .. } => {
@@ -1998,41 +2064,160 @@ impl DatabaseView {
                             .contains(filter.as_str())
                     });
                     if matches {
-                        push_block(format!("{index:<8} "), show(item));
+                        push_row(
+                            format!("{index:<8} "),
+                            show(item),
+                            Some(RowTarget::ListItem {
+                                index: index as i64,
+                                value: item.clone(),
+                            }),
+                        );
                     }
                 }
             }
             Value::Set { members, .. } => {
                 for member in members {
-                    push_block(String::new(), show(member));
+                    push_row(
+                        String::new(),
+                        show(member),
+                        Some(RowTarget::SetMember(member.clone())),
+                    );
                 }
             }
             Value::SortedSet { members, .. } | Value::SortedSetMatch { members, .. } => {
                 for (member, score) in members {
-                    push_block(format!("{score:<16} "), show(member));
+                    push_row(
+                        format!("{score:<16} "),
+                        show(member),
+                        Some(RowTarget::ZSetMember {
+                            member: member.clone(),
+                            score: score.clone(),
+                        }),
+                    );
                 }
             }
             Value::Stream { entries, .. } => {
                 for entry in entries {
-                    push_block(String::new(), entry.id.clone());
+                    push_row(String::new(), entry.id.clone(), None);
                     for (field, value) in &entry.fields {
-                        push_block(format!("    {:<24} ", escape_bytes(field)), show(value));
+                        push_row(
+                            format!("    {:<24} ", escape_bytes(field)),
+                            show(value),
+                            None,
+                        );
                     }
                 }
             }
-            Value::Json(Some(json)) => {
-                push_block(String::new(), formatted(json.as_bytes(), Format::Json))
-            }
-            Value::Json(None) => push_block(String::new(), "(no value)".into()),
-            Value::Other => push_block(
+            Value::Json(Some(json)) => push_row(
+                String::new(),
+                formatted(json.as_bytes(), Format::Json),
+                None,
+            ),
+            Value::Json(None) => push_row(String::new(), "(no value)".into(), None),
+            Value::Other => push_row(
                 String::new(),
                 format!(
                     "Vilo has no viewer for {} keys yet; use the CLI.",
                     detail.info.kind
                 ),
+                None,
             ),
         }
         lines
+    }
+
+    /// The value's lines, with edit and remove buttons on a row's first line when writes are on.
+    fn render_value_rows(
+        &self,
+        key: Bytes,
+        lines: Vec<(SharedString, Option<RowTarget>)>,
+        writable: bool,
+        scroll: &UniformListScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !writable || lines.iter().all(|(_, target)| target.is_none()) {
+            let lines = lines.into_iter().map(|(line, _)| line).collect();
+            return render_lines("database-redis-value", lines, scroll, cx);
+        }
+        let colors = cx.theme().colors().clone();
+        let view = cx.entity().downgrade();
+        let widest = lines
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (line, _))| line.len())
+            .map(|(index, _)| index);
+        let button = move |id: (&'static str, usize),
+                           icon: IconName,
+                           tip: &'static str,
+                           write: RowWrite,
+                           key: Bytes,
+                           view: gpui::WeakEntity<Self>| {
+            IconButton::new(id, icon)
+                .icon_size(IconSize::XSmall)
+                .tooltip(Tooltip::text(tip))
+                .visible_on_hover("database-redis-value-row")
+                .on_click(move |_, window, cx| {
+                    let (op, prefill, shown) = write.clone();
+                    let key = key.clone();
+                    view.update(cx, |this, cx| {
+                        this.start_redis_write(op, key, prefill, shown, window, cx)
+                    })
+                    .ok();
+                })
+        };
+        let list =
+            uniform_list("database-redis-value", lines.len(), move |range, _, cx| {
+                range
+                    .filter_map(|index| lines.get(index).cloned().map(|line| (index, line)))
+                    .map(|(index, (line, target))| {
+                        h_flex()
+                            .group("database-redis-value-row")
+                            .px_2()
+                            .gap_1()
+                            .whitespace_nowrap()
+                            .hover(|style| style.bg(colors.element_hover))
+                            .child(h_flex().w(px(44.)).flex_none().when_some(
+                                target,
+                                |this, target| {
+                                    this.when_some(target.edit(), |this, edit| {
+                                        this.child(button(
+                                            ("database-redis-row-edit", index),
+                                            IconName::Pencil,
+                                            "Edit",
+                                            edit,
+                                            key.clone(),
+                                            view.clone(),
+                                        ))
+                                    })
+                                    .child(button(
+                                        ("database-redis-row-remove", index),
+                                        IconName::Trash,
+                                        "Remove",
+                                        target.remove(),
+                                        key.clone(),
+                                        view.clone(),
+                                    ))
+                                },
+                            ))
+                            .child(Label::new(line).size(LabelSize::Small).buffer_font(cx))
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::Unconstrained)
+            .with_width_from_item(widest)
+            .track_scroll(scroll)
+            .flex_1();
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .child(list)
+            .into_any_element()
     }
 
     fn render_detail(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
@@ -2297,7 +2482,17 @@ impl DatabaseView {
                                         menu = menu.entry(op.label(), None, move |window, cx| {
                                             let (key, current) = (key.clone(), current.clone());
                                             view.update(cx, |this, cx| {
-                                                this.start_redis_write(op, key, current, window, cx)
+                                                // Only a string edit starts from the value shown.
+                                                let prefill = if op
+                                                    == crate::redis_write::RedisOp::EditString
+                                                {
+                                                    current.into_iter().collect()
+                                                } else {
+                                                    Vec::new()
+                                                };
+                                                this.start_redis_write(
+                                                    op, key, prefill, None, window, cx,
+                                                )
                                             })
                                             .ok();
                                         });
@@ -2381,9 +2576,10 @@ impl DatabaseView {
                         ),
                 )
             })
-            .child(render_lines(
-                "database-redis-value",
+            .child(self.render_value_rows(
+                detail.key.clone(),
                 self.value_lines(detail, state.format),
+                writable,
                 &state.value_scroll,
                 cx,
             ))
@@ -3396,14 +3592,50 @@ impl DatabaseView {
                                 "Bulk actions come with writes, in the next release",
                             )),
                     )
-                    .child(
-                        Button::new("database-redis-add-key", "Add key")
-                            .style(ButtonStyle::Filled)
-                            .disabled(true)
-                            .tooltip(Tooltip::text(
-                                "Adding keys comes with writes, in the next release",
-                            )),
-                    ),
+                    .child({
+                        let writable = self.writes_allowed(connection);
+                        let view = cx.entity().downgrade();
+                        PopoverMenu::new("database-redis-add-key")
+                            .trigger(
+                                Button::new("database-redis-add-key-button", "Add key")
+                                    .style(ButtonStyle::Filled)
+                                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                                    .disabled(!writable)
+                                    .tooltip(Tooltip::text(if writable {
+                                        "Create a key that does not exist yet"
+                                    } else {
+                                        "Switch writes on (top bar) to add keys"
+                                    })),
+                            )
+                            .menu(move |window, cx| {
+                                let view = view.clone();
+                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    for (label, kind) in [
+                                        ("String", "string"),
+                                        ("Hash", "hash"),
+                                        ("List", "list"),
+                                        ("Set", "set"),
+                                        ("Sorted Set", "zset"),
+                                    ] {
+                                        let view = view.clone();
+                                        menu = menu.entry(label, None, move |window, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.start_redis_write(
+                                                    crate::redis_write::RedisOp::AddKey(kind),
+                                                    Bytes::new(),
+                                                    Vec::new(),
+                                                    None,
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                            .ok();
+                                        });
+                                    }
+                                    menu
+                                }))
+                            })
+                    }),
             )
             .when_some(self.write_notice.clone(), |this, notice| {
                 this.child(
@@ -3565,6 +3797,36 @@ mod tests {
         let history: Vec<String> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(history.len(), 8);
         std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn test_row_buttons_start_the_right_write() {
+        use crate::redis_write::RedisOp;
+        let item = RowTarget::ListItem {
+            index: 3,
+            value: b"a".to_vec(),
+        };
+        let (op, prefill, shown) = item.edit().unwrap();
+        assert!(op == RedisOp::ListSet { index: 3 });
+        assert_eq!((prefill, shown), (vec![b"a".to_vec()], Some(b"a".to_vec())));
+        let (op, prefill, shown) = item.remove();
+        assert!(op == RedisOp::ListRemoveAt { index: 3 });
+        assert_eq!((prefill, shown), (Vec::<Bytes>::new(), Some(b"a".to_vec())));
+        assert!(RowTarget::SetMember(b"m".to_vec()).edit().is_none());
+        let field = RowTarget::HashField {
+            field: b"f".to_vec(),
+            value: b"v".to_vec(),
+        };
+        assert!(field.edit().unwrap().0 == RedisOp::HashSet);
+        assert!(field.remove().0 == RedisOp::HashDelete);
+        let member = RowTarget::ZSetMember {
+            member: b"m".to_vec(),
+            score: "1.5".into(),
+        };
+        assert_eq!(
+            member.edit().unwrap().1,
+            vec![b"m".to_vec(), b"1.5".to_vec()]
+        );
     }
 
     #[test]

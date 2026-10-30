@@ -1335,7 +1335,67 @@ pub enum RedisWrite {
     Persist {
         key: Bytes,
     },
+    /// Creates a key that does not exist yet, with its first values and TTL in one step.
+    AddKey {
+        key: Bytes,
+        value: NewValue,
+        ttl_seconds: Option<u64>,
+    },
+    /// Replaces the list item at `index` only if it still holds `expected`, so a list that
+    /// shifted since it was read is not edited in the wrong place.
+    ListSet {
+        key: Bytes,
+        index: i64,
+        expected: Bytes,
+        value: Bytes,
+    },
+    /// Removes the list item at `index` only if it still holds `expected`.
+    ListRemoveAt {
+        key: Bytes,
+        index: i64,
+        expected: Bytes,
+    },
 }
+
+/// The first values of a new key.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NewValue {
+    String(Bytes),
+    Hash(Vec<(Bytes, Bytes)>),
+    List(Vec<Bytes>),
+    Set(Vec<Bytes>),
+    SortedSet(Vec<(f64, Bytes)>),
+}
+
+impl NewValue {
+    fn command(&self) -> &'static str {
+        match self {
+            NewValue::String(_) => "SET",
+            NewValue::Hash(_) => "HSET",
+            NewValue::List(_) => "RPUSH",
+            NewValue::Set(_) => "SADD",
+            NewValue::SortedSet(_) => "ZADD",
+        }
+    }
+
+    fn arguments(&self) -> Vec<Bytes> {
+        match self {
+            NewValue::String(value) => vec![value.clone()],
+            NewValue::Hash(pairs) => pairs
+                .iter()
+                .flat_map(|(field, value)| [field.clone(), value.clone()])
+                .collect(),
+            NewValue::List(items) | NewValue::Set(items) => items.clone(),
+            NewValue::SortedSet(members) => members
+                .iter()
+                .flat_map(|(score, member)| [score.to_string().into_bytes(), member.clone()])
+                .collect(),
+        }
+    }
+}
+
+/// Lua's unpack stops near 8000 values; new keys stay well under it.
+pub const NEW_KEY_ARGUMENTS: usize = 4000;
 
 /// Replaces the value only if it is still `ARGV[1]`; XX and KEEPTTL keep an expired key gone
 /// and its expiry unchanged (Redis 6 and later).
@@ -1354,6 +1414,19 @@ const ZSET_SCORE_GUARDED: &str = "if redis.call('EXISTS', KEYS[1]) == 0 then ret
      if ARGV[3] == '1' then if not s or tonumber(s) ~= tonumber(ARGV[2]) then return 0 end \
      elseif s then return 0 end \
      redis.call('ZADD', KEYS[1], ARGV[4], ARGV[1]) return 1";
+/// ARGV: command, TTL seconds ('0' for none), then the command's arguments. Never touches an
+/// existing key.
+const ADD_KEY: &str = "if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end \
+     redis.call(ARGV[1], KEYS[1], unpack(ARGV, 3)) \
+     if ARGV[2] ~= '0' then redis.call('EXPIRE', KEYS[1], ARGV[2]) end return 1";
+/// ARGV: index, expected, new value.
+const LIST_SET_AT: &str = "if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end \
+     redis.call('LSET', KEYS[1], ARGV[1], ARGV[3]) return 1";
+/// ARGV: index, expected, a marker no item holds. The item becomes the marker and LREM removes
+/// that one marker, so an equal value elsewhere in the list stays.
+const LIST_REMOVE_AT: &str = "if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end \
+     redis.call('LSET', KEYS[1], ARGV[1], ARGV[3]) \
+     return redis.call('LREM', KEYS[1], 1, ARGV[3])";
 const SET_ADD_EXISTING: &str = "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end \
      redis.call('SADD', KEYS[1], ARGV[1]) return 1";
 
@@ -1372,7 +1445,10 @@ impl RedisWrite {
             | RedisWrite::Delete { key }
             | RedisWrite::Rename { key, .. }
             | RedisWrite::Expire { key, .. }
-            | RedisWrite::Persist { key } => key,
+            | RedisWrite::Persist { key }
+            | RedisWrite::AddKey { key, .. }
+            | RedisWrite::ListSet { key, .. }
+            | RedisWrite::ListRemoveAt { key, .. } => key,
         }
     }
 
@@ -1393,6 +1469,9 @@ impl RedisWrite {
             RedisWrite::Rename { .. } => "RENAMENX",
             RedisWrite::Expire { .. } => "EXPIRE",
             RedisWrite::Persist { .. } => "PERSIST",
+            RedisWrite::AddKey { value, .. } => value.command(),
+            RedisWrite::ListSet { .. } => "LSET",
+            RedisWrite::ListRemoveAt { .. } => "LREM",
         }
     }
 
@@ -1466,6 +1545,35 @@ impl RedisWrite {
                 )
             }
             RedisWrite::Expire { seconds, .. } => format!("{name} {key} {seconds}"),
+            RedisWrite::AddKey {
+                value: new,
+                ttl_seconds,
+                ..
+            } => {
+                let arguments = new.arguments();
+                let shown = if values {
+                    arguments
+                        .iter()
+                        .map(|argument| quote_bytes(argument))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    format!("<{} values>", arguments.len())
+                };
+                let ttl = ttl_seconds
+                    .map(|seconds| format!(" · EXPIRE {key} {seconds}"))
+                    .unwrap_or_default();
+                format!("{name} {key} {shown}{ttl}   (only if the key does not exist)")
+            }
+            RedisWrite::ListSet {
+                index, value: new, ..
+            } => format!(
+                "{name} {key} {index} {}   (only if item {index} is unchanged)",
+                value(new)
+            ),
+            RedisWrite::ListRemoveAt { index, .. } => {
+                format!("{name} {key} item {index}   (only if item {index} is unchanged)")
+            }
         }
     }
 }
@@ -1614,6 +1722,57 @@ impl RedisSession {
                 self.client
                     .custom(cmd!("PERSIST"), vec![bytes_arg(key)])
                     .await
+            }
+            RedisWrite::AddKey {
+                key,
+                value,
+                ttl_seconds,
+            } => {
+                let arguments = value.arguments();
+                if arguments.is_empty() || arguments.len() > NEW_KEY_ARGUMENTS {
+                    return Err(crate::mongo::WriteError::Refused(format!(
+                        "A new key takes 1 to {NEW_KEY_ARGUMENTS} values."
+                    )));
+                }
+                let mut all = vec![
+                    Value::from(value.command()),
+                    Value::from(ttl_seconds.unwrap_or(0).to_string()),
+                ];
+                all.extend(arguments.iter().map(|argument| bytes_arg(argument)));
+                self.eval(ADD_KEY, key, all).await
+            }
+            RedisWrite::ListSet {
+                key,
+                index,
+                expected,
+                value,
+            } => {
+                self.eval(
+                    LIST_SET_AT,
+                    key,
+                    vec![Value::from(*index), bytes_arg(expected), bytes_arg(value)],
+                )
+                .await
+            }
+            RedisWrite::ListRemoveAt {
+                key,
+                index,
+                expected,
+            } => {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_nanos());
+                let marker = format!("\0vilo-remove-{}-{nanos}", std::process::id());
+                self.eval(
+                    LIST_REMOVE_AT,
+                    key,
+                    vec![
+                        Value::from(*index),
+                        bytes_arg(expected),
+                        Value::from(marker),
+                    ],
+                )
+                .await
             }
         }
         .map_err(classify_redis)?;
@@ -1879,6 +2038,116 @@ broken line";
             .unwrap();
     }
 
+    async fn new_keys_and_list_rows(session: &RedisSession) {
+        let names = [
+            "vilo_test:new_s",
+            "vilo_test:new_h",
+            "vilo_test:new_z",
+            "vilo_test:rows",
+        ];
+        session
+            .call("DEL", names.iter().map(|name| Value::from(*name)).collect())
+            .await
+            .unwrap();
+        let add = |key: &str, value: NewValue, ttl_seconds| RedisWrite::AddKey {
+            key: key.as_bytes().to_vec(),
+            value,
+            ttl_seconds,
+        };
+        let hash = NewValue::Hash(vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"".to_vec()),
+        ]);
+        assert!(
+            session
+                .write(&add(names[1], hash.clone(), Some(60)))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !session.write(&add(names[1], hash, None)).await.unwrap(),
+            "an existing key is left alone"
+        );
+        let info = session.key_info(names[1].as_bytes()).await.unwrap();
+        assert_eq!(info.kind, "hash");
+        assert!(info.ttl_ms > 0 && info.ttl_ms <= 60_000);
+        assert_eq!(
+            session.hash_get(names[1].as_bytes(), b"b").await.unwrap(),
+            Some(Vec::new())
+        );
+        assert!(
+            session
+                .write(&add(names[0], NewValue::String(b"x".to_vec()), None))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            session.key_info(names[0].as_bytes()).await.unwrap().ttl_ms,
+            -1
+        );
+        let zset = NewValue::SortedSet(vec![(1.5, b"m".to_vec()), (f64::INFINITY, b"n".to_vec())]);
+        assert!(session.write(&add(names[2], zset, None)).await.unwrap());
+        assert_eq!(
+            session.zset_score(names[2].as_bytes(), b"m").await.unwrap(),
+            Some("1.5".to_string())
+        );
+        assert!(matches!(
+            session
+                .write(&add(names[3], NewValue::List(Vec::new()), None))
+                .await,
+            Err(crate::mongo::WriteError::Refused(_))
+        ));
+
+        let items = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            session
+                .write(&add(
+                    names[3],
+                    NewValue::List(items(&["a", "b", "a"])),
+                    None
+                ))
+                .await
+                .unwrap()
+        );
+        let key = names[3].as_bytes().to_vec();
+        let set = |index, expected: &str, value: &str| RedisWrite::ListSet {
+            key: key.clone(),
+            index,
+            expected: expected.as_bytes().to_vec(),
+            value: value.as_bytes().to_vec(),
+        };
+        assert!(session.write(&set(1, "b", "c")).await.unwrap());
+        assert!(
+            !session.write(&set(1, "b", "d")).await.unwrap(),
+            "the item changed"
+        );
+        assert!(
+            !session.write(&set(9, "a", "d")).await.unwrap(),
+            "no such item"
+        );
+        let remove = |index, expected: &str| RedisWrite::ListRemoveAt {
+            key: key.clone(),
+            index,
+            expected: expected.as_bytes().to_vec(),
+        };
+        assert!(!session.write(&remove(1, "a")).await.unwrap());
+        // The second "a" goes; the first, equal one stays.
+        assert!(session.write(&remove(2, "a")).await.unwrap());
+        assert_eq!(
+            session.list_range(&key, 0, -1).await.unwrap(),
+            items(&["a", "c"])
+        );
+        session
+            .call("DEL", names.iter().map(|name| Value::from(*name)).collect())
+            .await
+            .unwrap();
+    }
+
     async fn values_can_be_searched(session: &RedisSession) {
         let (hash, set, zset) = (b"vilo_test:sh", b"vilo_test:ss", b"vilo_test:sz");
         session
@@ -2114,6 +2383,7 @@ broken line";
         };
         let session = RedisSession::connect(&url).await.unwrap();
         writes_are_guarded(&session).await;
+        new_keys_and_list_rows(&session).await;
         values_can_be_searched(&session).await;
         databases_are_separate(&url).await;
         slowlog_and_clients(&url).await;
