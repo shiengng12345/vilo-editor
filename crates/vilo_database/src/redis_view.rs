@@ -58,6 +58,7 @@ enum RowTarget {
     ListItem { index: i64, value: Bytes },
     SetMember(Bytes),
     ZSetMember { member: Bytes, score: String },
+    StreamEntry(String),
 }
 
 /// An edit a row button starts: the operation, its prefilled inputs, and the list item shown.
@@ -76,7 +77,8 @@ impl RowTarget {
                 Some(value.clone()),
             ),
             // A member is its own identity; changing it is removing one and adding another.
-            RowTarget::SetMember(_) => return None,
+            // A stream entry cannot be changed at all.
+            RowTarget::SetMember(_) | RowTarget::StreamEntry(_) => return None,
             RowTarget::ZSetMember { member, score } => (
                 RedisOp::ZSetScore,
                 vec![member.clone(), score.clone().into_bytes()],
@@ -111,6 +113,9 @@ impl RowTarget {
             }
             RowTarget::ZSetMember { member, .. } => {
                 (RedisOp::ZSetRemove, RedisWrite::ZSetRemove { key, member })
+            }
+            RowTarget::StreamEntry(id) => {
+                (RedisOp::StreamRemove, RedisWrite::StreamDelete { key, id })
             }
         }
     }
@@ -181,7 +186,8 @@ enum Value {
     },
     Stream {
         entries: Vec<StreamEntry>,
-        groups: Vec<Vec<(String, String)>>,
+        /// The groups, or why they could not be read (shown, never taken as none).
+        groups: Result<Vec<Vec<(String, String)>>, String>,
         more: bool,
     },
     Json(Option<String>),
@@ -296,6 +302,8 @@ pub(crate) struct RedisState {
     _auto_refresh: Option<Task<()>>,
     pub(crate) analyze: crate::redis_analyze::AnalyzeState,
     pub(crate) pubsub: crate::redis_pubsub::PubSubState,
+    /// The consumer group opened under a stream key.
+    pub(crate) stream_group: Option<crate::redis_stream::StreamGroupView>,
     /// A database number typed in when the menu cannot know how many there are.
     database_input: Option<Entity<editor::Editor>>,
 }
@@ -363,6 +371,7 @@ impl RedisState {
             _auto_refresh: None,
             analyze: Default::default(),
             pubsub: Default::default(),
+            stream_group: None,
             database_input: None,
         }
     }
@@ -1375,7 +1384,10 @@ impl DatabaseView {
                     }
                     "stream" => {
                         let entries = session.stream_range(&key, None, PAGE).await?;
-                        let groups = session.stream_groups(&key).await.unwrap_or_default();
+                        let groups = session
+                            .stream_groups(&key)
+                            .await
+                            .map_err(|error| format!("{error:#}"));
                         let more = entries.len() == PAGE as usize;
                         Value::Stream {
                             entries,
@@ -2120,7 +2132,11 @@ impl DatabaseView {
             }
             Value::Stream { entries, .. } => {
                 for entry in entries {
-                    push_row(String::new(), entry.id.clone(), None);
+                    push_row(
+                        String::new(),
+                        entry.id.clone(),
+                        Some(RowTarget::StreamEntry(entry.id.clone())),
+                    );
                     for (field, value) in &entry.fields {
                         push_row(
                             format!("    {:<24} ", escape_bytes(field)),
@@ -2445,7 +2461,7 @@ impl DatabaseView {
             });
         let copy_key = quote_bytes(&detail.key);
         let groups = match &detail.value {
-            Value::Stream { groups, .. } if !groups.is_empty() => Some(groups.clone()),
+            Value::Stream { groups, .. } => Some(groups.clone()),
             _ => None,
         };
         let key = detail.key.clone();
@@ -2480,6 +2496,14 @@ impl DatabaseView {
                         let key = detail.key.clone();
                         let current = match &detail.value {
                             Value::String(value) => value.clone(),
+                            Value::Json(Some(json)) => Some(
+                                // Edited readable; the guard compares with the stored text, not this.
+                                serde_json::from_str::<serde_json::Value>(json)
+                                    .ok()
+                                    .and_then(|value| serde_json::to_string_pretty(&value).ok())
+                                    .unwrap_or_else(|| json.clone())
+                                    .into_bytes(),
+                            ),
                             _ => None,
                         };
                         let ops = crate::redis_write::RedisOp::for_kind(&detail.info.kind);
@@ -2512,10 +2536,12 @@ impl DatabaseView {
                                         menu = menu.entry(op.label(), None, move |window, cx| {
                                             let (key, current) = (key.clone(), current.clone());
                                             view.update(cx, |this, cx| {
-                                                // Only a string edit starts from the value shown.
-                                                let prefill = if op
-                                                    == crate::redis_write::RedisOp::EditString
-                                                {
+                                                // Only a string or document edit starts from the value shown.
+                                                let prefill = if matches!(
+                                                    op,
+                                                    crate::redis_write::RedisOp::EditString
+                                                        | crate::redis_write::RedisOp::EditJson
+                                                ) {
                                                     current.into_iter().collect()
                                                 } else {
                                                     Vec::new()
@@ -2568,22 +2594,13 @@ impl DatabaseView {
             )
             .child(self.render_value_tools(detail, cx))
             .when_some(groups, |this, groups| {
-                this.child(
-                    Label::new("Consumer Groups")
-                        .size(LabelSize::Small)
-                        .weight(gpui::FontWeight::SEMIBOLD),
-                )
-                .children(groups.into_iter().map(|group| {
-                    Label::new(
-                        group
-                            .into_iter()
-                            .map(|(name, value)| format!("{name}: {value}"))
-                            .collect::<Vec<_>>()
-                            .join("  ·  "),
-                    )
-                    .size(LabelSize::Small)
-                    .buffer_font(cx)
-                }))
+                this.child(self.render_stream_groups(
+                    &detail.key,
+                    &groups,
+                    state.stream_group.as_ref(),
+                    writable,
+                    cx,
+                ))
             })
             .when_some(header, |this, (left, right)| {
                 this.child(
@@ -3661,6 +3678,7 @@ impl DatabaseView {
                                         ("List", "list"),
                                         ("Set", "set"),
                                         ("Sorted Set", "zset"),
+                                        ("JSON", "json"),
                                     ] {
                                         let view = view.clone();
                                         menu = menu.entry(label, None, move |window, cx| {
@@ -3878,6 +3896,15 @@ mod tests {
                 expected: b"v".to_vec(),
             },
             "a field goes only if it still holds the value shown"
+        );
+        let entry = RowTarget::StreamEntry("1-1".into());
+        assert!(entry.edit().is_none(), "stream entries cannot be edited");
+        assert_eq!(
+            entry.remove(b"k".to_vec()).1,
+            RedisWrite::StreamDelete {
+                key: b"k".to_vec(),
+                id: "1-1".into(),
+            }
         );
         let binary = RowTarget::SetMember(b"\xff".to_vec());
         assert_eq!(

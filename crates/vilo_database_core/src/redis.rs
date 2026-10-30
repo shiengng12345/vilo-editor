@@ -43,6 +43,22 @@ pub struct ScanNode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct StreamConsumer {
+    pub name: String,
+    pub pending: i64,
+    pub idle_ms: i64,
+    pub inactive_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingEntry {
+    pub id: String,
+    pub consumer: String,
+    pub idle_ms: i64,
+    pub deliveries: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamEntry {
     pub id: String,
     pub fields: Vec<(Bytes, Bytes)>,
@@ -631,11 +647,11 @@ pub fn search_pattern(text: &str) -> Option<Vec<u8>> {
 }
 
 /// How a Cluster routes a command. fred hashes the first argument by default, which for
-/// MEMORY USAGE, OBJECT ENCODING or XINFO GROUPS is the subcommand, not the key, so every such
+/// MEMORY USAGE, OBJECT ENCODING, XINFO GROUPS or XGROUP CREATE is the subcommand, not the key, so every such
 /// call would go to one node and be redirected until it gives up. fred honours only an explicit
 /// slot for custom commands (not an argument offset), so the key's slot is given.
 fn cluster_hash(name: &str, args: &[Value]) -> fred::types::ClusterHash {
-    let subcommand_first = ["MEMORY", "OBJECT", "XINFO"]
+    let subcommand_first = ["MEMORY", "OBJECT", "XINFO", "XGROUP"]
         .iter()
         .any(|command| command.eq_ignore_ascii_case(name));
     match args.get(1).and_then(|key| key.as_bytes()) {
@@ -795,6 +811,16 @@ impl RedisSession {
             label: "server".into(),
             server: None,
         }]
+    }
+
+    /// One command routed by its key, keeping fred's error so a write can tell refused from unknown.
+    async fn keyed(
+        &self,
+        name: &'static str,
+        args: Vec<Value>,
+    ) -> Result<Value, fred::error::Error> {
+        let command = fred::types::CustomCommand::new(name, cluster_hash(name, &args), false);
+        self.client.custom(command, args).await
     }
 
     pub(crate) async fn call(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
@@ -1260,6 +1286,81 @@ impl RedisSession {
             .collect())
     }
 
+    /// The consumers of a stream's group (XINFO CONSUMERS).
+    pub async fn stream_consumers(&self, key: &[u8], group: &str) -> Result<Vec<StreamConsumer>> {
+        let reply = self
+            .call(
+                "XINFO",
+                vec![
+                    "CONSUMERS".into(),
+                    bytes_arg(key),
+                    Value::from(group.to_string()),
+                ],
+            )
+            .await?;
+        Ok(reply
+            .into_array()
+            .into_iter()
+            .map(|consumer| {
+                let fields = pairs(consumer)
+                    .into_iter()
+                    .map(|(name, value)| (name.as_string().unwrap_or_default(), value))
+                    .collect::<Vec<_>>();
+                let number = |name: &str| {
+                    fields
+                        .iter()
+                        .find(|(field, _)| field == name)
+                        .and_then(|(_, value)| value.as_i64())
+                };
+                StreamConsumer {
+                    name: fields
+                        .iter()
+                        .find(|(field, _)| field == "name")
+                        .and_then(|(_, value)| value.as_string())
+                        .unwrap_or_default(),
+                    pending: number("pending").unwrap_or(0),
+                    idle_ms: number("idle").unwrap_or(0),
+                    // Redis 7.2 and later.
+                    inactive_ms: number("inactive"),
+                }
+            })
+            .collect())
+    }
+
+    /// The first `count` pending entries of a group (XPENDING … - + count), oldest first.
+    pub async fn stream_pending(
+        &self,
+        key: &[u8],
+        group: &str,
+        count: u32,
+    ) -> Result<Vec<PendingEntry>> {
+        let reply = self
+            .call(
+                "XPENDING",
+                vec![
+                    bytes_arg(key),
+                    Value::from(group.to_string()),
+                    "-".into(),
+                    "+".into(),
+                    Value::from(i64::from(count)),
+                ],
+            )
+            .await?;
+        Ok(reply
+            .into_array()
+            .into_iter()
+            .filter_map(|entry| {
+                let mut parts = entry.into_array().into_iter();
+                Some(PendingEntry {
+                    id: parts.next()?.as_string()?,
+                    consumer: parts.next()?.as_string()?,
+                    idle_ms: parts.next()?.as_i64()?,
+                    deliveries: parts.next()?.as_i64()?,
+                })
+            })
+            .collect())
+    }
+
     /// A RedisJSON document as JSON text, when the module is loaded.
     pub async fn json_get(&self, key: &[u8]) -> Result<Option<String>> {
         Ok(self
@@ -1381,6 +1482,49 @@ pub enum RedisWrite {
         index: i64,
         expected: Bytes,
     },
+    /// XADD NOMKSTREAM with `id` ("*" lets the server choose); a stream deleted meanwhile is
+    /// not created again.
+    StreamAdd {
+        key: Bytes,
+        id: String,
+        fields: Vec<(Bytes, Bytes)>,
+    },
+    StreamDelete {
+        key: Bytes,
+        id: String,
+    },
+    /// XGROUP CREATE reading from `start` ("$" new entries only, "0" all of them).
+    GroupCreate {
+        key: Bytes,
+        group: String,
+        start: String,
+    },
+    GroupDestroy {
+        key: Bytes,
+        group: String,
+    },
+    /// XACK: the entry is no longer pending for the group. It changes what the group's
+    /// consumers will process, and reloading cannot show whether it happened.
+    StreamAck {
+        key: Bytes,
+        group: String,
+        id: String,
+    },
+    /// XCLAIM … JUSTID: gives a pending entry to `consumer`, only if it has been idle for at
+    /// least `min_idle_ms`, so an entry another consumer just touched is left alone.
+    StreamClaim {
+        key: Bytes,
+        group: String,
+        consumer: String,
+        min_idle_ms: u64,
+        id: String,
+    },
+    /// The whole RedisJSON document, only if it is still `expected` (as JSON.GET returned it).
+    JsonSet {
+        key: Bytes,
+        expected: String,
+        value: String,
+    },
 }
 
 /// The first values of a new key.
@@ -1391,6 +1535,8 @@ pub enum NewValue {
     List(Vec<Bytes>),
     Set(Vec<Bytes>),
     SortedSet(Vec<(f64, Bytes)>),
+    /// A RedisJSON document, as JSON text.
+    Json(String),
 }
 
 impl NewValue {
@@ -1401,6 +1547,7 @@ impl NewValue {
             NewValue::List(_) => "RPUSH",
             NewValue::Set(_) => "SADD",
             NewValue::SortedSet(_) => "ZADD",
+            NewValue::Json(_) => "JSON.SET",
         }
     }
 
@@ -1416,6 +1563,7 @@ impl NewValue {
                 .iter()
                 .flat_map(|(score, member)| [score.to_string().into_bytes(), member.clone()])
                 .collect(),
+            NewValue::Json(json) => vec![b"$".to_vec(), json.clone().into_bytes()],
         }
     }
 }
@@ -1465,6 +1613,9 @@ const LIST_REMOVE_AT: &str = "if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[
        and redis.acl_check_cmd('LREM', KEYS[1], 1, ARGV[3])) then return -2 end \
      redis.call('LSET', KEYS[1], ARGV[1], ARGV[3]) \
      return redis.call('LREM', KEYS[1], 1, ARGV[3])";
+/// ARGV: the document as read, the new document.
+const JSON_SET_GUARDED: &str = "if redis.call('JSON.GET', KEYS[1]) ~= ARGV[1] then return 0 end \
+     redis.call('JSON.SET', KEYS[1], '$', ARGV[2]) return 1";
 const SET_ADD_EXISTING: &str = "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end \
      redis.call('SADD', KEYS[1], ARGV[1]) return 1";
 
@@ -1486,7 +1637,14 @@ impl RedisWrite {
             | RedisWrite::Persist { key }
             | RedisWrite::AddKey { key, .. }
             | RedisWrite::ListSet { key, .. }
-            | RedisWrite::ListRemoveAt { key, .. } => key,
+            | RedisWrite::ListRemoveAt { key, .. }
+            | RedisWrite::StreamAdd { key, .. }
+            | RedisWrite::StreamDelete { key, .. }
+            | RedisWrite::GroupCreate { key, .. }
+            | RedisWrite::GroupDestroy { key, .. }
+            | RedisWrite::StreamAck { key, .. }
+            | RedisWrite::StreamClaim { key, .. }
+            | RedisWrite::JsonSet { key, .. } => key,
         }
     }
 
@@ -1510,6 +1668,13 @@ impl RedisWrite {
             RedisWrite::AddKey { value, .. } => value.command(),
             RedisWrite::ListSet { .. } => "LSET",
             RedisWrite::ListRemoveAt { .. } => "LREM",
+            RedisWrite::StreamAdd { .. } => "XADD",
+            RedisWrite::StreamDelete { .. } => "XDEL",
+            RedisWrite::GroupCreate { .. } => "XGROUP CREATE",
+            RedisWrite::GroupDestroy { .. } => "XGROUP DESTROY",
+            RedisWrite::StreamAck { .. } => "XACK",
+            RedisWrite::StreamClaim { .. } => "XCLAIM",
+            RedisWrite::JsonSet { .. } => "JSON.SET",
         }
     }
 
@@ -1612,6 +1777,41 @@ impl RedisWrite {
             RedisWrite::ListRemoveAt { index, .. } => {
                 format!("{name} {key} item {index}   (only if item {index} is unchanged)")
             }
+            RedisWrite::StreamAdd { id, fields, .. } => format!(
+                "{name} {key} NOMKSTREAM {id} {}   (not if the stream is gone)",
+                fields
+                    .iter()
+                    .map(|(field, new)| format!("{} {}", quote_bytes(field), value(new)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            RedisWrite::StreamDelete { id, .. } => format!("{name} {key} {id}"),
+            RedisWrite::GroupCreate { group, start, .. } => {
+                format!("{name} {key} {} {start}", quote_bytes(group.as_bytes()))
+            }
+            RedisWrite::GroupDestroy { group, .. } => format!(
+                "{name} {key} {}   (its consumers and pending entries go with it)",
+                quote_bytes(group.as_bytes())
+            ),
+            RedisWrite::StreamAck { group, id, .. } => format!(
+                "{name} {key} {} {id}   (the group stops treating this entry as pending; its consumers will not get it again)",
+                quote_bytes(group.as_bytes())
+            ),
+            RedisWrite::StreamClaim {
+                group,
+                consumer,
+                min_idle_ms,
+                id,
+                ..
+            } => format!(
+                "{name} {key} {} {} {min_idle_ms} {id} JUSTID   (only if it is still idle for {min_idle_ms} ms or more)",
+                quote_bytes(group.as_bytes()),
+                quote_bytes(consumer.as_bytes())
+            ),
+            RedisWrite::JsonSet { value: new, .. } => format!(
+                "{name} {key} $ {}   (only if the document is unchanged)",
+                value(new.as_bytes())
+            ),
         }
     }
 }
@@ -1825,6 +2025,93 @@ impl RedisSession {
                 )
                 .await
             }
+            RedisWrite::StreamAdd { key, id, fields } => {
+                if fields.is_empty() {
+                    return Err(crate::mongo::WriteError::Refused(
+                        "An entry needs at least one field.".into(),
+                    ));
+                }
+                let mut args = vec![bytes_arg(key), "NOMKSTREAM".into(), Value::from(id.clone())];
+                for (field, value) in fields {
+                    args.push(bytes_arg(field));
+                    args.push(bytes_arg(value));
+                }
+                self.client.custom(cmd!("XADD"), args).await
+            }
+            RedisWrite::StreamDelete { key, id } => {
+                self.client
+                    .custom(cmd!("XDEL"), vec![bytes_arg(key), Value::from(id.clone())])
+                    .await
+            }
+            RedisWrite::GroupCreate { key, group, start } => {
+                self.keyed(
+                    "XGROUP",
+                    vec![
+                        "CREATE".into(),
+                        bytes_arg(key),
+                        Value::from(group.clone()),
+                        Value::from(start.clone()),
+                    ],
+                )
+                .await
+            }
+            RedisWrite::GroupDestroy { key, group } => {
+                self.keyed(
+                    "XGROUP",
+                    vec!["DESTROY".into(), bytes_arg(key), Value::from(group.clone())],
+                )
+                .await
+            }
+            RedisWrite::StreamAck { key, group, id } => {
+                self.client
+                    .custom(
+                        cmd!("XACK"),
+                        vec![
+                            bytes_arg(key),
+                            Value::from(group.clone()),
+                            Value::from(id.clone()),
+                        ],
+                    )
+                    .await
+            }
+            RedisWrite::StreamClaim {
+                key,
+                group,
+                consumer,
+                min_idle_ms,
+                id,
+            } => {
+                self.client
+                    .custom(
+                        cmd!("XCLAIM"),
+                        vec![
+                            bytes_arg(key),
+                            Value::from(group.clone()),
+                            Value::from(consumer.clone()),
+                            Value::from(*min_idle_ms as i64),
+                            Value::from(id.clone()),
+                            "JUSTID".into(),
+                        ],
+                    )
+                    .await
+            }
+            RedisWrite::JsonSet {
+                key,
+                expected,
+                value,
+            } => {
+                if serde_json::from_str::<serde_json::Value>(value).is_err() {
+                    return Err(crate::mongo::WriteError::Refused(
+                        "The new document is not valid JSON.".into(),
+                    ));
+                }
+                self.eval(
+                    JSON_SET_GUARDED,
+                    key,
+                    vec![Value::from(expected.clone()), Value::from(value.clone())],
+                )
+                .await
+            }
         }
         .map_err(|error| match classify_redis(error) {
             crate::mongo::WriteError::Refused(message) if two_steps => {
@@ -1834,12 +2121,21 @@ impl RedisSession {
             }
             other => other,
         })?;
-        match reply.as_i64() {
-            Some(NOT_PERMITTED) => Err(crate::mongo::WriteError::Refused(
-                "This connection's ACL does not allow every step of this write; nothing was changed."
-                    .into(),
-            )),
-            reply => Ok(reply.unwrap_or(0) > 0),
+        match (write, reply) {
+            // XADD answers the new id (nil when the stream is gone), XGROUP CREATE "OK", and
+            // XCLAIM the ids it claimed.
+            (RedisWrite::StreamAdd { .. } | RedisWrite::GroupCreate { .. }, reply) => {
+                Ok(!matches!(reply, Value::Null))
+            }
+            (RedisWrite::StreamClaim { .. }, Value::Array(claimed)) => Ok(!claimed.is_empty()),
+            (RedisWrite::StreamClaim { .. }, _) => Ok(false),
+            (_, reply) => match reply.as_i64() {
+                Some(NOT_PERMITTED) => Err(crate::mongo::WriteError::Refused(
+                    "This connection's ACL does not allow every step of this write; nothing was changed."
+                        .into(),
+                )),
+                reply => Ok(reply.unwrap_or(0) > 0),
+            },
         }
     }
 }
@@ -2135,6 +2431,178 @@ broken line";
             .call("DEL", vec!["vilo_test:db".into()])
             .await
             .unwrap();
+    }
+
+    async fn streams_and_groups(session: &RedisSession) {
+        let key = b"vilo_test:stream".to_vec();
+        session.call("DEL", vec![bytes_arg(&key)]).await.unwrap();
+        let write = |write: RedisWrite| async move { session.write(&write).await };
+        let add = |id: &str| RedisWrite::StreamAdd {
+            key: key.clone(),
+            id: id.to_string(),
+            fields: vec![(b"f".to_vec(), b"v".to_vec())],
+        };
+        assert!(
+            !write(add("*")).await.unwrap(),
+            "NOMKSTREAM: a missing stream is not created"
+        );
+        session
+            .call(
+                "XADD",
+                vec![bytes_arg(&key), "1-1".into(), "f".into(), "a".into()],
+            )
+            .await
+            .unwrap();
+        assert!(write(add("2-1")).await.unwrap());
+        assert!(write(add("*")).await.unwrap());
+        let group = |start: &str| RedisWrite::GroupCreate {
+            key: key.clone(),
+            group: "g".into(),
+            start: start.into(),
+        };
+        assert!(write(group("0")).await.unwrap());
+        assert!(
+            matches!(
+                write(group("0")).await,
+                Err(crate::mongo::WriteError::Refused(_))
+            ),
+            "a group that exists is refused"
+        );
+        // Two entries delivered to consumer c1 and not acknowledged become pending.
+        session
+            .call(
+                "XREADGROUP",
+                vec![
+                    "GROUP".into(),
+                    "g".into(),
+                    "c1".into(),
+                    "COUNT".into(),
+                    2.into(),
+                    "STREAMS".into(),
+                    bytes_arg(&key),
+                    ">".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        let pending = session.stream_pending(&key, "g", 100).await.unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["1-1", "2-1"]
+        );
+        assert_eq!(
+            (pending[0].consumer.as_str(), pending[0].deliveries),
+            ("c1", 1)
+        );
+        let consumers = session.stream_consumers(&key, "g").await.unwrap();
+        assert_eq!(
+            (consumers[0].name.as_str(), consumers[0].pending),
+            ("c1", 2)
+        );
+
+        let ack = |id: &str| RedisWrite::StreamAck {
+            key: key.clone(),
+            group: "g".into(),
+            id: id.into(),
+        };
+        assert!(write(ack("1-1")).await.unwrap());
+        assert!(!write(ack("1-1")).await.unwrap(), "already acknowledged");
+        let claim = |min_idle_ms| RedisWrite::StreamClaim {
+            key: key.clone(),
+            group: "g".into(),
+            consumer: "c2".into(),
+            min_idle_ms,
+            id: "2-1".into(),
+        };
+        assert!(
+            !write(claim(3_600_000)).await.unwrap(),
+            "not idle long enough: left with its consumer"
+        );
+        assert!(write(claim(0)).await.unwrap());
+        let pending = session.stream_pending(&key, "g", 100).await.unwrap();
+        assert_eq!((pending.len(), pending[0].consumer.as_str()), (1, "c2"));
+
+        assert!(
+            write(RedisWrite::StreamDelete {
+                key: key.clone(),
+                id: "1-1".into()
+            })
+            .await
+            .unwrap()
+        );
+        assert!(
+            !write(RedisWrite::StreamDelete {
+                key: key.clone(),
+                id: "1-1".into()
+            })
+            .await
+            .unwrap()
+        );
+        assert!(
+            write(RedisWrite::GroupDestroy {
+                key: key.clone(),
+                group: "g".into()
+            })
+            .await
+            .unwrap()
+        );
+        assert!(session.stream_groups(&key).await.unwrap().is_empty());
+        session.call("DEL", vec![bytes_arg(&key)]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_json_against_redis_stack() {
+        let Ok(url) = std::env::var("VILO_TEST_REDIS_STACK") else {
+            return;
+        };
+        let session = RedisSession::connect(&url).await.unwrap();
+        let key = b"vilo_test:json".to_vec();
+        session.call("DEL", vec![bytes_arg(&key)]).await.unwrap();
+        let add = RedisWrite::AddKey {
+            key: key.clone(),
+            value: NewValue::Json(r#"{"name":"Ann","tags":[1,2]}"#.into()),
+            ttl_seconds: Some(60),
+        };
+        assert!(session.write(&add).await.unwrap());
+        assert!(
+            !session.write(&add).await.unwrap(),
+            "an existing key is left alone"
+        );
+        assert_eq!(session.key_info(&key).await.unwrap().kind, "ReJSON-RL");
+        let shown = session.json_get(&key).await.unwrap().unwrap();
+        let set = |expected: &str, value: &str| RedisWrite::JsonSet {
+            key: key.clone(),
+            expected: expected.into(),
+            value: value.into(),
+        };
+        assert!(
+            session
+                .write(&set(&shown, r#"{"name":"Bo"}"#))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !session
+                .write(&set(&shown, r#"{"name":"Cy"}"#))
+                .await
+                .unwrap(),
+            "the document changed since it was read"
+        );
+        assert!(matches!(
+            session.write(&set(r#"{"name":"Bo"}"#, "{not json")).await,
+            Err(crate::mongo::WriteError::Refused(_))
+        ));
+        let now: serde_json::Value =
+            serde_json::from_str(&session.json_get(&key).await.unwrap().unwrap()).unwrap();
+        assert_eq!(now, serde_json::json!({ "name": "Bo" }));
+        assert!(
+            session.key_info(&key).await.unwrap().ttl_ms > 0,
+            "JSON.SET keeps the TTL"
+        );
+        session.call("DEL", vec![bytes_arg(&key)]).await.unwrap();
     }
 
     async fn new_keys_and_list_rows(session: &RedisSession) {
@@ -2586,6 +3054,7 @@ broken line";
         let session = RedisSession::connect(&url).await.unwrap();
         writes_are_guarded(&session).await;
         new_keys_and_list_rows(&session).await;
+        streams_and_groups(&session).await;
         steps_denied_by_acl_change_nothing(&session, &url).await;
         values_can_be_searched(&session).await;
         databases_are_separate(&url).await;

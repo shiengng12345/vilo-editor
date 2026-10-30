@@ -217,6 +217,46 @@ pub(crate) fn acknowledge_publishes(operations: &[String]) {
     );
 }
 
+/// Takes the shared lock for an operation about to be sent. When another operation holds it,
+/// says whether that one's outcome is unknown (else it is still awaiting its answer).
+pub(crate) fn take_operation_lock(lock: &str, operation: &str) -> Result<(), bool> {
+    let mut locks = publish_locks();
+    if let Some((_, unknown)) = locks.held.get(lock) {
+        return Err(*unknown);
+    }
+    locks
+        .held
+        .insert(lock.to_string(), (operation.to_string(), false));
+    Ok(())
+}
+
+/// Records an operation's answer: a known one frees its lock, an unknown one keeps it until
+/// the user checked it.
+pub(crate) fn settle_operation_lock(lock: &str, operation: &str, unknown: bool) {
+    let mut locks = publish_locks();
+    if locks
+        .held
+        .get(lock)
+        .is_some_and(|(owner, _)| owner == operation)
+    {
+        if unknown {
+            locks
+                .held
+                .insert(lock.to_string(), (operation.to_string(), true));
+        } else {
+            locks.held.remove(lock);
+        }
+    }
+    if !unknown {
+        locks.settled.insert(operation.to_string());
+    }
+}
+
+/// The operation holding a lock, and whether its outcome is unknown.
+pub(crate) fn operation_lock(lock: &str) -> Option<(String, bool)> {
+    publish_locks().held.get(lock).cloned()
+}
+
 /// Channels are shared by every logical database of a server, so the lock is per connection.
 fn lock_key(connection: &str, channel: &str) -> String {
     format!("{connection}/redis/pubsub/{channel}")
@@ -907,6 +947,28 @@ mod tests {
             "an unknown lock goes once checked"
         );
         publish_locks().held.remove("test/a");
+    }
+
+    #[test]
+    fn test_operation_locks() {
+        assert_eq!(take_operation_lock("test/op", "one"), Ok(()));
+        assert_eq!(take_operation_lock("test/op", "two"), Err(false), "pending");
+        settle_operation_lock("test/op", "two", true);
+        assert_eq!(
+            operation_lock("test/op"),
+            Some(("one".to_string(), false)),
+            "only the owner settles"
+        );
+        settle_operation_lock("test/op", "one", true);
+        assert_eq!(
+            take_operation_lock("test/op", "three"),
+            Err(true),
+            "unknown until checked"
+        );
+        acknowledge_publishes(&["one".to_string()]);
+        assert_eq!(take_operation_lock("test/op", "four"), Ok(()));
+        settle_operation_lock("test/op", "four", false);
+        assert_eq!(operation_lock("test/op"), None, "a known answer frees it");
     }
 
     #[test]

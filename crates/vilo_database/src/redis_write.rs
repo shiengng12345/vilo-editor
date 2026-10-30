@@ -37,6 +37,13 @@ pub(crate) enum RedisOp {
     ListRemoveAt {
         index: i64,
     },
+    StreamAdd,
+    StreamRemove,
+    GroupCreate,
+    GroupDestroy,
+    StreamAck,
+    StreamClaim,
+    EditJson,
 }
 
 impl RedisOp {
@@ -59,6 +66,13 @@ impl RedisOp {
             RedisOp::AddKey(_) => "Add key",
             RedisOp::ListSet { .. } => "Edit item",
             RedisOp::ListRemoveAt { .. } => "Remove item",
+            RedisOp::StreamAdd => "Add an entry",
+            RedisOp::StreamRemove => "Remove an entry",
+            RedisOp::GroupCreate => "Create a consumer group",
+            RedisOp::GroupDestroy => "Destroy a consumer group",
+            RedisOp::StreamAck => "Acknowledge a pending entry",
+            RedisOp::StreamClaim => "Claim a pending entry",
+            RedisOp::EditJson => "Edit document",
         }
     }
 
@@ -74,6 +88,8 @@ impl RedisOp {
                 RedisOp::ListPush { head: false },
                 RedisOp::ListRemove,
             ],
+            "stream" => vec![RedisOp::StreamAdd, RedisOp::GroupCreate],
+            "ReJSON-RL" => vec![RedisOp::EditJson],
             _ => Vec::new(),
         };
         ops.extend([
@@ -97,7 +113,16 @@ impl RedisOp {
             RedisOp::Expire => &["Seconds"],
             RedisOp::ListSet { .. } => &["Value"],
             RedisOp::AddKey(_) => &["Key name", "TTL in seconds (empty: no TTL)"],
-            RedisOp::Delete | RedisOp::Persist | RedisOp::ListRemoveAt { .. } => &[],
+            RedisOp::StreamAdd => &["Entry ID (* lets Redis choose)"],
+            RedisOp::GroupCreate => &["Group name", "Start from ($ new entries only, 0 all)"],
+            RedisOp::StreamClaim => &["Give to consumer"],
+            RedisOp::EditJson => &["Document"],
+            RedisOp::Delete
+            | RedisOp::Persist
+            | RedisOp::ListRemoveAt { .. }
+            | RedisOp::StreamRemove
+            | RedisOp::GroupDestroy
+            | RedisOp::StreamAck => &[],
         }
     }
 
@@ -109,6 +134,8 @@ impl RedisOp {
             RedisOp::AddKey("list") => &["Element"],
             RedisOp::AddKey("set") => &["Member"],
             RedisOp::AddKey("zset") => &["Member", "Score"],
+            RedisOp::AddKey("json") => &["Document"],
+            RedisOp::StreamAdd => &["Field", "Value"],
             _ => &[],
         }
     }
@@ -120,6 +147,8 @@ pub(crate) struct RedisWriteForm {
     inputs: Vec<(&'static str, Entity<Editor>)>,
     /// The list item as it was shown, which a list row edit or removal must still find.
     shown_item: Option<Bytes>,
+    /// For a claim: the group, the entry and how long it was idle when shown.
+    claim: Option<(String, String, u64)>,
     planned: Option<RedisWrite>,
     typed: Entity<Editor>,
     show_values: bool,
@@ -136,6 +165,33 @@ impl RedisWriteForm {
 
 fn lock_key(connection: &str, database: u8, key: &[u8]) -> String {
     format!("{connection}/redis/db{database}/{}", quote_bytes(key))
+}
+
+/// A new stream entry from the form: the ID ("*" when left empty), then field and value rows;
+/// rows left empty are skipped.
+fn stream_entry(values: &[String]) -> Result<(String, Vec<(Bytes, Bytes)>)> {
+    let id = values.first().map(|text| text.trim()).unwrap_or_default();
+    let fields = values
+        .get(1..)
+        .unwrap_or_default()
+        .chunks(2)
+        .filter(|row| row.iter().any(|text| !text.is_empty()))
+        .map(|row| {
+            let field = row.first().cloned().unwrap_or_default();
+            if field.is_empty() {
+                return Err(anyhow!("Every field needs a name."));
+            }
+            Ok((
+                field.into_bytes(),
+                row.get(1).cloned().unwrap_or_default().into_bytes(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if fields.is_empty() {
+        return Err(anyhow!("Add at least one field."));
+    }
+    let id = if id.is_empty() { "*" } else { id };
+    Ok((id.to_string(), fields))
 }
 
 /// The new key from the form: name, optional TTL, then value rows. Rows left empty are skipped.
@@ -164,7 +220,7 @@ fn new_key(kind: &'static str, values: &[String]) -> Result<RedisWrite> {
         .get(2..)
         .unwrap_or_default()
         .chunks(width)
-        .filter(|row| kind == "string" || row.iter().any(|text| !text.is_empty()))
+        .filter(|row| kind == "string" || kind == "json" || row.iter().any(|text| !text.is_empty()))
         .collect::<Vec<_>>();
     if rows.is_empty() {
         return Err(anyhow!("Add at least one value."));
@@ -198,6 +254,12 @@ fn new_key(kind: &'static str, values: &[String]) -> Result<RedisWrite> {
                 })
                 .collect::<Result<_>>()?,
         ),
+        "json" => {
+            let document = column(rows[0], 0);
+            serde_json::from_str::<serde_json::Value>(&document)
+                .map_err(|error| anyhow!("The document is not valid JSON: {error}"))?;
+            NewValue::Json(document)
+        }
         _ => return Err(anyhow!("Vilo cannot create {kind} keys.")),
     };
     Ok(RedisWrite::AddKey {
@@ -256,6 +318,7 @@ impl DatabaseView {
         }
         let multiline = |op: RedisOp, label: &str| {
             matches!(op, RedisOp::EditString | RedisOp::AddKey("string")) && label == "Value"
+                || label == "Document"
         };
         let mut inputs = Vec::new();
         for (index, label) in op.inputs().iter().chain(op.row_inputs()).enumerate() {
@@ -276,6 +339,7 @@ impl DatabaseView {
             key,
             inputs,
             shown_item,
+            claim: None,
             planned: None,
             typed: single_line("Type the connection name", "", false, window, cx),
             show_values: false,
@@ -348,6 +412,7 @@ impl DatabaseView {
             key: planned.key().to_vec(),
             inputs: Vec::new(),
             shown_item: None,
+            claim: None,
             planned: Some(planned),
             typed: single_line("Type the connection name", "", false, window, cx),
             show_values: false,
@@ -356,6 +421,26 @@ impl DatabaseView {
             _task: None,
         });
         cx.notify();
+    }
+
+    /// A claim form for one pending entry, which keeps the idle time shown as XCLAIM's minimum.
+    pub(crate) fn start_stream_claim(
+        &mut self,
+        key: Bytes,
+        group: String,
+        id: String,
+        idle_ms: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_redis_write(RedisOp::StreamClaim, key, Vec::new(), None, window, cx);
+        if let Some(form) = self
+            .redis_write
+            .as_mut()
+            .filter(|form| form.op == RedisOp::StreamClaim)
+        {
+            form.claim = Some((group, id, idle_ms));
+        }
     }
 
     fn add_redis_write_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -381,7 +466,12 @@ impl DatabaseView {
             .iter()
             .map(|(_, editor)| editor.read(cx).text(cx))
             .collect::<Vec<_>>();
-        let (op, key, shown_item) = (form.op, form.key.clone(), form.shown_item.clone());
+        let (op, key, shown_item, claim) = (
+            form.op,
+            form.key.clone(),
+            form.shown_item.clone(),
+            form.claim.clone(),
+        );
         form.message = Some("Reading the current value…".into());
         let task = run(cx, async move {
             let input = |index: usize| -> Result<Bytes> {
@@ -494,6 +584,48 @@ impl DatabaseView {
                     return Err(anyhow!("Remove items from their row in the list."));
                 }
                 RedisOp::AddKey(kind) => new_key(kind, &values)?,
+                RedisOp::StreamAdd => {
+                    let (id, fields) = stream_entry(&values)?;
+                    RedisWrite::StreamAdd { id, fields, key }
+                }
+                RedisOp::GroupCreate => {
+                    let start = values.get(1).map(|text| text.trim()).unwrap_or_default();
+                    RedisWrite::GroupCreate {
+                        group: trimmed(0)?,
+                        start: if start.is_empty() {
+                            "$".to_string()
+                        } else {
+                            start.to_string()
+                        },
+                        key,
+                    }
+                }
+                RedisOp::StreamClaim => {
+                    let (group, id, min_idle_ms) = claim
+                        .ok_or_else(|| anyhow!("Claim entries from the group's pending list."))?;
+                    RedisWrite::StreamClaim {
+                        consumer: trimmed(0)?,
+                        group,
+                        min_idle_ms,
+                        id,
+                        key,
+                    }
+                }
+                RedisOp::EditJson => {
+                    let value = values.first().cloned().unwrap_or_default();
+                    serde_json::from_str::<serde_json::Value>(&value)
+                        .map_err(|error| anyhow!("The document is not valid JSON: {error}"))?;
+                    RedisWrite::JsonSet {
+                        expected: session.json_get(&key).await?.ok_or_else(|| {
+                            anyhow!("The key is gone or is no longer a JSON document.")
+                        })?,
+                        value,
+                        key,
+                    }
+                }
+                RedisOp::StreamRemove | RedisOp::GroupDestroy | RedisOp::StreamAck => {
+                    return Err(anyhow!("Start this from its row."));
+                }
             })
         });
         form._task = Some(cx.spawn(async move |this, cx| {
@@ -559,9 +691,33 @@ impl DatabaseView {
             cx.notify();
             return;
         }
+        let operation = uuid::Uuid::new_v4().simple().to_string();
+        // XACK and XCLAIM cannot be checked by reloading, so they hold their group's lock,
+        // shared with every window, until their answer is known or the user checked it.
+        let group_lock =
+            match &planned {
+                RedisWrite::StreamAck { key, group, .. }
+                | RedisWrite::StreamClaim { key, group, .. } => Some(
+                    crate::redis_stream::group_lock(&connection.id, database, key, group),
+                ),
+                _ => None,
+            };
+        if let Some(lock) = &group_lock
+            && let Err(unknown) = crate::redis_pubsub::take_operation_lock(lock, &operation)
+        {
+            form.message = Some(
+                if unknown {
+                    "An acknowledgement or claim for this group has an unknown outcome. Check its pending entries, then press I checked it in the group."
+                } else {
+                    "An acknowledgement or claim for this group is still waiting for its answer."
+                }
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
         form.sending = true;
         form.message = Some("Sending…".into());
-        let operation = uuid::Uuid::new_v4().simple().to_string();
         let intent = serde_json::json!({
             "time": chrono::Utc::now().to_rfc3339(),
             "operation": operation,
@@ -572,6 +728,8 @@ impl DatabaseView {
             "db": database,
             "key": quote_bytes(planned.key()),
             "kind": planned.name(),
+            // Restores the group's lock after a restart until the outcome is settled.
+            "lock": group_lock,
             "phase": "intent",
         });
         let (summary, operation_id) = (mongo_write::summarize_intent(&intent), operation.clone());
@@ -597,6 +755,11 @@ impl DatabaseView {
                 Ok((outcome, logged)) => (Ok(outcome), logged),
                 Err(error) => (Err(error), None),
             };
+            let unknown = matches!(result, Ok(Err(WriteError::Unknown(_))));
+            // Settled before touching the window, which may be closed by now.
+            if let Some(lock) = &group_lock {
+                crate::redis_pubsub::settle_operation_lock(lock, &operation_id, unknown);
+            }
             this.update(cx, |this, cx| {
                 let key = planned.key().to_vec();
                 // Recorded even if the page moved on meanwhile, so the next write still has to check.
@@ -607,14 +770,21 @@ impl DatabaseView {
                     ));
                 }
                 if let Ok(Err(WriteError::Unknown(message))) = &result {
-                    if let Some(connection) = &this.active {
-                        this.unknown_writes
-                            .insert(lock_key(connection, database, &key));
+                    if group_lock.is_some() {
+                        this.write_notice = Some(
+                            format!("The outcome of {summary} is unknown ({message}). Check the group's pending entries, then press I checked it in the group.")
+                                .into(),
+                        );
+                    } else {
+                        if let Some(connection) = &this.active {
+                            this.unknown_writes
+                                .insert(lock_key(connection, database, &key));
+                        }
+                        this.write_notice = Some(
+                            format!("The outcome of {summary} is unknown ({message}). Refresh the key to check it before writing again.")
+                                .into(),
+                        );
                     }
-                    this.write_notice = Some(
-                        format!("The outcome of {summary} is unknown ({message}). Refresh the key to check it before writing again.")
-                            .into(),
-                    );
                 }
                 if this.generation != generation {
                     cx.notify();
@@ -637,12 +807,26 @@ impl DatabaseView {
                         } else {
                             this.reopen_redis_key(key, cx);
                         }
+                        if matches!(
+                            planned,
+                            RedisWrite::StreamAck { .. }
+                                | RedisWrite::StreamClaim { .. }
+                                | RedisWrite::GroupDestroy { .. }
+                        ) {
+                            this.reload_stream_group(cx);
+                        }
                     }
                     Ok(Ok(false)) => {
                         form.message = Some(
                             match planned {
                                 RedisWrite::Rename { .. } => "Nothing changed: the new name is already taken, or the key is gone.",
                                 RedisWrite::AddKey { .. } => "Nothing changed: a key with this name already exists.",
+                                RedisWrite::StreamAdd { .. } => "Nothing changed: the stream is gone.",
+                                RedisWrite::StreamDelete { .. } => "Nothing changed: the entry is already gone.",
+                                RedisWrite::StreamAck { .. } => "Nothing changed: the entry is no longer pending for the group.",
+                                RedisWrite::StreamClaim { .. } => "Nothing changed: the entry is no longer pending, or another consumer touched it since it was shown.",
+                                RedisWrite::GroupDestroy { .. } => "Nothing changed: the group is already gone.",
+                                RedisWrite::JsonSet { .. } => "Nothing changed: the document changed since it was read, or the key is gone. Refresh and try again.",
                                 RedisWrite::ListSet { .. } | RedisWrite::ListRemoveAt { .. } => "Nothing changed: the item is no longer there as shown (the list changed). Refresh and try again.",
                                 RedisWrite::ListRemoveFirst { .. } | RedisWrite::SetRemove { .. } | RedisWrite::ZSetRemove { .. } => "Nothing changed: the value is not there.",
                                 _ => "Nothing changed: the value changed since it was read, or the key is gone. Refresh and try again.",
@@ -717,7 +901,8 @@ impl DatabaseView {
                             .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
                             .child(boxed(editor.clone(), cx))
                     };
-                    let growable = matches!(form.op, RedisOp::AddKey(kind) if kind != "string");
+                    let growable = matches!(form.op, RedisOp::AddKey(kind) if kind != "string" && kind != "json")
+                        || form.op == RedisOp::StreamAdd;
                     this.children(single.iter().map(|(label, editor)| labelled(label, editor)))
                         .children(rows.chunks(width).map(|row| {
                             h_flex()
@@ -924,5 +1109,38 @@ mod tests {
             "NaN score"
         );
         assert!(new_key("stream", &values(&["x", "", "a"])).is_err());
+        assert_eq!(
+            new_key("json", &values(&["j", "", r#"{"a": 1}"#])).unwrap(),
+            RedisWrite::AddKey {
+                key: b"j".to_vec(),
+                value: NewValue::Json(r#"{"a": 1}"#.into()),
+                ttl_seconds: None,
+            }
+        );
+        assert!(
+            new_key("json", &values(&["j", "", "{oops"])).is_err(),
+            "not JSON"
+        );
+    }
+
+    #[test]
+    fn test_stream_entry_from_the_form() {
+        assert_eq!(
+            stream_entry(&values(&["", "a", "1", "", "", "b", ""])).unwrap(),
+            (
+                "*".to_string(),
+                vec![(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), Vec::new())]
+            ),
+            "empty ID lets Redis choose; empty rows are skipped; empty values are kept"
+        );
+        assert_eq!(
+            stream_entry(&values(&[" 5-1 ", "a", "1"])).unwrap().0,
+            "5-1"
+        );
+        assert!(stream_entry(&values(&["*", "", ""])).is_err(), "no field");
+        assert!(
+            stream_entry(&values(&["*", "", "v"])).is_err(),
+            "unnamed field"
+        );
     }
 }
