@@ -206,6 +206,20 @@ fn write_names(level: Level, names: Vec<String>, cx: &mut App) {
     .detach_and_log_err(cx);
 }
 
+/// This run's unlogged writes first, keeping their reason, then the log's other dangling writes.
+fn writes_to_check(
+    unlogged: &[(String, String)],
+    dangling: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut writes = unlogged.to_vec();
+    for entry in dangling {
+        if !writes.iter().any(|known| known.0 == entry.0) {
+            writes.push(entry.clone());
+        }
+    }
+    writes
+}
+
 /// Checks a name typed in the rail against the others in its list (case is ignored).
 fn check_name(name: &str, others: &[String]) -> Result<(), &'static str> {
     if name.is_empty() {
@@ -343,6 +357,9 @@ pub struct DatabaseView {
     write_notice: Option<SharedString>,
     /// Writes from earlier runs whose result never reached the write log.
     dangling_writes: Vec<(String, String)>,
+    /// Writes of this run whose result line could not be saved. Kept apart from the list read
+    /// back from the log, because a line can be readable even though saving it failed.
+    unlogged_writes: Vec<(String, String)>,
     /// Why the write log could not be read or updated, shown until it works again.
     audit_problem: Option<SharedString>,
     /// While a page is open the site, environment and connection columns fold away; hovering the
@@ -473,6 +490,7 @@ impl DatabaseView {
             unknown_writes: Default::default(),
             write_notice: None,
             dangling_writes: Vec::new(),
+            unlogged_writes: Vec::new(),
             audit_problem: None,
             rail_peek: false,
             query_language: None,
@@ -1885,8 +1903,15 @@ impl DatabaseView {
         .detach_and_log_err(cx);
     }
 
+    /// Writes to check: those of this run that could not be logged, then those the log has no
+    /// result for.
+    fn writes_to_check(&self) -> Vec<(String, String)> {
+        writes_to_check(&self.unlogged_writes, &self.dangling_writes)
+    }
+
     fn render_dangling_writes(&self, cx: &mut Context<Self>) -> AnyElement {
-        let count = self.dangling_writes.len();
+        let writes = self.writes_to_check();
+        let count = writes.len();
         v_flex()
             .m_2()
             .p_2()
@@ -1929,9 +1954,9 @@ impl DatabaseView {
                                 .style(ButtonStyle::Outlined)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     let operations = this
-                                        .dangling_writes
-                                        .iter()
-                                        .map(|(operation, _)| operation.clone())
+                                        .writes_to_check()
+                                        .into_iter()
+                                        .map(|(operation, _)| operation)
                                         .collect::<Vec<_>>();
                                     let task = cx.background_spawn({
                                         let operations = operations.clone();
@@ -1944,6 +1969,9 @@ impl DatabaseView {
                                             match result {
                                                 Ok(()) => {
                                                     this.dangling_writes.retain(|(operation, _)| {
+                                                        !operations.contains(operation)
+                                                    });
+                                                    this.unlogged_writes.retain(|(operation, _)| {
                                                         !operations.contains(operation)
                                                     });
                                                     this.audit_problem = None;
@@ -1967,8 +1995,8 @@ impl DatabaseView {
                         .id("database-dangling-list")
                         .max_h(px(160.))
                         .overflow_y_scroll()
-                        .children(self.dangling_writes.iter().map(|(_, summary)| {
-                            Label::new(summary.clone())
+                        .children(writes.into_iter().map(|(_, summary)| {
+                            Label::new(summary)
                                 .size(LabelSize::XSmall)
                                 .buffer_font(cx)
                                 .color(Color::Muted)
@@ -2063,7 +2091,9 @@ impl Render for DatabaseView {
                     .h_full()
                     .when(!full_bleed, |this| this.p_4())
                     .when(
-                        !self.dangling_writes.is_empty() || self.audit_problem.is_some(),
+                        !self.dangling_writes.is_empty()
+                            || !self.unlogged_writes.is_empty()
+                            || self.audit_problem.is_some(),
                         |this| this.child(self.render_dangling_writes(cx)),
                     )
                     // The peek closes when the pointer reaches the page, not when it leaves the
@@ -2149,6 +2179,21 @@ impl Render for DatabaseView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_writes_to_check_keep_unlogged_reasons() {
+        let pair = |operation: &str, summary: &str| (operation.to_string(), summary.to_string());
+        let unlogged = [pair("a", "a · its result is not in the log: disk full")];
+        let dangling = [pair("a", "a"), pair("b", "b")];
+        assert_eq!(
+            writes_to_check(&unlogged, &dangling),
+            vec![
+                pair("a", "a · its result is not in the log: disk full"),
+                pair("b", "b")
+            ]
+        );
+        assert_eq!(writes_to_check(&[], &dangling), dangling.to_vec());
+    }
 
     #[test]
     fn test_redis_parts_round_trip() {

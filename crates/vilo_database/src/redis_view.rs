@@ -600,6 +600,8 @@ impl DatabaseView {
             return;
         }
         if state.switching.is_some() {
+            state.switch_error = Some("A database switch is already in progress.".into());
+            cx.notify();
             return;
         }
         state.switching = Some(database);
@@ -1354,7 +1356,10 @@ impl DatabaseView {
                     .collect::<Vec<_>>();
                 let orphans = others.len();
                 for node in &others {
-                    let (state_text, state_color) = health(node);
+                    let (state_text, state_color) = match health(node) {
+                        (_, Color::Error) => health(node),
+                        _ => ("no known primary".to_string(), Color::Warning),
+                    };
                     table = table.child(
                         row(&colors)
                             .child(cell(node.address.clone(), Some(200.), Color::Warning))
@@ -1387,8 +1392,9 @@ impl DatabaseView {
                             primaries.len(),
                             nodes
                                 .iter()
-                                .filter(|node| node.primary_id.is_some())
-                                .count(),
+                                .filter(|node| !node.primary)
+                                .count()
+                                .saturating_sub(orphans),
                             if orphans > 0 {
                                 format!(" · {orphans} nodes without a known primary, listed last")
                             } else {
@@ -2329,6 +2335,7 @@ impl DatabaseView {
                     match input.read(cx).text(cx).trim().parse::<u8>() {
                         Ok(database) => {
                             state.database_input = None;
+                            state.switch_error = None;
                             this.switch_redis_database(database, cx);
                         }
                         Err(_) => {

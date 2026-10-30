@@ -465,7 +465,7 @@ impl DatabaseView {
             this.update(cx, |this, cx| {
                 // Recorded even if the page moved on meanwhile, so the next write still has to check.
                 if let Some(error) = logged {
-                    this.dangling_writes.push((
+                    this.unlogged_writes.push((
                         operation_id,
                         format!("{summary} · its result is not in the log: {error}"),
                     ));
