@@ -692,10 +692,10 @@ fn unbracket_tls_names(config: &mut Config) {
     };
     match &mut config.server {
         fred::types::config::ServerConfig::Centralized { server } => fix(server),
-        fred::types::config::ServerConfig::Clustered { hosts, .. } => {
+        fred::types::config::ServerConfig::Clustered { hosts, .. }
+        | fred::types::config::ServerConfig::Sentinel { hosts, .. } => {
             hosts.iter_mut().for_each(fix)
         }
-        _ => {}
     }
 }
 
@@ -2394,52 +2394,84 @@ mod tests {
             .await
             .unwrap();
 
-        // After a failover a new session reaches the new master.
-        let before = tcp_port(&session).await;
+        // When Sentinel names another master, a new session goes there. The master is moved by
+        // hand rather than by SENTINEL FAILOVER, which a Sentinel in TILT mode (as in a VM whose
+        // clock jumps) does not carry out.
         let sentinel_url = url.split('?').next().unwrap().replacen(
             "redis-sentinel://:master-pw@",
             "redis://:sentinel-pw@",
             1,
         );
         let sentinel = RedisSession::connect(&sentinel_url).await.unwrap();
-        for _ in 0..2 {
+        let address = |reply: Value| {
+            let mut parts = reply.into_array().into_iter();
+            Some((parts.next()?.as_string()?, parts.next()?.as_string()?))
+        };
+        let (host, old) = address(
             sentinel
-                .call("SENTINEL", vec!["FAILOVER".into(), "mymaster".into()])
+                .call(
+                    "SENTINEL",
+                    vec!["GET-MASTER-ADDR-BY-NAME".into(), "mymaster".into()],
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tcp_port(&session).await.as_deref(), Some(old.as_str()));
+        let replica = pairs(
+            sentinel
+                .call("SENTINEL", vec!["REPLICAS".into(), "mymaster".into()])
+                .await
+                .unwrap()
+                .into_array()
+                .into_iter()
+                .next()
+                .unwrap(),
+        )
+        .into_iter()
+        .find(|(name, _)| name.as_string().as_deref() == Some("port"))
+        .and_then(|(_, port)| port.as_string())
+        .unwrap();
+        let node = |port: &str| format!("redis://:master-pw@{host}:{port}");
+        RedisSession::connect(&node(&replica))
+            .await
+            .unwrap()
+            .call("REPLICAOF", vec!["NO".into(), "ONE".into()])
+            .await
+            .unwrap();
+        RedisSession::connect(&node(&old))
+            .await
+            .unwrap()
+            .call(
+                "REPLICAOF",
+                vec![host.as_str().into(), replica.as_str().into()],
+            )
+            .await
+            .unwrap();
+        for args in [
+            vec!["REMOVE", "mymaster"],
+            vec!["MONITOR", "mymaster", host.as_str(), replica.as_str(), "1"],
+            vec!["SET", "mymaster", "auth-pass", "master-pw"],
+        ] {
+            sentinel
+                .call("SENTINEL", args.into_iter().map(Value::from).collect())
                 .await
                 .unwrap();
-            let mut moved = false;
-            for _ in 0..100 {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if let Ok(next) = RedisSession::connect(&url).await
-                    && tcp_port(&next).await != before
-                    && next
-                        .call("SET", vec!["vilo_test:sentinel".into(), "2".into()])
-                        .await
-                        .is_ok()
-                {
-                    moved = true;
-                    break;
-                }
-            }
-            if moved {
-                break;
-            }
         }
         let after = RedisSession::connect(&url).await.unwrap();
-        assert_ne!(
-            tcp_port(&after).await,
-            before,
-            "the new master, as Sentinel names it"
+        assert_eq!(
+            tcp_port(&after).await.as_deref(),
+            Some(replica.as_str()),
+            "the master Sentinel names now"
         );
+        after
+            .call("SET", vec!["vilo_test:sentinel".into(), "2".into()])
+            .await
+            .unwrap();
         after
             .call("DEL", vec!["vilo_test:sentinel".into()])
             .await
             .unwrap();
-        // Back to the first master, so the next run starts the same way.
-        sentinel
-            .call("SENTINEL", vec!["FAILOVER".into(), "mymaster".into()])
-            .await
-            .ok();
 
         let wrong_password = url.replace("sentinelPassword=sentinel-pw", "sentinelPassword=nope");
         assert!(RedisSession::connect(&wrong_password).await.is_err());
@@ -2467,13 +2499,21 @@ mod tests {
 
     #[test]
     fn test_ipv6_seeds_get_a_tls_name_rustls_takes() {
-        for url in ["redis://[::1]:6380", "redis-cluster://[::1]:6380"] {
+        for url in [
+            "redis://[::1]:6380",
+            "redis-cluster://[::1]:6380",
+            "redis-sentinel://[::1]:26379?sentinelServiceName=mymaster",
+        ] {
             let mut config = Config::from_url(url).unwrap();
             unbracket_tls_names(&mut config);
             let host = match &config.server {
                 fred::types::config::ServerConfig::Centralized { server } => server.clone(),
-                fred::types::config::ServerConfig::Clustered { hosts, .. } => hosts[0].clone(),
-                _ => panic!("{url}"),
+                fred::types::config::ServerConfig::Clustered { hosts, .. }
+                | fred::types::config::ServerConfig::Sentinel { hosts, .. } => hosts
+                    .iter()
+                    .find(|host| host.host.contains(':'))
+                    .cloned()
+                    .unwrap(),
             };
             let name = host.tls_server_name.unwrap_or(host.host);
             assert_eq!(&*name, "::1", "{url}");
