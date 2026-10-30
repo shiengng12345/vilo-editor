@@ -328,9 +328,11 @@ fn type_badge(kind: &str) -> (&'static str, Hsla) {
 
 fn badge(kind: &str) -> impl IntoElement {
     let (label, color) = type_badge(kind);
-    div()
+    // One width for every type, so the key names line up.
+    h_flex()
+        .w(px(58.))
         .flex_none()
-        .px_1p5()
+        .justify_center()
         .rounded_md()
         .border_1()
         .border_color(color.opacity(0.45))
@@ -1078,7 +1080,7 @@ impl DatabaseView {
                                     view.update(cx, |this, cx| this.open_key(key, cx)).ok();
                                 })
                                 .child(div().w(px(depth as f32 * 18. + 4.)).flex_none())
-                                .child(h_flex().w(px(60.)).flex_none().child(badge(&info.kind)))
+                                .child(h_flex().w(px(64.)).flex_none().child(badge(&info.kind)))
                                 .child(
                                     div()
                                         .flex_1()
