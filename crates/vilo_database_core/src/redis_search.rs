@@ -219,14 +219,12 @@ fn parse_info(reply: Value) -> IndexInfo {
                             name: String::new(),
                             kind: String::new(),
                         };
-                        // RESP2 lists flags such as SORTABLE without values, which shifts the
-                        // pairs after them; the three read here always come first there.
-                        let read = if matches!(attribute, Value::Map(_)) {
-                            usize::MAX
+                        let entries = if matches!(attribute, Value::Map(_)) {
+                            pairs(attribute)
                         } else {
-                            3
+                            attribute_entries(attribute.into_array())
                         };
-                        for (name, value) in pairs(attribute).into_iter().take(read) {
+                        for (name, value) in entries {
                             match name_of(&name).as_str() {
                                 "identifier" => found.identifier = text(&value),
                                 "attribute" => found.name = text(&value),
@@ -245,6 +243,21 @@ fn parse_info(reply: Value) -> IndexInfo {
         }
     }
     info
+}
+
+/// RESP2 lists flags such as SORTABLE without values, so its attribute array cannot be read as
+/// pairs: each name Vilo reads takes the item after it as its value.
+fn attribute_entries(items: Vec<Value>) -> Vec<(Value, Value)> {
+    let mut entries = Vec::new();
+    let mut items = items.into_iter();
+    while let Some(item) = items.next() {
+        if matches!(name_of(&item).as_str(), "identifier" | "attribute" | "type")
+            && let Some(value) = items.next()
+        {
+            entries.push((item, value));
+        }
+    }
+    entries
 }
 
 async fn command(client: &Client, name: &'static str, args: Vec<Value>) -> Result<Value> {
@@ -365,41 +378,51 @@ async fn measure(client: &Client, keys: &[Bytes]) -> Result<Vec<Result<u64, Stri
     let mut sizes = Vec::with_capacity(keys.len());
     let mut asked = Vec::new();
     for (index, key) in keys.iter().enumerate() {
-        let read = |offset: usize| {
-            kinds
-                .get(index * 2 + offset)
-                .and_then(|reply| reply.as_ref().ok())
+        // The reply, or why the key's size cannot be known, with the server's reason.
+        let read = |offset: usize| match kinds.get(index * 2 + offset) {
+            Some(Ok(reply)) => Ok(reply),
+            Some(Err(error)) => Err(format!(
+                "Its size could not be read ({}); open the key.",
+                error.details()
+            )),
+            None => Err(unreadable()),
         };
-        let kind = read(0).map(text);
-        let args = match kind.as_deref() {
-            Some("hash") => match read(1).and_then(Value::as_u64) {
-                Some(fields) if fields <= MAX_FIELDS => {
+        let kind = match read(0) {
+            Ok(kind) => text(kind),
+            Err(reason) => {
+                sizes.push(Err(reason));
+                continue;
+            }
+        };
+        let args = match kind.as_str() {
+            "hash" => match read(1).map(Value::as_u64) {
+                Ok(Some(fields)) if fields <= MAX_FIELDS => {
                     vec!["USAGE".into(), bytes_arg(key), "SAMPLES".into(), "0".into()]
                 }
-                Some(fields) => {
+                Ok(Some(fields)) => {
                     sizes.push(Err(format!(
                         "It has {fields} fields, more than {MAX_FIELDS}; open the key."
                     )));
                     continue;
                 }
-                None => {
+                Ok(None) => {
                     sizes.push(Err(unreadable()));
                     continue;
                 }
+                Err(reason) => {
+                    sizes.push(Err(reason));
+                    continue;
+                }
             },
-            Some("ReJSON-RL") => vec!["USAGE".into(), bytes_arg(key)],
-            Some("none") => {
+            "ReJSON-RL" => vec!["USAGE".into(), bytes_arg(key)],
+            "none" => {
                 sizes.push(Err("The key no longer exists.".to_string()));
                 continue;
             }
-            Some(other) => {
+            other => {
                 sizes.push(Err(format!(
                     "It is a {other}, not a hash or JSON document; open the key."
                 )));
-                continue;
-            }
-            None => {
-                sizes.push(Err(unreadable()));
                 continue;
             }
         };
@@ -613,6 +636,57 @@ mod tests {
             ]))
             .is_err(),
             "two field arrays for one key"
+        );
+    }
+
+    #[test]
+    fn test_resp2_attributes_are_read_by_name() {
+        let info = parse_info(Value::Array(vec![
+            bulk("attributes"),
+            Value::Array(vec![
+                Value::Array(
+                    [
+                        "identifier",
+                        "n",
+                        "attribute",
+                        "n",
+                        "type",
+                        "NUMERIC",
+                        "SORTABLE",
+                        "UNF",
+                    ]
+                    .map(bulk)
+                    .to_vec(),
+                ),
+                Value::Array(
+                    [
+                        "SORTABLE",
+                        "attribute",
+                        "type",
+                        "type",
+                        "TAG",
+                        "identifier",
+                        "$.type",
+                    ]
+                    .map(bulk)
+                    .to_vec(),
+                ),
+            ]),
+        ]));
+        assert_eq!(
+            info.attributes,
+            vec![
+                IndexAttribute {
+                    identifier: "n".into(),
+                    name: "n".into(),
+                    kind: "NUMERIC".into()
+                },
+                IndexAttribute {
+                    identifier: "$.type".into(),
+                    name: "type".into(),
+                    kind: "TAG".into()
+                },
+            ]
         );
     }
 
