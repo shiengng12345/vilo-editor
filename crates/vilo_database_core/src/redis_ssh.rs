@@ -174,14 +174,26 @@ impl SshTunnel {
                 let reason = self.master_error().await;
                 bail!("The SSH connection failed ({status}): {reason}");
             }
-            let check = Command::new("ssh")
-                .args(["-O", "check"])
-                .args(&self.arguments)
-                .stdin(Stdio::null())
-                .output()
-                .await
-                .context("Could not run ssh")?;
-            if check.status.success() {
+            // Bounded by what is left of the startup deadline, so a master that stalls while
+            // answering cannot hold the connection past it.
+            let left = READY_TIMEOUT
+                .saturating_sub(started.elapsed())
+                .max(Duration::from_millis(100));
+            let check = tokio::time::timeout(
+                left,
+                Command::new("ssh")
+                    .args(["-O", "check"])
+                    .args(&self.arguments)
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await;
+            let ready = match check {
+                Ok(output) => output.context("Could not run ssh")?.status.success(),
+                Err(_) => false,
+            };
+            if ready {
                 return Ok(());
             }
             if started.elapsed() > READY_TIMEOUT {
