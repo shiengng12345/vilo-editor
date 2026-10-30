@@ -29,6 +29,9 @@ pub const DOCUMENT_BYTES: u64 = 1024 * 1024;
 pub const MAX_FIELDS: u64 = 1000;
 /// Content kept per page. A document may grow between being measured and fetched; past this
 /// the rest of the page is not kept.
+/// RediSearch's words when a query stops at its time limit. Even with ON_TIMEOUT RETURN some
+/// queries answer with this error instead of partial results (seen on 2.10.5).
+const TIMED_OUT: &str = "Timeout limit was reached";
 const KEPT_BYTES: usize = 2 * PAGE_BYTES as usize;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -474,7 +477,13 @@ async fn search_on(client: &Client, request: &SearchRequest) -> Result<SearchPag
     let mut args = base();
     args.push("NOCONTENT".into());
     args.extend(options(request.offset, request.count));
-    let found = parse_search(command(client, "FT.SEARCH", args).await?)?;
+    let found = match command(client, "FT.SEARCH", args).await {
+        Err(error) if error.to_string().contains(TIMED_OUT) => bail!(
+            "The query stopped at its time limit before it returned any results. Raise the time \
+             limit or narrow the query."
+        ),
+        reply => parse_search(reply?)?,
+    };
     let mut partial = found.partial();
     let keys = found
         .results
@@ -522,13 +531,24 @@ async fn search_on(client: &Client, request: &SearchRequest) -> Result<SearchPag
         args.push(fetch.len().to_string().into());
         args.extend(fetch.iter().map(|key| bytes_arg(key)));
         args.extend(options(0, fetch.len() as u64));
-        let fetched = parse_search(command(client, "FT.SEARCH", args).await?)?;
-        if let Some(reason) = fetched.partial() {
-            content_partial = true;
-            partial.get_or_insert(reason);
-        }
+        let results = match command(client, "FT.SEARCH", args).await {
+            // The keys are already found; their rows say the content was not fetched.
+            Err(error) if error.to_string().contains(TIMED_OUT) => {
+                content_partial = true;
+                partial.get_or_insert(TIMED_OUT.to_string());
+                Vec::new()
+            }
+            reply => {
+                let fetched = parse_search(reply?)?;
+                if let Some(reason) = fetched.partial() {
+                    content_partial = true;
+                    partial.get_or_insert(reason);
+                }
+                fetched.results
+            }
+        };
         let mut kept = 0_usize;
-        for (key, fields) in fetched.results {
+        for (key, fields) in results {
             let Some(fields) = fields else {
                 continue;
             };
@@ -1019,19 +1039,27 @@ mod tests {
         }
         let mut slow = request(index, "al* | be* | ga* | de* | ka* | th*");
         slow.timeout_ms = 1;
-        let page = session.search(&slow).await.unwrap();
+        let page = session.search(&slow).await;
         let fast = session.search(&request(index, "alpha1")).await.unwrap();
         session
             .call("FT.DROPINDEX", vec![index.into(), "DD".into()])
             .await
             .unwrap();
-        assert!(
-            page.partial
-                .as_deref()
-                .is_some_and(|reason| reason.contains("Timeout")),
-            "{:?}",
-            page.partial
-        );
+        // The server either returns part of the results with a warning or refuses the query;
+        // both must be said.
+        match page {
+            Ok(page) => assert!(
+                page.partial
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("Timeout")),
+                "{:?}",
+                page.partial
+            ),
+            Err(error) => assert!(
+                format!("{error:#}").contains("stopped at its time limit"),
+                "{error:#}"
+            ),
+        }
         assert_eq!(fast.partial, None);
     }
 }
