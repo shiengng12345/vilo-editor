@@ -372,9 +372,12 @@ pub fn parse_cluster_nodes(text: &str) -> Vec<ClusterNode> {
             let slot_count = slots
                 .iter()
                 .filter_map(|slot| match slot.split_once('-') {
-                    Some((start, end)) => {
-                        Some(end.parse::<u32>().ok()? + 1 - start.parse::<u32>().ok()?)
-                    }
+                    // Checked, so a reversed or out-of-range range from a node in a bad state counts as 0.
+                    Some((start, end)) => end
+                        .parse::<u32>()
+                        .ok()?
+                        .checked_add(1)?
+                        .checked_sub(start.parse::<u32>().ok()?),
                     None => slot.parse::<u32>().ok().map(|_| 1),
                 })
                 .sum();
@@ -1376,7 +1379,7 @@ mod tests {
         let text = "247790d65b6faa09daea9d2242fd0d25e05174f3 127.0.0.1:47102@57102 master - 0 1793371854000 3 connected 10923-16383\n\
 7798d999ab1e64a74b816bc3046bfe9ea89fd255 127.0.0.1:47103@57103 slave d0a1d0332440fa9054fca14876d4e4abdd690162 0 1793371855547 2 connected\n\
 40a7385ee006410f5bfd54906534a2d858f3e43f 127.0.0.1:47100@57100,node-a myself,master - 0 0 1 connected 0-5460 [5461->-d0a1d0332440fa9054fca14876d4e4abdd690162]\n\
-aaaa 10.0.0.9:6379@16379 master,fail - 1 2 4 disconnected 7000\n\
+aaaa 10.0.0.9:6379@16379 master,fail - 1 2 4 disconnected 7000 9000-8000 0-4294967295\n\
 broken line";
         let nodes = parse_cluster_nodes(text);
         assert_eq!(nodes.len(), 4);

@@ -111,35 +111,38 @@ pub(crate) fn dangling_writes(log: &str) -> Vec<(String, String)> {
         let Some(operation) = entry.get("operation").and_then(|value| value.as_str()) else {
             continue;
         };
-        let text = |name: &str| {
-            entry
-                .get(name)
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-        };
-        match text("phase") {
-            "intent" => {
-                let target = if text("target").is_empty() {
-                    text("key")
-                } else {
-                    text("target")
-                };
-                open.push((
-                    operation.to_string(),
-                    format!(
-                        "{} {} on {} ({}, {})",
-                        text("time"),
-                        text("kind"),
-                        target,
-                        text("name"),
-                        text("environment")
-                    ),
-                ));
-            }
+        match entry.get("phase").and_then(|value| value.as_str()) {
+            Some("intent") => open.push((operation.to_string(), summarize_intent(&entry))),
             _ => open.retain(|(known, _)| known != operation),
         }
     }
     open
+}
+
+/// One intent as a line a person can check: when, what, where (with the Redis database).
+pub(crate) fn summarize_intent(entry: &serde_json::Value) -> String {
+    let text = |name: &str| {
+        entry
+            .get(name)
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+    };
+    let target = match (
+        text("target"),
+        entry.get("db").and_then(|value| value.as_u64()),
+    ) {
+        ("", Some(database)) => format!("db{database} {}", text("key")),
+        ("", None) => text("key").to_string(),
+        (target, _) => target.to_string(),
+    };
+    format!(
+        "{} {} on {} ({}, {})",
+        text("time"),
+        text("kind"),
+        target,
+        text("name"),
+        text("environment")
+    )
 }
 
 /// Reads the write log for dangling writes; a missing log has none.
@@ -420,6 +423,7 @@ impl DatabaseView {
             "phase": "intent",
         });
         let (database, collection) = (write.database.clone(), write.collection.clone());
+        let (summary, operation_id) = (summarize_intent(&intent), operation.clone());
         let task = run(cx, async move {
             audit(intent)?;
             let outcome = match planned {
@@ -458,7 +462,24 @@ impl DatabaseView {
                 Err(error) => (Err(error), None),
             };
             this.update(cx, |this, cx| {
+                // Recorded even if the page moved on meanwhile, so the next write still has to check.
+                if let Some(error) = logged {
+                    this.dangling_writes.push((
+                        operation_id,
+                        format!("{summary} · its result is not in the log: {error}"),
+                    ));
+                }
+                if let Ok(Err(WriteError::Unknown(message))) = &result {
+                    if let Some(key) = &key {
+                        this.unknown_writes.insert(key.clone());
+                    }
+                    this.write_notice = Some(
+                        format!("The outcome of {summary} is unknown ({message}). Refresh the page to check it before writing again.")
+                            .into(),
+                    );
+                }
                 if this.generation != generation {
+                    cx.notify();
                     return;
                 }
                 let Some(write) = &mut this.doc_write else {
@@ -479,27 +500,11 @@ impl DatabaseView {
                                 .into(),
                         );
                     }
-                    Ok(Err(WriteError::Unknown(message))) => {
-                        if let Some(key) = key {
-                            this.unknown_writes.insert(key);
-                        }
-                        this.write_notice = Some(
-                            format!("The outcome of the last write is unknown ({message}). Refresh the page to check it before writing again.")
-                                .into(),
-                        );
-                        this.doc_write = None;
-                    }
+                    Ok(Err(WriteError::Unknown(_))) => this.doc_write = None,
                     Ok(Err(WriteError::Refused(message))) => {
                         write.message = Some(format!("Not written: {message}").into());
                     }
                     Err(error) => write.message = Some(format!("Not sent: {error:#}").into()),
-                }
-                if let Some(error) = logged {
-                    let note = format!("The write log has its intent but not its result ({error}).");
-                    this.write_notice = Some(match this.write_notice.take() {
-                        Some(existing) => format!("{existing} {note}").into(),
-                        None => note.into(),
-                    });
                 }
                 cx.notify();
             })
@@ -682,5 +687,7 @@ mod tests {
             ["b", "d"]
         );
         assert!(dangling[0].1.contains("UNLINK on \"k\" (R, UAT)"));
+        let with_db = serde_json::json!({ "kind": "SET", "key": "k", "db": 3, "time": "t", "name": "R", "environment": "QAT" });
+        assert_eq!(summarize_intent(&with_db), "t SET on db3 k (R, QAT)");
     }
 }

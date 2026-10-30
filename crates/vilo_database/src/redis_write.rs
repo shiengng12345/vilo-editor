@@ -137,6 +137,13 @@ impl DatabaseView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .redis_state
+            .as_ref()
+            .is_some_and(|state| state.switching_database())
+        {
+            return;
+        }
         if self.redis_writes_locked(&key) {
             self.write_notice = Some(
                 "A write to this key has an unknown outcome. Refresh the key to check it first."
@@ -364,6 +371,7 @@ impl DatabaseView {
             "kind": planned.name(),
             "phase": "intent",
         });
+        let (summary, operation_id) = (mongo_write::summarize_intent(&intent), operation.clone());
         let task = run(cx, {
             let planned = planned.clone();
             async move {
@@ -387,14 +395,32 @@ impl DatabaseView {
                 Err(error) => (Err(error), None),
             };
             this.update(cx, |this, cx| {
+                let key = planned.key().to_vec();
+                // Recorded even if the page moved on meanwhile, so the next write still has to check.
+                if let Some(error) = logged {
+                    this.dangling_writes.push((
+                        operation_id,
+                        format!("{summary} · its result is not in the log: {error}"),
+                    ));
+                }
+                if let Ok(Err(WriteError::Unknown(message))) = &result {
+                    if let Some(connection) = &this.active {
+                        this.unknown_writes
+                            .insert(lock_key(connection, database, &key));
+                    }
+                    this.write_notice = Some(
+                        format!("The outcome of {summary} is unknown ({message}). Refresh the key to check it before writing again.")
+                            .into(),
+                    );
+                }
                 if this.generation != generation {
+                    cx.notify();
                     return;
                 }
                 let Some(form) = &mut this.redis_write else {
                     return;
                 };
                 form.sending = false;
-                let key = planned.key().to_vec();
                 match result {
                     Ok(Ok(true)) => {
                         this.redis_write = None;
@@ -416,28 +442,11 @@ impl DatabaseView {
                             .into(),
                         );
                     }
-                    Ok(Err(WriteError::Unknown(message))) => {
-                        if let Some(connection) = &this.active {
-                            this.unknown_writes
-                                .insert(lock_key(connection, database, &key));
-                        }
-                        this.write_notice = Some(
-                            format!("The outcome of the last write is unknown ({message}). Refresh the key to check it before writing again.")
-                                .into(),
-                        );
-                        this.redis_write = None;
-                    }
+                    Ok(Err(WriteError::Unknown(_))) => this.redis_write = None,
                     Ok(Err(WriteError::Refused(message))) => {
                         form.message = Some(format!("Not written: {message}").into());
                     }
                     Err(error) => form.message = Some(format!("Not sent: {error:#}").into()),
-                }
-                if let Some(error) = logged {
-                    let note = format!("The write log has its intent but not its result ({error}).");
-                    this.write_notice = Some(match this.write_notice.take() {
-                        Some(existing) => format!("{existing} {note}").into(),
-                        None => note.into(),
-                    });
                 }
                 cx.notify();
             })

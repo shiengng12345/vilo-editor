@@ -12,6 +12,7 @@ use std::{
 use collections::{HashMap, HashSet};
 use gpui::{ClipboardItem, Hsla, Task, UniformListScrollHandle, prelude::*, rgb, uniform_list};
 use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
+use util::ResultExt as _;
 use vilo_database_core::redis::{
     Bytes, ClusterNode, KeyInfo, ScanNode, StreamEntry, format_reply, quote_bytes, split_command,
 };
@@ -195,6 +196,10 @@ pub(crate) struct RedisState {
 }
 
 impl RedisState {
+    pub(crate) fn switching_database(&self) -> bool {
+        self.switching.is_some()
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             tab: RedisTab::Browse,
@@ -543,7 +548,10 @@ impl DatabaseView {
         let connection = self.generation;
         let task = run(cx, async move {
             let count = session.database_count().await;
-            Ok((count, session.keyspace().await.unwrap_or_default()))
+            Ok((
+                count,
+                session.keyspace().await.log_err().unwrap_or_default(),
+            ))
         });
         cx.spawn(async move |this, cx| {
             let Ok((count, keyspace)) = task.await else {
@@ -570,16 +578,19 @@ impl DatabaseView {
         let Some(connection) = self.active_connection().cloned() else {
             return;
         };
-        if self
-            .redis_write
-            .as_ref()
-            .is_some_and(|form| form.sending_now())
-        {
-            return;
-        }
+        // A write must finish or be closed first; its result belongs to the database it was sent to.
+        let editing = self.redis_write.is_some();
         let Some(state) = self.redis_state() else {
             return;
         };
+        if editing {
+            state.switch_error = Some("Close the open edit before switching databases.".into());
+            cx.notify();
+            return;
+        }
+        if state.switching.is_some() {
+            return;
+        }
         state.switching = Some(database);
         state.switch_error = None;
         let generation = self.generation;
@@ -1335,7 +1346,10 @@ impl DatabaseView {
                         Label::new(format!(
                             "{} primaries, {} replicas · {covered} of 16384 slots covered{}",
                             primaries.len(),
-                            nodes.len() - primaries.len(),
+                            nodes
+                                .iter()
+                                .filter(|node| node.primary_id.is_some())
+                                .count(),
                             if orphans > 0 {
                                 format!(" · {orphans} replicas of unknown primaries")
                             } else {

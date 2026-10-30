@@ -343,6 +343,8 @@ pub struct DatabaseView {
     write_notice: Option<SharedString>,
     /// Writes from earlier runs whose result never reached the write log.
     dangling_writes: Vec<(String, String)>,
+    /// Why the write log could not be read or updated, shown until it works again.
+    audit_problem: Option<SharedString>,
     /// While a page is open the site, environment and connection columns fold away; hovering the
     /// kind icons shows them over the page.
     rail_peek: bool,
@@ -471,6 +473,7 @@ impl DatabaseView {
             unknown_writes: Default::default(),
             write_notice: None,
             dangling_writes: Vec::new(),
+            audit_problem: None,
             rail_peek: false,
             query_language: None,
             hover_pick: None,
@@ -480,9 +483,17 @@ impl DatabaseView {
         };
         let read = cx.background_spawn(async { mongo_write::read_dangling_writes() });
         cx.spawn(async move |this, cx| {
-            let dangling = read.await?;
+            let result = read.await;
             this.update(cx, |this, cx| {
-                this.dangling_writes = dangling;
+                match result {
+                    Ok(dangling) => this.dangling_writes.extend(dangling),
+                    Err(error) => this.audit_problem = Some(
+                        format!(
+                            "Vilo could not check the write log for unfinished writes: {error:#}"
+                        )
+                        .into(),
+                    ),
+                }
                 cx.notify();
             })
         })
@@ -1871,44 +1882,81 @@ impl DatabaseView {
             .gap_1()
             .rounded_md()
             .bg(cx.theme().status().warning_background)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(Icon::new(IconName::Warning).size(IconSize::Small).color(Color::Warning))
-                    .child(
-                        Label::new(format!(
-                            "{count} earlier write{} may or may not have happened: the write log has no result for {}. Check {} before writing there again.",
-                            if count == 1 { "" } else { "s" },
-                            if count == 1 { "it" } else { "them" },
-                            if count == 1 { "its target" } else { "their targets" },
-                        ))
-                        .size(LabelSize::Small),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("database-dangling-checked", "I checked them")
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Outlined)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let operations = this
-                                    .dangling_writes
-                                    .drain(..)
-                                    .map(|(operation, _)| operation)
-                                    .collect::<Vec<_>>();
-                                cx.background_spawn(async move {
-                                    mongo_write::acknowledge_writes(&operations)
-                                })
-                                .detach_and_log_err(cx);
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .children(self.dangling_writes.iter().take(5).map(|(_, summary)| {
-                Label::new(summary.clone())
-                    .size(LabelSize::XSmall)
-                    .buffer_font(cx)
-                    .color(Color::Muted)
-            }))
+            .when_some(self.audit_problem.clone(), |this, problem| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .child(Icon::new(IconName::Warning).size(IconSize::Small).color(Color::Error))
+                        .child(Label::new(problem).size(LabelSize::Small)),
+                )
+            })
+            .when(count > 0, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .child(Icon::new(IconName::Warning).size(IconSize::Small).color(Color::Warning))
+                        .child(
+                            Label::new(format!(
+                                "{count} write{} may or may not have happened: the write log has no result for {}. Check {} before writing there again.",
+                                if count == 1 { "" } else { "s" },
+                                if count == 1 { "it" } else { "them" },
+                                if count == 1 { "its target" } else { "their targets" },
+                            ))
+                            .size(LabelSize::Small),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("database-dangling-checked", "I checked them")
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let operations = this
+                                        .dangling_writes
+                                        .iter()
+                                        .map(|(operation, _)| operation.clone())
+                                        .collect::<Vec<_>>();
+                                    let task = cx.background_spawn({
+                                        let operations = operations.clone();
+                                        async move { mongo_write::acknowledge_writes(&operations) }
+                                    });
+                                    // The list only clears once the acknowledgement is in the log.
+                                    cx.spawn(async move |this, cx| {
+                                        let result = task.await;
+                                        this.update(cx, |this, cx| {
+                                            match result {
+                                                Ok(()) => {
+                                                    this.dangling_writes.retain(|(operation, _)| {
+                                                        !operations.contains(operation)
+                                                    });
+                                                    this.audit_problem = None;
+                                                }
+                                                Err(error) => {
+                                                    this.audit_problem = Some(
+                                                        format!("Vilo could not record that these were checked: {error:#}")
+                                                            .into(),
+                                                    )
+                                                }
+                                            }
+                                            cx.notify();
+                                        })
+                                    })
+                                    .detach_and_log_err(cx);
+                                })),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .id("database-dangling-list")
+                        .max_h(px(160.))
+                        .overflow_y_scroll()
+                        .children(self.dangling_writes.iter().map(|(_, summary)| {
+                            Label::new(summary.clone())
+                                .size(LabelSize::XSmall)
+                                .buffer_font(cx)
+                                .color(Color::Muted)
+                        })),
+                )
+            })
             .into_any_element()
     }
 }
@@ -1996,9 +2044,10 @@ impl Render for DatabaseView {
                     .min_w_0()
                     .h_full()
                     .when(!full_bleed, |this| this.p_4())
-                    .when(!self.dangling_writes.is_empty(), |this| {
-                        this.child(self.render_dangling_writes(cx))
-                    })
+                    .when(
+                        !self.dangling_writes.is_empty() || self.audit_problem.is_some(),
+                        |this| this.child(self.render_dangling_writes(cx)),
+                    )
                     // The peek closes when the pointer reaches the page, not when it leaves the
                     // peek: right-click menus and dialogs sit outside it and must keep it open.
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
