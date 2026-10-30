@@ -226,8 +226,49 @@ impl Output {
         self.text.push_str(text);
     }
 
-    fn remaining(&self) -> usize {
-        MAX_OUTPUT.saturating_sub(self.text.len())
+    /// A JSON-style quoted string, escaped piece by piece so the limit cuts it where it is
+    /// reached instead of dropping it whole.
+    fn push_text(&mut self, text: &str) {
+        self.push("\"");
+        let mut buffer = [0; 4];
+        for character in text.chars() {
+            if self.cut {
+                return;
+            }
+            match character {
+                '"' => self.push("\\\""),
+                '\\' => self.push("\\\\"),
+                '\n' => self.push("\\n"),
+                '\r' => self.push("\\r"),
+                '\t' => self.push("\\t"),
+                control if u32::from(control) < 0x20 => {
+                    self.push(&format!("\\u{:04x}", u32::from(control)))
+                }
+                character => self.push(character.encode_utf8(&mut buffer)),
+            }
+        }
+        self.push("\"");
+    }
+
+    /// Bytes quoted as `quote_bytes` writes them, escaped piece by piece like `push_text`.
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        self.push("\"");
+        for byte in bytes {
+            if self.cut {
+                return;
+            }
+            match byte {
+                b'"' => self.push("\\\""),
+                b'\\' => self.push("\\\\"),
+                b'\n' => self.push("\\n"),
+                b' '..=b'~' => {
+                    let printable = [*byte];
+                    self.push(std::str::from_utf8(&printable).unwrap_or("?"))
+                }
+                _ => self.push(&format!("\\x{byte:02x}")),
+            }
+        }
+        self.push("\"");
     }
 
     fn finish(mut self) -> String {
@@ -237,10 +278,6 @@ impl Output {
         }
         self.text
     }
-}
-
-fn quoted(text: &str) -> String {
-    serde_json::Value::String(text.to_string()).to_string()
 }
 
 fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mut Output) {
@@ -285,38 +322,19 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
         Node::Bool(flag) => out.push(if *flag { "true" } else { "false" }),
         Node::Int(number) => out.push(number),
         Node::Float(value) => out.push(&format_float(*value)),
-        Node::Text(text) => {
-            // Only as much as can still be shown is escaped, so a huge value is never copied whole.
-            let end = (0..=text.len().min(out.remaining()))
-                .rev()
-                .find(|end| text.is_char_boundary(*end))
-                .unwrap_or(0);
-            out.push(&quoted(&text[..end]));
-            if end < text.len() {
-                out.cut = true;
-            }
-        }
+        Node::Text(text) => out.push_text(text),
         Node::Bytes(bytes) => {
-            let end = bytes.len().min(out.remaining());
-            out.push(&format!("b{}", crate::redis::quote_bytes(&bytes[..end])));
-            if end < bytes.len() {
-                out.cut = true;
-            }
+            out.push("b");
+            out.push_bytes(bytes);
         }
         Node::List(ids) => items("[", ids, "]", out),
         Node::Tuple(ids) => items("(", ids, ")", out),
         Node::Set(ids) => items("{", ids, "}", out),
         Node::Name(name) => out.push(name),
         Node::Custom(label, bytes) => {
-            let end = bytes.len().min(out.remaining());
-            out.push(&format!(
-                "<{label}: {} bytes {}>",
-                bytes.len(),
-                crate::redis::quote_bytes(&bytes[..end])
-            ));
-            if end < bytes.len() {
-                out.cut = true;
-            }
+            out.push(&format!("<{label}: {} bytes ", bytes.len()));
+            out.push_bytes(bytes);
+            out.push(">");
         }
         Node::Map(pairs) => {
             if pairs.is_empty() {
@@ -585,11 +603,18 @@ impl Php<'_> {
         self.expect(b':')?;
         match kind {
             b'b' => {
-                let flag = self.number(b';')? == "1";
+                let flag = match self.number(b';')?.as_str() {
+                    "0" => false,
+                    "1" => true,
+                    _ => return self.error("a boolean that is not 0 or 1"),
+                };
                 self.remember(Node::Bool(flag))
             }
             b'i' => {
                 let number = self.number(b';')?;
+                if !is_integer(&number) {
+                    return self.error("an integer that is not a number");
+                }
                 self.remember(Node::Int(number))
             }
             b'd' => {
@@ -696,6 +721,9 @@ impl Php<'_> {
                 self.at += 1;
                 self.expect(b':')?;
                 let number = self.number(b';')?;
+                if !is_integer(&number) {
+                    return self.error("an integer that is not a number");
+                }
                 self.arena.add(Node::Int(number))
             }
             Some(b's') => {
@@ -860,7 +888,8 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 let node = match text.as_str() {
                     "00" => Node::Bool(false),
                     "01" => Node::Bool(true),
-                    _ => Node::Int(text),
+                    text if is_integer(text) => Node::Int(text.to_string()),
+                    _ => return fail(at, "an INT that is not a number"),
                 };
                 push(arena, &mut stack, node)?
             }
@@ -958,7 +987,10 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 arena.fits(length as usize)?;
                 let data = take!(length as usize).to_vec();
                 let node = match opcode {
-                    b'X' => Node::Text(String::from_utf8_lossy(&data).to_string()),
+                    b'X' => match python_text(&data) {
+                        Some(text) => Node::Text(text),
+                        None => return fail(at, "text that is not UTF-8"),
+                    },
                     b'B' => Node::Bytes(data),
                     _ => match String::from_utf8(data) {
                         Ok(text) => Node::Text(text),
@@ -973,7 +1005,10 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 let data = take!(length).to_vec();
                 let node = match opcode {
                     b'C' => Node::Bytes(data),
-                    0x8c => Node::Text(String::from_utf8_lossy(&data).to_string()),
+                    0x8c => match python_text(&data) {
+                        Some(text) => Node::Text(text),
+                        None => return fail(at, "text that is not UTF-8"),
+                    },
                     _ => match String::from_utf8(data) {
                         Ok(text) => Node::Text(text),
                         Err(error) => Node::Bytes(error.into_bytes()),
@@ -987,7 +1022,10 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 arena.fits(length)?;
                 let data = take!(length).to_vec();
                 let node = if opcode == 0x8d {
-                    Node::Text(String::from_utf8_lossy(&data).to_string())
+                    match python_text(&data) {
+                        Some(text) => Node::Text(text),
+                        None => return fail(at, "text that is not UTF-8"),
+                    }
                 } else {
                     Node::Bytes(data)
                 };
@@ -1319,6 +1357,8 @@ impl Java<'_> {
                 let slot = self.handle(Handle::Value(0));
                 let flags = self.u8()?;
                 let count = u16::from_be_bytes(self.array()?);
+                // The field list is kept with the class; counted before it is built.
+                self.arena.entries(usize::from(count))?;
                 let mut fields = Vec::new();
                 for _ in 0..count {
                     let code = self.u8()?;
@@ -1673,6 +1713,39 @@ fn object_items(
     Ok(items)
 }
 
+fn is_integer(text: &str) -> bool {
+    let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Python text as pickled: UTF-8 with surrogates passed through (Python allows lone
+/// surrogates in a str), which stay visible as \u{…}. Anything else that is not UTF-8 is `None`.
+fn python_text(bytes: &[u8]) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                out.push_str(text);
+                return Some(out);
+            }
+            Err(error) => {
+                let (valid, after) = rest.split_at(error.valid_up_to());
+                out.push_str(std::str::from_utf8(valid).ok()?);
+                match after {
+                    [0xED, second @ 0xA0..=0xBF, third @ 0x80..=0xBF, ..] => {
+                        let unit =
+                            0xD000 | (u32::from(second & 0x3F) << 6) | u32::from(third & 0x3F);
+                        out.push_str(&format!("\\u{{{unit:x}}}"));
+                        rest = &after[3..];
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+}
+
 /// Key and value pairs from a flat run of items; `None` when one is left over.
 fn pairs_of(items: &[Id]) -> Option<Vec<(Id, Id)>> {
     if !items.len().is_multiple_of(2) {
@@ -1801,6 +1874,10 @@ fn modified_utf8(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quoted(text: &str) -> String {
+        serde_json::Value::String(text.to_string()).to_string()
+    }
 
     fn hex(text: &str) -> Vec<u8> {
         (0..text.len())
@@ -2205,6 +2282,50 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(decode(Decoder::Pickle, &work).is_ok(), "within the budgets");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_exact_scalars_and_escaped_cuts() {
+        // python3: pickle.dumps(chr(0xd800), protocol=4)
+        assert_eq!(
+            decode(
+                Decoder::Pickle,
+                &hex("80049507000000000000008c03eda080942e")
+            )
+            .unwrap(),
+            r#""\\u{d800}""#
+        );
+        assert!(
+            decode(Decoder::Pickle, b"\x8c\x01\xff.").is_err(),
+            "not UTF-8"
+        );
+        assert!(decode(Decoder::Php, b"b:garbage;").is_err());
+        assert!(decode(Decoder::Php, b"i:garbage;").is_err());
+        assert!(decode(Decoder::Pickle, b"Igarbage\n.").is_err());
+        assert_eq!(decode(Decoder::Php, b"i:-12;").unwrap(), "-12");
+        // A value whose escapes are longer than the limit is cut where the limit is reached,
+        // not dropped.
+        let mut bin = vec![0xc6, 0x00, 0x04, 0x93, 0xe0];
+        bin.extend(std::iter::repeat_n(0_u8, 300_000));
+        let text = decode(Decoder::Msgpack, &bin).unwrap();
+        assert!(
+            text.starts_with(r#"b"\x00\x00"#) && text.ends_with("KB of text"),
+            "{}",
+            &text[..40]
+        );
+        // Descriptors with many fields count those fields.
+        let mut fields = b"\xac\xed\x00\x05".to_vec();
+        for _ in 0..20 {
+            fields.extend_from_slice(&[0x72, 0x00, 0x01, b'D']);
+            fields.extend_from_slice(&[0; 8]);
+            fields.push(0x02);
+            fields.extend_from_slice(&u16::MAX.to_be_bytes());
+            for _ in 0..u16::MAX {
+                fields.extend_from_slice(&[b'I', 0x00, 0x00]);
+            }
+            fields.extend_from_slice(&[0x78, 0x70]);
+        }
+        assert!(decode(Decoder::Java, &fields).is_err());
     }
 
     #[test]
