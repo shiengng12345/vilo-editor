@@ -472,44 +472,33 @@ pub(crate) fn load_command_history() -> anyhow::Result<Vec<String>> {
     }
 }
 
-/// Numbers every history save in this process.
-static HISTORY_SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Serializes history appends from every window of this process.
+static HISTORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The newest history save that reached the file; saves can finish out of order.
-static HISTORY_SAVED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
-
-/// Writes the history through its own temporary file and renames it into place only when no
-/// newer save got there first, so the file always holds a whole and latest snapshot.
-fn save_command_history(history: &[String], save: u64) -> anyhow::Result<()> {
-    save_snapshot(
-        &command_history_path(),
-        &serde_json::to_vec_pretty(history)?,
-        save,
-        &HISTORY_SAVED,
-    )
-}
-
-fn save_snapshot(
-    path: &std::path::Path,
-    bytes: &[u8],
-    save: u64,
-    saved: &std::sync::Mutex<u64>,
-) -> anyhow::Result<()> {
+/// Appends one command to the history file and returns the file's history: read, add, write,
+/// all under one lock, so windows add to each other's history instead of replacing it.
+fn append_history(path: &std::path::Path, line: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+    let _guard = HISTORY_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("history lock poisoned"))?;
+    let mut history: Vec<String> = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    if history.last().map(String::as_str) != Some(line) {
+        history.push(line.to_string());
+    }
+    let excess = history.len().saturating_sub(limit);
+    history.drain(..excess);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temporary = path.with_extension(format!("{save}.tmp"));
-    std::fs::write(&temporary, bytes)?;
-    let mut saved = saved
-        .lock()
-        .map_err(|_| anyhow::anyhow!("history save lock poisoned"))?;
-    if save > *saved {
-        std::fs::rename(&temporary, path)?;
-        *saved = save;
-    } else {
-        std::fs::remove_file(&temporary)?;
-    }
-    Ok(())
+    // The process id keeps two Vilo processes from sharing a temporary file.
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&history)?)?;
+    std::fs::rename(&temporary, path)?;
+    Ok(history)
 }
 
 /// Completes the command name (the first word) from the read commands the Workbench accepts.
@@ -2415,8 +2404,19 @@ impl DatabaseView {
         let searchable = matches!(detail.info.kind.as_str(), "hash" | "set" | "zset" | "list");
         // A list's filter only hides rows, so its command still holds every loaded item.
         let searched = detail.pattern.is_some();
-        let rebuilt = rebuild_command(&detail.key, &detail.value, detail.info.ttl_ms)
-            .map(|(command, more)| (command, searched, more));
+        let rebuilt = rebuild_command(&detail.key, &detail.value, detail.info.ttl_ms).map(
+            |(command, more)| {
+                // A window that ends exactly at the end looks unfinished; the length says otherwise.
+                let more = match (&detail.value, detail.length) {
+                    (Value::List { items, .. }, Some(length)) => (items.len() as u64) < length,
+                    (Value::SortedSet { members, .. }, Some(length)) => {
+                        (members.len() as u64) < length
+                    }
+                    _ => more,
+                };
+                (command, searched, more)
+            },
+        );
         let note = match (&detail.pattern, &detail.local_filter) {
             (Some(pattern), _) => Some(format!(
                 "Matching {} across the whole key",
@@ -2721,22 +2721,24 @@ impl DatabaseView {
 
     fn remember_command(&mut self, line: &str, cx: &mut Context<Self>) {
         self.history_position = None;
-        if self.command_history.last().map(String::as_str) == Some(line) {
-            return;
-        }
-        self.command_history.push(line.to_string());
-        let excess = self.command_history.len().saturating_sub(COMMAND_HISTORY);
-        self.command_history.drain(..excess);
-        // Numbered across every window, so a newer save anywhere wins and temporary files differ.
-        let save = HISTORY_SAVES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let history = self.command_history.clone();
-        let task = cx.background_spawn(async move { save_command_history(&history, save) });
+        let line = line.to_string();
+        let task = cx.background_spawn(async move {
+            append_history(&command_history_path(), &line, COMMAND_HISTORY)
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                this.history_problem = result
-                    .err()
-                    .map(|error| format!("Command history not saved: {error:#}").into());
+                match result {
+                    // The file holds every window's commands, so it becomes this window's history.
+                    Ok(history) => {
+                        this.command_history = history;
+                        this.history_problem = None;
+                    }
+                    Err(error) => {
+                        this.history_problem =
+                            Some(format!("Command history not saved: {error:#}").into())
+                    }
+                }
                 cx.notify();
             })
         })
@@ -3213,16 +3215,31 @@ impl DatabaseView {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn test_newer_snapshot_wins() {
+    fn test_history_appends_from_every_window() {
         let folder = std::env::temp_dir().join(format!("vilo-history-{}", std::process::id()));
         let path = folder.join("history.json");
-        let saved = std::sync::Mutex::new(0);
-        save_snapshot(&path, b"[\"two\"]", 2, &saved).unwrap();
-        // An older save finishing later must not replace the newer file.
-        save_snapshot(&path, b"[\"one\"]", 1, &saved).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"[\"two\"]");
-        save_snapshot(&path, b"[\"three\"]", 3, &saved).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"[\"three\"]");
+        // Two windows, each holding an older copy, add their own commands to the same file.
+        assert_eq!(append_history(&path, "GET a", 3).unwrap(), ["GET a"]);
+        assert_eq!(
+            append_history(&path, "GET b", 3).unwrap(),
+            ["GET a", "GET b"]
+        );
+        assert_eq!(
+            append_history(&path, "GET b", 3).unwrap(),
+            ["GET a", "GET b"],
+            "repeats once"
+        );
+        append_history(&path, "GET c", 3).unwrap();
+        assert_eq!(
+            append_history(&path, "GET d", 3).unwrap(),
+            ["GET b", "GET c", "GET d"]
+        );
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(
+            append_history(&path, "GET e", 3).is_err(),
+            "a damaged file is not overwritten"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"not json");
         assert_eq!(
             std::fs::read_dir(&folder).unwrap().count(),
             1,
