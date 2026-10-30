@@ -481,23 +481,7 @@ impl DatabaseView {
             tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
-        let read = cx.background_spawn(async { mongo_write::read_dangling_writes() });
-        cx.spawn(async move |this, cx| {
-            let result = read.await;
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(dangling) => this.dangling_writes.extend(dangling),
-                    Err(error) => this.audit_problem = Some(
-                        format!(
-                            "Vilo could not check the write log for unfinished writes: {error:#}"
-                        )
-                        .into(),
-                    ),
-                }
-                cx.notify();
-            })
-        })
-        .detach_and_log_err(cx);
+        view.check_write_log(cx);
         let workspace = view.workspace.clone();
         cx.spawn(async move |this, cx| {
             let language = workspace
@@ -1874,6 +1858,35 @@ impl DatabaseView {
 }
 
 impl DatabaseView {
+    /// Reads the write log for writes left without a result; a read failure stays on screen with
+    /// a retry instead of hiding the check.
+    fn check_write_log(&mut self, cx: &mut Context<Self>) {
+        let read = cx.background_spawn(async { mongo_write::read_dangling_writes() });
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(dangling) => {
+                        for entry in dangling {
+                            if !this.dangling_writes.iter().any(|known| known.0 == entry.0) {
+                                this.dangling_writes.push(entry);
+                            }
+                        }
+                        this.audit_problem = None;
+                    }
+                    Err(error) => this.audit_problem = Some(
+                        format!(
+                            "Vilo could not check the write log for unfinished writes: {error:#}"
+                        )
+                        .into(),
+                    ),
+                }
+                cx.notify();
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn render_dangling_writes(&self, cx: &mut Context<Self>) -> AnyElement {
         let count = self.dangling_writes.len();
         v_flex()
@@ -1887,7 +1900,14 @@ impl DatabaseView {
                     h_flex()
                         .gap_2()
                         .child(Icon::new(IconName::Warning).size(IconSize::Small).color(Color::Error))
-                        .child(Label::new(problem).size(LabelSize::Small)),
+                        .child(Label::new(problem).size(LabelSize::Small))
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("database-audit-retry", "Check again")
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(|this, _, _, cx| this.check_write_log(cx))),
+                        ),
                 )
             })
             .when(count > 0, |this| {

@@ -142,6 +142,8 @@ impl DatabaseView {
             .as_ref()
             .is_some_and(|state| state.switching_database())
         {
+            self.write_notice = Some("Wait for the database switch to finish, then edit.".into());
+            cx.notify();
             return;
         }
         if self.redis_writes_locked(&key) {

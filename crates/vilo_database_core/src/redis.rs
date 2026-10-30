@@ -364,33 +364,34 @@ pub fn parse_cluster_nodes(text: &str) -> Vec<ClusterNode> {
             let address = fields[1].split(['@', ',']).next()?.to_string();
             let flags = fields[2].split(',').collect::<Vec<_>>();
             let primary = flags.contains(&"master");
-            let slots = fields[8..]
+            // A range counts only if it lies within the 16384 slots; others are reported as problems.
+            let slot_size = |slot: &str| -> Option<u32> {
+                let (start, end) = slot.split_once('-').unwrap_or((slot, slot));
+                let (start, end) = (start.parse::<u32>().ok()?, end.parse::<u32>().ok()?);
+                (start <= end && end < 16384).then(|| end - start + 1)
+            };
+            let mut slots = Vec::new();
+            let mut slot_count = 0;
+            let mut problems = flags
                 .iter()
-                .filter(|slot| !slot.starts_with('['))
-                .map(|slot| slot.to_string())
+                .filter(|flag| !matches!(**flag, "master" | "slave" | "myself" | "noflags"))
+                .map(|flag| flag.to_string())
                 .collect::<Vec<_>>();
-            let slot_count = slots
-                .iter()
-                .filter_map(|slot| match slot.split_once('-') {
-                    // Checked, so a reversed or out-of-range range from a node in a bad state counts as 0.
-                    Some((start, end)) => end
-                        .parse::<u32>()
-                        .ok()?
-                        .checked_add(1)?
-                        .checked_sub(start.parse::<u32>().ok()?),
-                    None => slot.parse::<u32>().ok().map(|_| 1),
-                })
-                .sum();
+            for slot in fields[8..].iter().filter(|slot| !slot.starts_with('[')) {
+                match slot_size(slot) {
+                    Some(size) => {
+                        slots.push(slot.to_string());
+                        slot_count += size;
+                    }
+                    None => problems.push(format!("bad slot range {slot}")),
+                }
+            }
             Some(ClusterNode {
                 id: fields[0].to_string(),
                 address,
                 primary,
                 primary_id: (fields[3] != "-").then(|| fields[3].to_string()),
-                problems: flags
-                    .iter()
-                    .filter(|flag| !matches!(**flag, "master" | "slave" | "myself" | "noflags"))
-                    .map(|flag| flag.to_string())
-                    .collect(),
+                problems,
                 connected: fields[7] == "connected",
                 slots,
                 slot_count,
@@ -1393,7 +1394,15 @@ broken line";
         assert_eq!(nodes[2].address, "127.0.0.1:47100");
         assert_eq!(nodes[2].slots, vec!["0-5460"]);
         assert_eq!(nodes[2].slot_count, 5461);
-        assert_eq!(nodes[3].problems, vec!["fail"]);
+        assert_eq!(
+            nodes[3].problems,
+            vec![
+                "fail",
+                "bad slot range 9000-8000",
+                "bad slot range 0-4294967295"
+            ]
+        );
+        assert_eq!(nodes[3].slots, vec!["7000"]);
         assert!(!nodes[3].connected);
         assert_eq!(nodes[3].slot_count, 1);
     }

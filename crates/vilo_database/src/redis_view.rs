@@ -12,7 +12,6 @@ use std::{
 use collections::{HashMap, HashSet};
 use gpui::{ClipboardItem, Hsla, Task, UniformListScrollHandle, prelude::*, rgb, uniform_list};
 use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
-use util::ResultExt as _;
 use vilo_database_core::redis::{
     Bytes, ClusterNode, KeyInfo, ScanNode, StreamEntry, format_reply, quote_bytes, split_command,
 };
@@ -190,6 +189,8 @@ pub(crate) struct RedisState {
     database_count: Option<u32>,
     /// Databases with keys, from INFO keyspace.
     keyspace: Vec<(u32, u64)>,
+    /// Why key counts per database are missing, when INFO keyspace failed.
+    keyspace_error: Option<SharedString>,
     /// The database being connected to while a switch is in progress.
     switching: Option<u8>,
     switch_error: Option<SharedString>,
@@ -237,6 +238,7 @@ impl RedisState {
             _tasks: Vec::new(),
             database_count: None,
             keyspace: Vec::new(),
+            keyspace_error: None,
             switching: None,
             switch_error: None,
         }
@@ -548,10 +550,7 @@ impl DatabaseView {
         let connection = self.generation;
         let task = run(cx, async move {
             let count = session.database_count().await;
-            Ok((
-                count,
-                session.keyspace().await.log_err().unwrap_or_default(),
-            ))
+            Ok((count, session.keyspace().await))
         });
         cx.spawn(async move |this, cx| {
             let Ok((count, keyspace)) = task.await else {
@@ -563,7 +562,13 @@ impl DatabaseView {
                 }
                 if let Some(state) = this.redis_state() {
                     state.database_count = count;
-                    state.keyspace = keyspace;
+                    match keyspace {
+                        Ok(keyspace) => state.keyspace = keyspace,
+                        Err(error) => {
+                            state.keyspace_error =
+                                Some(format!("Key counts unavailable: {error:#}").into())
+                        }
+                    }
                     cx.notify();
                 }
             })
@@ -2207,6 +2212,7 @@ impl DatabaseView {
             )
             .min(256);
         let keyspace = state.keyspace.clone();
+        let keyspace_error = state.keyspace_error.clone();
         let view = cx.entity().downgrade();
         h_flex()
             .gap_1()
@@ -2220,8 +2226,12 @@ impl DatabaseView {
                             .tooltip(Tooltip::text("Logical database")),
                     )
                     .menu(move |window, cx| {
-                        let (view, keyspace) = (view.clone(), keyspace.clone());
+                        let (view, keyspace, keyspace_error) =
+                            (view.clone(), keyspace.clone(), keyspace_error.clone());
                         Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            if let Some(error) = &keyspace_error {
+                                menu = menu.label(error.clone());
+                            }
                             for database in 0..count {
                                 let Ok(database) = u8::try_from(database) else {
                                     break;
