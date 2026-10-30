@@ -42,6 +42,9 @@ pub struct ScanNode {
     server: Option<Server>,
 }
 
+/// Marks a consumer group whose name is not text, so nothing is sent with its shown name.
+pub const GROUP_NAME_NOT_TEXT: &str = "vilo:name-not-text";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamConsumer {
     pub name: String,
@@ -1263,7 +1266,8 @@ impl RedisSession {
             .collect())
     }
 
-    /// Consumer groups of a stream: name, consumers, pending, last delivered id, as the server reports them.
+    /// Consumer groups of a stream: name, consumers, pending, last delivered id, as the server
+    /// reports them; a group whose name is not text also carries `GROUP_NAME_NOT_TEXT`.
     pub async fn stream_groups(&self, key: &[u8]) -> Result<Vec<Vec<(String, String)>>> {
         let reply = self
             .call("XINFO", vec!["GROUPS".into(), bytes_arg(key)])
@@ -1272,16 +1276,25 @@ impl RedisSession {
             .into_array()
             .into_iter()
             .map(|group| {
-                pairs(group)
-                    .into_iter()
-                    .map(|(name, value)| {
-                        let text = value
-                            .as_string()
-                            .or_else(|| value.as_i64().map(|number| number.to_string()))
-                            .unwrap_or_else(|| format!("{value:?}"));
-                        (name.as_string().unwrap_or_default(), text)
-                    })
-                    .collect()
+                let mut fields = Vec::new();
+                for (name, value) in pairs(group) {
+                    let name = name.as_string().unwrap_or_default();
+                    // A group name that is not text cannot be named back to Redis from here.
+                    if name == "name"
+                        && !matches!(&value, Value::String(_))
+                        && value
+                            .as_bytes()
+                            .is_none_or(|bytes| std::str::from_utf8(bytes).is_err())
+                    {
+                        fields.push((GROUP_NAME_NOT_TEXT.to_string(), "true".to_string()));
+                    }
+                    let text = value
+                        .as_string()
+                        .or_else(|| value.as_i64().map(|number| number.to_string()))
+                        .unwrap_or_else(|| format!("{value:?}"));
+                    fields.push((name, text));
+                }
+                fields
             })
             .collect())
     }
@@ -2558,6 +2571,41 @@ broken line";
             .unwrap()
         );
         assert!(session.stream_groups(&key).await.unwrap().is_empty());
+        session
+            .call(
+                "XGROUP",
+                vec![
+                    "CREATE".into(),
+                    bytes_arg(&key),
+                    bytes_arg(b"\xff"),
+                    "0".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        let groups = session.stream_groups(&key).await.unwrap();
+        assert!(
+            groups[0]
+                .iter()
+                .any(|(field, _)| field == GROUP_NAME_NOT_TEXT),
+            "a group name that is not text is marked"
+        );
+        session
+            .call(
+                "XGROUP",
+                vec!["CREATE".into(), bytes_arg(&key), "text".into(), "0".into()],
+            )
+            .await
+            .unwrap();
+        let groups = session.stream_groups(&key).await.unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|group| group.iter().any(|(field, _)| field == GROUP_NAME_NOT_TEXT))
+                .count(),
+            1,
+            "a text name is not marked"
+        );
         session.call("DEL", vec![bytes_arg(&key)]).await.unwrap();
     }
 

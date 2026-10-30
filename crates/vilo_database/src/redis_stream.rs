@@ -6,7 +6,9 @@
 
 use gpui::{Window, prelude::*};
 use ui::{Button, IconButton, Tooltip, prelude::*};
-use vilo_database_core::redis::{Bytes, PendingEntry, RedisWrite, StreamConsumer, quote_bytes};
+use vilo_database_core::redis::{
+    Bytes, GROUP_NAME_NOT_TEXT, PendingEntry, RedisWrite, StreamConsumer, quote_bytes,
+};
 
 use crate::{DatabaseView, Fetch, mongo_write, redis_pubsub, redis_write::RedisOp, run};
 
@@ -177,9 +179,16 @@ impl DatabaseView {
         let open = open.filter(|view| view.key == *key);
         let rows = groups.iter().enumerate().map(|(index, group)| {
             let name = field(group, "name").to_string();
+            // Shown, but never opened or destroyed: its shown name is not its real name.
+            let usable = field(group, GROUP_NAME_NOT_TEXT).is_empty();
             let selected = open.is_some_and(|view| view.group == name);
             let summary = format!(
-                "{name}  ·  consumers {}  ·  pending {}  ·  last delivered {}{}",
+                "{name}{}  ·  consumers {}  ·  pending {}  ·  last delivered {}{}",
+                if usable {
+                    ""
+                } else {
+                    " (name is not text; use the CLI)"
+                },
                 field(group, "consumers"),
                 field(group, "pending"),
                 field(group, "last-delivered-id"),
@@ -193,19 +202,23 @@ impl DatabaseView {
                 .px_2()
                 .gap_2()
                 .rounded_sm()
-                .cursor_pointer()
                 .when(selected, |this| this.bg(colors.element_selected))
-                .hover(|style| style.bg(colors.element_hover))
-                .on_click(cx.listener({
-                    let (key, name) = (key.clone(), name.clone());
-                    move |this, _, _, cx| this.open_stream_group(key.clone(), name.clone(), cx)
-                }))
+                .when(usable, |this| {
+                    this.cursor_pointer()
+                        .hover(|style| style.bg(colors.element_hover))
+                        .on_click(cx.listener({
+                            let (key, name) = (key.clone(), name.clone());
+                            move |this, _, _, cx| {
+                                this.open_stream_group(key.clone(), name.clone(), cx)
+                            }
+                        }))
+                })
                 .child(
                     div()
                         .flex_1()
                         .child(Label::new(summary).size(LabelSize::Small).buffer_font(cx)),
                 )
-                .when(writable, |this| {
+                .when(writable && usable, |this| {
                     this.child(
                         IconButton::new(("database-stream-group-destroy", index), IconName::Trash)
                             .icon_size(IconSize::XSmall)
