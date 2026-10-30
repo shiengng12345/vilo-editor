@@ -133,6 +133,7 @@ impl DatabaseView {
                             .redis_state
                             .as_mut()
                             .and_then(|state| state.stream_group.as_mut())
+                            .filter(|view| view.key == key && view.group == group)
                         {
                             view.problem = Some(
                                 format!("Vilo could not record that it was checked: {error:#}")
@@ -331,26 +332,29 @@ impl DatabaseView {
                                         }
                                     })),
                             )
-                            .child(
-                                Button::new(("database-stream-claim", index), "Claim")
-                                    .label_size(LabelSize::Small)
-                                    .disabled(blocked)
-                                    .tooltip(Tooltip::text(
-                                        "XCLAIM: give this entry to another consumer, only if it is still idle as long as shown",
-                                    ))
-                                    .on_click(cx.listener({
-                                        let claim = (
-                                            view.key.clone(),
-                                            view.group.clone(),
-                                            entry.id.clone(),
-                                            u64::try_from(entry.idle_ms).unwrap_or(0),
-                                        );
-                                        move |this, _, window: &mut Window, cx| {
-                                            let (key, group, id, idle) = claim.clone();
-                                            this.start_stream_claim(key, group, id, idle, window, cx)
-                                        }
-                                    })),
-                            )
+                            .when_some(u64::try_from(entry.idle_ms).ok(), |this, idle| {
+                                // A negative idle cannot serve as XCLAIM's minimum, so no claim is offered.
+                                this.child(
+                                    Button::new(("database-stream-claim", index), "Claim")
+                                        .label_size(LabelSize::Small)
+                                        .disabled(blocked)
+                                        .tooltip(Tooltip::text(
+                                            "XCLAIM: give this entry to another consumer, only if it is still idle as long as shown",
+                                        ))
+                                        .on_click(cx.listener({
+                                            let claim = (
+                                                view.key.clone(),
+                                                view.group.clone(),
+                                                entry.id.clone(),
+                                                idle,
+                                            );
+                                            move |this, _, window: &mut Window, cx| {
+                                                let (key, group, id, idle) = claim.clone();
+                                                this.start_stream_claim(key, group, id, idle, window, cx)
+                                            }
+                                        })),
+                                )
+                            })
                         })
                 }))
                 .when(pending.is_empty(), |this| {

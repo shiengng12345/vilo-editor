@@ -155,6 +155,8 @@ pub(crate) struct RedisWriteForm {
     sending: bool,
     message: Option<SharedString>,
     _task: Option<gpui::Task<()>>,
+    /// The operation this form sent, so a later answer only touches the form that sent it.
+    sent: Option<String>,
 }
 
 impl RedisWriteForm {
@@ -346,6 +348,7 @@ impl DatabaseView {
             sending: false,
             message: None,
             _task: None,
+            sent: None,
         };
         // Operations without inputs go straight to review.
         if form.inputs.is_empty() {
@@ -419,6 +422,7 @@ impl DatabaseView {
             sending: false,
             message: None,
             _task: None,
+            sent: None,
         });
         cx.notify();
     }
@@ -659,6 +663,7 @@ impl DatabaseView {
             return;
         }
         let generation = self.generation;
+        let log_checked = self.write_log_checked;
         let Some(form) = &mut self.redis_write else {
             return;
         };
@@ -702,6 +707,15 @@ impl DatabaseView {
                 ),
                 _ => None,
             };
+        // Until the write log was read, an unsettled acknowledgement from before a restart is not known.
+        if group_lock.is_some() && !log_checked {
+            form.message = Some(
+                "Vilo has not finished checking the write log for unsettled writes, so it does not change consumer groups yet."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         if let Some(lock) = &group_lock
             && let Err(unknown) = crate::redis_pubsub::take_operation_lock(lock, &operation)
         {
@@ -717,6 +731,7 @@ impl DatabaseView {
             return;
         }
         form.sending = true;
+        form.sent = Some(operation.clone());
         form.message = Some("Sending…".into());
         let intent = serde_json::json!({
             "time": chrono::Utc::now().to_rfc3339(),
@@ -750,7 +765,9 @@ impl DatabaseView {
                 Ok((outcome, logged))
             }
         });
-        form._task = Some(cx.spawn(async move |this, cx| {
+        // Detached, not owned by the form: the outcome must be recorded and the shared lock
+        // settled even if the form or its window closes first.
+        cx.spawn(async move |this, cx| {
             let (result, logged) = match task.await {
                 Ok((outcome, logged)) => (Ok(outcome), logged),
                 Err(error) => (Err(error), None),
@@ -765,7 +782,7 @@ impl DatabaseView {
                 // Recorded even if the page moved on meanwhile, so the next write still has to check.
                 if let Some(error) = logged {
                     this.unlogged_writes.push((
-                        operation_id,
+                        operation_id.clone(),
                         format!("{summary} · its result is not in the log: {error}"),
                     ));
                 }
@@ -790,7 +807,12 @@ impl DatabaseView {
                     cx.notify();
                     return;
                 }
-                let Some(form) = &mut this.redis_write else {
+                let Some(form) = this
+                    .redis_write
+                    .as_mut()
+                    .filter(|form| form.sent.as_deref() == Some(operation_id.as_str()))
+                else {
+                    cx.notify();
                     return;
                 };
                 form.sending = false;
@@ -843,7 +865,8 @@ impl DatabaseView {
                 cx.notify();
             })
             .ok();
-        }));
+        })
+        .detach();
         cx.notify();
     }
 

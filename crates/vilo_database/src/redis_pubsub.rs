@@ -252,6 +252,14 @@ pub(crate) fn settle_operation_lock(lock: &str, operation: &str, unknown: bool) 
     }
 }
 
+/// An XACK or XCLAIM still holding its group's lock; it is settled only from its group panel.
+pub(crate) fn group_operation(operation: &str) -> bool {
+    publish_locks()
+        .held
+        .iter()
+        .any(|(lock, (owner, _))| owner == operation && lock.contains("/stream/"))
+}
+
 /// The operation holding a lock, and whether its outcome is unknown.
 pub(crate) fn operation_lock(lock: &str) -> Option<(String, bool)> {
     publish_locks().held.get(lock).cloned()

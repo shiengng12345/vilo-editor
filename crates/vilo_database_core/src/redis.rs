@@ -1298,7 +1298,7 @@ impl RedisSession {
                 ],
             )
             .await?;
-        Ok(reply
+        reply
             .into_array()
             .into_iter()
             .map(|consumer| {
@@ -1312,19 +1312,22 @@ impl RedisSession {
                         .find(|(field, _)| field == name)
                         .and_then(|(_, value)| value.as_i64())
                 };
-                StreamConsumer {
-                    name: fields
-                        .iter()
-                        .find(|(field, _)| field == "name")
-                        .and_then(|(_, value)| value.as_string())
-                        .unwrap_or_default(),
-                    pending: number("pending").unwrap_or(0),
-                    idle_ms: number("idle").unwrap_or(0),
-                    // Redis 7.2 and later.
-                    inactive_ms: number("inactive"),
-                }
+                let name = fields
+                    .iter()
+                    .find(|(field, _)| field == "name")
+                    .and_then(|(_, value)| value.as_string());
+                let read = || -> Option<StreamConsumer> {
+                    Some(StreamConsumer {
+                        name: name?,
+                        pending: number("pending")?,
+                        idle_ms: number("idle")?,
+                        // Redis 7.2 and later.
+                        inactive_ms: number("inactive"),
+                    })
+                };
+                read().context("XINFO CONSUMERS returned a consumer Vilo cannot read")
             })
-            .collect())
+            .collect()
     }
 
     /// The first `count` pending entries of a group (XPENDING … - + count), oldest first.
@@ -1346,19 +1349,24 @@ impl RedisSession {
                 ],
             )
             .await?;
-        Ok(reply
+        // A reply Vilo cannot read is an error, never fewer pending entries than there are.
+        reply
             .into_array()
             .into_iter()
-            .filter_map(|entry| {
+            .map(|entry| {
                 let mut parts = entry.into_array().into_iter();
-                Some(PendingEntry {
-                    id: parts.next()?.as_string()?,
-                    consumer: parts.next()?.as_string()?,
-                    idle_ms: parts.next()?.as_i64()?,
-                    deliveries: parts.next()?.as_i64()?,
-                })
+                let mut next = || parts.next();
+                let mut read = || -> Option<PendingEntry> {
+                    Some(PendingEntry {
+                        id: next()?.as_string()?,
+                        consumer: next()?.as_string()?,
+                        idle_ms: next()?.as_i64()?,
+                        deliveries: next()?.as_i64()?,
+                    })
+                };
+                read().context("XPENDING returned an entry Vilo cannot read")
             })
-            .collect())
+            .collect()
     }
 
     /// A RedisJSON document as JSON text, when the module is loaded.

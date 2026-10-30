@@ -2038,10 +2038,12 @@ impl DatabaseView {
                                 .label_size(LabelSize::Small)
                                 .style(ButtonStyle::Outlined)
                                 .on_click(cx.listener(|this, _, _, cx| {
+                                    // Consumer group acknowledgements and claims are checked in their group.
                                     let operations = this
                                         .writes_to_check()
                                         .into_iter()
                                         .map(|(operation, _)| operation)
+                                        .filter(|operation| !redis_pubsub::group_operation(operation))
                                         .collect::<Vec<_>>();
                                     let task = cx.background_spawn({
                                         let operations = operations.clone();
@@ -2086,7 +2088,12 @@ impl DatabaseView {
                         .id("database-dangling-list")
                         .max_h(px(160.))
                         .overflow_y_scroll()
-                        .children(writes.into_iter().map(|(_, summary)| {
+                        .children(writes.into_iter().map(|(operation, summary)| {
+                            let summary = if redis_pubsub::group_operation(&operation) {
+                                format!("{summary} · check it in its consumer group")
+                            } else {
+                                summary
+                            };
                             Label::new(summary)
                                 .size(LabelSize::XSmall)
                                 .buffer_font(cx)
