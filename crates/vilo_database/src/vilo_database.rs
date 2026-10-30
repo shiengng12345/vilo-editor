@@ -283,13 +283,14 @@ impl RedisFields {
             port: if port.is_empty() {
                 None
             } else {
-                Some(port.parse().context("SSH port must be a number")?)
+                Some(port.parse().context("SSH port must be from 1 to 65535")?)
             },
             user: text(&self.ssh_user),
             key_file: (!key.is_empty()).then(|| PathBuf::from(key)),
             known_hosts: None,
         };
         anyhow::ensure!(!settings.host.is_empty(), "Fill in the SSH host.");
+        anyhow::ensure!(settings.port != Some(0), "SSH port must be from 1 to 65535");
         Ok(settings)
     }
 

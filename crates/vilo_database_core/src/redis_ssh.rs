@@ -31,6 +31,8 @@ pub struct SshSettings {
 }
 
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
+/// A control command asks the local master only; it never needs long.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 /// What is kept of the master's error output, the end of it, for saying why it failed.
 const LOG_BYTES: usize = 8 * 1024;
 
@@ -42,7 +44,7 @@ pub struct SshTunnel {
     /// The end of the master's error output. It is read all along, since a full pipe would
     /// stop ssh, and every forward with it.
     log: Arc<std::sync::Mutex<Vec<u8>>>,
-    _drain: tokio::task::JoinHandle<()>,
+    drain: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Redis host and port to the local port forwarding to it.
     forwards: tokio::sync::Mutex<HashMap<(String, u16), u16>>,
 }
@@ -145,7 +147,7 @@ impl SshTunnel {
             control,
             master: std::sync::Mutex::new(Some(master)),
             log,
-            _drain: drain,
+            drain: tokio::sync::Mutex::new(Some(drain)),
             forwards: Default::default(),
         });
         tunnel.wait_ready().await?;
@@ -198,9 +200,17 @@ impl SshTunnel {
         }
     }
 
-    /// What ssh said before it exited; the drain is given a moment to take its last words.
+    /// What ssh said. Once it exited, the drain is waited for (briefly), so its last words are in.
     async fn master_error(&self) -> String {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let exited = self
+            .master()
+            .as_mut()
+            .is_none_or(|master| master.try_wait().ok().flatten().is_some());
+        if exited && let Some(drain) = self.drain.lock().await.take() {
+            tokio::time::timeout(Duration::from_secs(1), drain)
+                .await
+                .ok();
+        }
         let log = self
             .log
             .lock()
@@ -231,14 +241,19 @@ impl SshTunnel {
                     continue;
                 }
             };
-            let output = Command::new("ssh")
-                .args(["-O", "forward", "-L"])
-                .arg(format!("127.0.0.1:{local}:{target}:{port}"))
-                .args(&self.arguments)
-                .stdin(Stdio::null())
-                .output()
-                .await
-                .context("Could not run ssh")?;
+            let output = tokio::time::timeout(
+                CONTROL_TIMEOUT,
+                Command::new("ssh")
+                    .args(["-O", "forward", "-L"])
+                    .arg(format!("127.0.0.1:{local}:{target}:{port}"))
+                    .args(&self.arguments)
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .context("The SSH master did not answer in time")?
+            .context("Could not run ssh")?;
             if output.status.success() {
                 forwards.insert((host.to_string(), port), local);
                 return Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, local)));
