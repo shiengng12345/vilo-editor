@@ -14,4 +14,5 @@ pub mod redis_docs;
 pub mod redis_monitor;
 pub mod redis_pubsub;
 pub mod redis_search;
+pub mod redis_workbench;
 pub mod shell;

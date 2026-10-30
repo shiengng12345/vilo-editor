@@ -653,7 +653,7 @@ pub fn search_pattern(text: &str) -> Option<Vec<u8>> {
 /// MEMORY USAGE, OBJECT ENCODING, XINFO GROUPS or XGROUP CREATE is the subcommand, not the key, so every such
 /// call would go to one node and be redirected until it gives up. fred honours only an explicit
 /// slot for custom commands (not an argument offset), so the key's slot is given.
-fn cluster_hash(name: &str, args: &[Value]) -> fred::types::ClusterHash {
+pub(crate) fn cluster_hash(name: &str, args: &[Value]) -> fred::types::ClusterHash {
     let subcommand_first = ["MEMORY", "OBJECT", "XINFO", "XGROUP"]
         .iter()
         .any(|command| command.eq_ignore_ascii_case(name));

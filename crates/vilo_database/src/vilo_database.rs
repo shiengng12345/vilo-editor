@@ -7,6 +7,7 @@ mod redis_pubsub;
 mod redis_search;
 mod redis_stream;
 mod redis_view;
+mod redis_workbench;
 mod redis_write;
 
 use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
@@ -368,6 +369,7 @@ pub struct DatabaseView {
     redis_write: Option<redis_write::RedisWriteForm>,
     admin_write: Option<redis_analyze::AdminWriteForm>,
     bulk_delete: Option<redis_bulk::BulkForm>,
+    workbench_run: Option<redis_workbench::WorkbenchRun>,
     /// Production connections with writes switched on for this run of Vilo only.
     session_writes: collections::HashSet<String>,
     /// Documents whose last write has an unknown outcome; writing to them waits for a refresh.
@@ -541,6 +543,7 @@ impl DatabaseView {
             redis_write: None,
             admin_write: None,
             bulk_delete: None,
+            workbench_run: None,
             session_writes: Default::default(),
             unknown_writes: Default::default(),
             write_log_checked: false,
@@ -793,6 +796,13 @@ impl DatabaseView {
             .is_some_and(redis_bulk::BulkForm::closable)
         {
             self.bulk_delete = None;
+        }
+        if self
+            .workbench_run
+            .as_ref()
+            .is_some_and(redis_workbench::WorkbenchRun::closable)
+        {
+            self.workbench_run = None;
         }
         self.tasks.clear();
     }
@@ -2133,6 +2143,8 @@ impl Render for DatabaseView {
             Some((false, self.render_admin_write(form, cx)))
         } else if let Some(form) = &self.bulk_delete {
             Some((false, self.render_bulk_delete(form, cx)))
+        } else if let Some(run) = &self.workbench_run {
+            Some((false, self.render_workbench_run(run, cx)))
         } else if let Some(form) = &self.redis_write {
             Some((false, self.render_redis_write(form, cx)))
         } else if let Some(write) = &self.doc_write {
@@ -2259,6 +2271,10 @@ impl Render for DatabaseView {
                             } else if let Some(form) = &this.bulk_delete {
                                 if form.closable() {
                                     this.bulk_delete = None;
+                                }
+                            } else if let Some(run) = &this.workbench_run {
+                                if run.closable() {
+                                    this.workbench_run = None;
                                 }
                             } else if let Some(form) = &this.redis_write {
                                 if !form.sending_now() {

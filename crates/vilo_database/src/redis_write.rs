@@ -165,7 +165,7 @@ impl RedisWriteForm {
     }
 }
 
-fn lock_key(connection: &str, database: u8, key: &[u8]) -> String {
+pub(crate) fn lock_key(connection: &str, database: u8, key: &[u8]) -> String {
     format!("{connection}/redis/db{database}/{}", quote_bytes(key))
 }
 

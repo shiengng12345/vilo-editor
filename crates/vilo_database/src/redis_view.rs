@@ -286,7 +286,7 @@ pub(crate) struct RedisState {
     /// The command picked from the helper's list; with none, the helper follows what is typed.
     helper_selected: Option<&'static CommandDoc>,
     helper_scroll: UniformListScrollHandle,
-    workbench: Vec<(String, Result<Vec<String>, String>)>,
+    pub(crate) workbench: Vec<(String, Result<Vec<String>, String>)>,
     info: Option<Fetch<String>>,
     topology: Option<Fetch<Topology>>,
     stats: Stats,
@@ -957,8 +957,10 @@ impl DatabaseView {
             return;
         };
         // A write must finish or be closed first; its result belongs to the database it was sent to.
-        let editing =
-            self.redis_write.is_some() || self.admin_write.is_some() || self.bulk_delete.is_some();
+        let editing = self.redis_write.is_some()
+            || self.admin_write.is_some()
+            || self.bulk_delete.is_some()
+            || self.workbench_run.is_some();
         let Some(state) = self.redis_state() else {
             return;
         };
@@ -1010,6 +1012,13 @@ impl DatabaseView {
                             .is_some_and(|form| form.closable())
                         {
                             this.bulk_delete = None;
+                        }
+                        if this
+                            .workbench_run
+                            .as_ref()
+                            .is_some_and(|run| run.closable())
+                        {
+                            this.workbench_run = None;
                         }
                         this.redis_state = Some(RedisState::new());
                         this.start_redis_stats(cx);
@@ -1075,7 +1084,8 @@ impl DatabaseView {
                             }
                             let busy = this.redis_write.is_some()
                                 || this.admin_write.is_some()
-                                || this.bulk_delete.is_some();
+                                || this.bulk_delete.is_some()
+                                || this.workbench_run.is_some();
                             let Some(state) = this.redis_state() else {
                                 return false;
                             };
@@ -1676,12 +1686,41 @@ impl DatabaseView {
         }
         self.workbench_input
             .update(cx, |editor, cx| editor.set_text("", window, cx));
-        // Only commands the Workbench would run are kept, so Up never recalls a refused write.
-        if split_command(&line).is_ok_and(|words| {
-            vilo_database_core::redis::classify_words(&words)
-                == vilo_database_core::redis::CommandKind::Read
-        }) {
+        use vilo_database_core::redis_workbench::{Planned, plan};
+        let planned = split_command(&line).and_then(plan);
+        // Only commands the Workbench would run are kept, so Up never recalls a refused one.
+        if planned.is_ok() {
             self.remember_command(&line, cx);
+        }
+        match planned {
+            Ok(Planned::Read(_)) => {}
+            Ok(write @ Planned::Write(_)) => {
+                let writable = self
+                    .active_connection()
+                    .is_some_and(|connection| self.writes_allowed(connection));
+                if writable {
+                    self.open_workbench_run(
+                        "the Workbench".into(),
+                        vec![(1, line, write)],
+                        window,
+                        cx,
+                    );
+                } else if let Some(state) = self.redis_state() {
+                    state.workbench.push((
+                        line,
+                        Err("This is a write. Switch writes on (top bar) to run it.".into()),
+                    ));
+                    cx.notify();
+                }
+                return;
+            }
+            Err(error) => {
+                if let Some(state) = self.redis_state() {
+                    state.workbench.push((line, Err(format!("{error:#}"))));
+                    cx.notify();
+                }
+                return;
+            }
         }
         let connection = self.generation;
         let Some(state) = self.redis_state() else {
@@ -3357,9 +3396,20 @@ impl DatabaseView {
                 this.child(Label::new(problem).size(LabelSize::Small).color(Color::Warning))
             })
             .child(
-                Label::new("Read commands only in this release. Writes, KEYS, FLUSH*, CONFIG, MONITOR, scripts and risky subcommands are refused before sending.")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Label::new("Reads run at once. Writes from Vilo's reviewed list run after a confirm step, logged and sent once; KEYS, FLUSH*, CONFIG, MONITOR, scripts, functions and connection commands are refused before sending.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("database-workbench-file", "Run a command file…")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(|this, _, window, cx| this.pick_command_file(window, cx))),
+                    ),
             )
             .child(if lines.is_empty() {
                 Label::new("Run a command such as HGETALL user:1 or XINFO GROUPS orders.").color(Color::Muted).into_any_element()
