@@ -513,6 +513,18 @@ impl DatabaseView {
         self.redis_state.as_mut()
     }
 
+    pub(crate) fn close_redis_key(&mut self) {
+        if let Some(state) = self.redis_state() {
+            state.panel = RightPanel::Empty;
+            state.selected = None;
+            state.detail = None;
+        }
+    }
+
+    pub(crate) fn reopen_redis_key(&mut self, key: Bytes, cx: &mut Context<Self>) {
+        self.open_key(key, cx);
+    }
+
     /// Polls INFO and DBSIZE every few seconds while the Redis connection is open, for the top bar.
     pub(crate) fn start_redis_stats(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.redis() else {
@@ -817,6 +829,11 @@ impl DatabaseView {
             this.update(cx, |this, cx| {
                 if this.generation != connection {
                     return;
+                }
+                // A fresh read shows what an unknown write did, so the key's lock can go.
+                if result.is_ok() {
+                    this.clear_redis_lock(&key);
+                    this.write_notice = None;
                 }
                 if let Some(state) = this.redis_state()
                     && state.selected.as_ref() == Some(&key)
@@ -1390,6 +1407,9 @@ impl DatabaseView {
             _ => None,
         };
         let key = detail.key.clone();
+        let writable = self
+            .active_connection()
+            .is_some_and(|connection| self.writes_allowed(connection));
         v_flex()
             .size_full()
             .gap_3()
@@ -1413,6 +1433,52 @@ impl DatabaseView {
                             }),
                     )
                     .child(div().flex_1())
+                    .child({
+                        let view = cx.entity().downgrade();
+                        let key = detail.key.clone();
+                        let current = match &detail.value {
+                            Value::String(value) => value.clone(),
+                            _ => None,
+                        };
+                        let ops = crate::redis_write::RedisOp::for_kind(&detail.info.kind);
+                        PopoverMenu::new("database-redis-edit")
+                            .trigger(
+                                Button::new("database-redis-edit-button", "Edit")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Outlined)
+                                    .start_icon(Icon::new(IconName::Pencil).size(IconSize::XSmall))
+                                    .end_icon(
+                                        Icon::new(IconName::ChevronDown).size(IconSize::XSmall),
+                                    )
+                                    .disabled(!writable)
+                                    .tooltip(Tooltip::text(if writable {
+                                        "Change this key"
+                                    } else {
+                                        "Switch writes on (top bar) to change keys"
+                                    })),
+                            )
+                            .menu(move |window, cx| {
+                                let (view, key, current, ops) =
+                                    (view.clone(), key.clone(), current.clone(), ops.clone());
+                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    for op in ops {
+                                        if op == crate::redis_write::RedisOp::Rename {
+                                            menu = menu.separator();
+                                        }
+                                        let (view, key, current) =
+                                            (view.clone(), key.clone(), current.clone());
+                                        menu = menu.entry(op.label(), None, move |window, cx| {
+                                            let (key, current) = (key.clone(), current.clone());
+                                            view.update(cx, |this, cx| {
+                                                this.start_redis_write(op, key, current, window, cx)
+                                            })
+                                            .ok();
+                                        });
+                                    }
+                                    menu
+                                }))
+                            })
+                    })
                     .child(
                         IconButton::new("database-redis-reload-key", IconName::RotateCw)
                             .icon_size(IconSize::Small)
@@ -1858,6 +1924,19 @@ impl DatabaseView {
                             .tooltip(Tooltip::text("Database information (INFO)"))
                             .on_click(cx.listener(|this, _, _, cx| this.show_info(cx))),
                     )
+                    .child({
+                        let writable = self.writes_allowed(connection);
+                        Button::new("database-redis-writes", if writable { "Writes on" } else { "Read only" })
+                            .label_size(LabelSize::Small)
+                            .style(if writable { ButtonStyle::Tinted(ui::TintColor::Warning) } else { ButtonStyle::Outlined })
+                            .start_icon(Icon::new(if writable { IconName::LockOff } else { IconName::Lock }).size(IconSize::XSmall))
+                            .tooltip(Tooltip::text(if crate::mongo_write::guarded(connection) {
+                                "Production (or no environment): writes switch off again when Vilo restarts, and each write needs the connection name typed."
+                            } else {
+                                "Allow changing keys on this connection."
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_writes(cx)))
+                    })
                     .child(div().flex_1())
                     .child(stat(
                         IconName::Sparkle,
@@ -1931,6 +2010,19 @@ impl DatabaseView {
                             )),
                     ),
             )
+            .when_some(self.write_notice.clone(), |this, notice| {
+                this.child(
+                    h_flex()
+                        .mx_4()
+                        .mt_2()
+                        .p_2()
+                        .gap_2()
+                        .rounded_md()
+                        .bg(cx.theme().status().warning_background)
+                        .child(Icon::new(IconName::Warning).size(IconSize::Small).color(Color::Warning))
+                        .child(Label::new(notice).size(LabelSize::Small)),
+                )
+            })
             .child(div().flex_1().min_h_0().child(body))
             .when(state.cli_open, |this| {
                 this.child(

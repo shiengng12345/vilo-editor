@@ -599,6 +599,20 @@ impl RedisSession {
         Ok(value.as_bytes().map(<[u8]>::to_vec))
     }
 
+    /// One hash field's value, or `None` when the field or the key is missing.
+    pub async fn hash_get(&self, key: &[u8], field: &[u8]) -> Result<Option<Bytes>> {
+        let value = self.call("HGET", vec![bytes_arg(key), bytes_arg(field)]).await?;
+        Ok(value.as_bytes().map(<[u8]>::to_vec))
+    }
+
+    /// One sorted-set member's score as the server writes it, or `None` when it is missing.
+    pub async fn zset_score(&self, key: &[u8], member: &[u8]) -> Result<Option<String>> {
+        let value = self.call("ZSCORE", vec![bytes_arg(key), bytes_arg(member)]).await?;
+        Ok(value
+            .as_string()
+            .or_else(|| value.as_f64().map(|score| score.to_string())))
+    }
+
     pub async fn hash_page(
         &self,
         key: &[u8],

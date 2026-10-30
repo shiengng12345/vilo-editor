@@ -96,7 +96,7 @@ fn target_key(connection: &str, database: &str, collection: &str, id: &Bson) -> 
 }
 
 /// Appends one line to the write log; a write is not sent if its intent cannot be logged.
-fn audit(line: serde_json::Value) -> Result<()> {
+pub(crate) fn audit(line: serde_json::Value) -> Result<()> {
     let path = paths::config_dir().join("database_audit.log");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
