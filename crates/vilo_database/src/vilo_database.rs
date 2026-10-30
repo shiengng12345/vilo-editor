@@ -1410,20 +1410,6 @@ impl DatabaseView {
                     .h(px(26.))
                     .pl_3()
                     .pr_1()
-                    .child(
-                        Label::new(
-                            format!(
-                                "{} · {} · {}",
-                                self.kind_view.label(),
-                                self.current(Level::Site),
-                                self.current(Level::Environment)
-                            )
-                            .to_uppercase(),
-                        )
-                        .size(LabelSize::XSmall)
-                        .weight(gpui::FontWeight::SEMIBOLD)
-                        .color(Color::Muted),
-                    )
                     .child(div().flex_1())
                     .child(
                         h_flex()
