@@ -68,6 +68,31 @@ pub fn split_tls_scheme(uri: &str) -> (String, bool) {
     }
 }
 
+/// The plain schemes fred is given; anything else is refused before fred sees it, since fred
+/// takes any scheme starting with `rediss` as TLS and would build its own TLS settings.
+const PLAIN_SCHEMES: &[&str] = &[
+    "redis",
+    "redis-cluster",
+    "redis-sentinel",
+    "valkey",
+    "valkey-cluster",
+    "valkey-sentinel",
+];
+
+/// Like `split_tls_scheme`, refusing schemes that are not Redis connection strings.
+pub fn plain_url(uri: &str) -> Result<(String, bool)> {
+    let (url, tls) = split_tls_scheme(uri);
+    let scheme = url
+        .split_once("://")
+        .map(|(scheme, _)| scheme)
+        .unwrap_or_default();
+    anyhow::ensure!(
+        PLAIN_SCHEMES.contains(&scheme),
+        "That is not a Redis connection string; it starts with redis://, rediss://, redis-cluster:// or rediss-cluster://."
+    );
+    Ok((url, tls))
+}
+
 /// Whether a Redis connection string asks for TLS.
 pub fn tls_scheme(uri: &str) -> bool {
     split_tls_scheme(uri).1
@@ -270,6 +295,13 @@ mod tests {
         assert_eq!(
             split_tls_scheme("REDIS://h:1"),
             ("redis://h:1".to_string(), false)
+        );
+        for refused in ["redissx://h:1", "http://h", "h:6379", "mongodb://h"] {
+            assert!(plain_url(refused).is_err(), "{refused}");
+        }
+        assert_eq!(
+            plain_url("Rediss://h:1").unwrap(),
+            ("redis://h:1".to_string(), true)
         );
     }
 
@@ -502,6 +534,20 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_unknown_schemes_are_refused_before_fred_sees_them() {
+        // fred would take this as TLS and build its own settings, which needs a process
+        // provider; it must be an error, not a panic.
+        let error = crate::redis::RedisSession::connect("redissx://127.0.0.1:1")
+            .await
+            .err()
+            .expect("an unknown scheme");
+        assert!(
+            format!("{error:#}").contains("not a Redis connection string"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

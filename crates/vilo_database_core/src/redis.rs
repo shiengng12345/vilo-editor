@@ -747,7 +747,7 @@ impl RedisSession {
     ) -> Result<Self> {
         // Parsed without its TLS scheme: fred would build its own TLS settings for `rediss`,
         // which needs a process-wide crypto provider; Vilo's own settings are set below.
-        let (url, tls_scheme) = crate::redis_tls::split_tls_scheme(url);
+        let (url, tls_scheme) = crate::redis_tls::plain_url(url)?;
         let mut config = Config::from_url(&url).context("The Redis URL is not valid")?;
         let host = url_host(&url)?;
         let tls_config = match (tls_scheme, tls) {
