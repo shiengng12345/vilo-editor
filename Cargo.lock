@@ -20140,6 +20140,7 @@ dependencies = [
  "gpui",
  "gpui_tokio",
  "log",
+ "menu",
  "paths",
  "serde",
  "serde_json",
@@ -20155,6 +20156,7 @@ name = "vilo_database_core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "fred",
  "futures 0.3.34",
  "mongodb",

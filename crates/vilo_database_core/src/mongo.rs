@@ -93,6 +93,17 @@ impl MongoSession {
         Ok(self.client.database(database).collection::<Document>(collection).estimated_document_count().await?)
     }
 
+    /// How many documents match, within `max_time`; slow counts give up rather than hold the page.
+    pub async fn count(&self, database: &str, collection: &str, filter: Document, max_time: Duration) -> Result<u64> {
+        Ok(self
+            .client
+            .database(database)
+            .collection::<Document>(collection)
+            .count_documents(filter)
+            .max_time(max_time)
+            .await?)
+    }
+
     pub async fn find_page(&self, request: &FindRequest) -> Result<FindPage> {
         let collection = self.client.database(&request.database).collection::<Document>(&request.collection);
         let page_size = request.page_size.max(1);
@@ -187,5 +198,6 @@ mod tests {
         assert!(session.databases().await.unwrap().iter().any(|database| database.name == "vilo_test"));
         assert_eq!(session.collections("vilo_test").await.unwrap()[0].name, "paging");
         assert_eq!(session.estimated_count("vilo_test", "paging").await.unwrap(), 5);
+        assert_eq!(session.count("vilo_test", "paging", doc! { "index": { "$gte": 3 } }, Duration::from_secs(5)).await.unwrap(), 2);
     }
 }
