@@ -708,7 +708,7 @@ impl DatabaseView {
                     "mongodb://… or redis://…"
                 },
                 "",
-                true,
+                false,
                 window,
                 cx,
             ),
@@ -717,6 +717,24 @@ impl DatabaseView {
             checking: false,
             _task: None,
         });
+        // Editing shows the saved connection string so it can be checked or changed in place.
+        if let Some(connection) = existing
+            && let Some(form) = &mut self.form
+        {
+            let uri = form.uri.clone();
+            let read = cx.read_credentials(&connection.credential_url());
+            form._task = Some(cx.spawn_in(window, async move |_, cx| match read.await {
+                Ok(Some((_, saved))) => {
+                    let saved = String::from_utf8_lossy(&saved).to_string();
+                    uri.update_in(cx, |uri, window, cx| uri.set_text(saved, window, cx))
+                        .log_err();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    log::error!("Could not read the saved connection string: {error:#}")
+                }
+            }));
+        }
         cx.notify();
     }
 
@@ -1222,15 +1240,6 @@ impl DatabaseView {
                                 this.open_form(Some(edit_id.clone()), window, cx)
                             },
                         )),
-                    )
-                    .child(
-                        Label::new(connection.environment.clone())
-                            .size(LabelSize::XSmall)
-                            .color(if connection.production() {
-                                Color::Warning
-                            } else {
-                                Color::Muted
-                            }),
                     );
                 tree = tree.child(row);
                 if !mongo_open {
@@ -1390,7 +1399,7 @@ impl DatabaseView {
             }
         }
         v_flex()
-            .w(px(300.))
+            .w(px(240.))
             .flex_none()
             .h_full()
             .border_r_1()
