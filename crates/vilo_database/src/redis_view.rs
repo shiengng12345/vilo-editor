@@ -309,31 +309,38 @@ fn group_thousands(number: u64) -> String {
     out
 }
 
-/// RedisInsight's filled type badges. Colours approximate its palette.
+/// Type badges: a tint of the type's colour with the name in that colour, like the index pills.
 fn type_badge(kind: &str) -> (&'static str, Hsla) {
     let (label, color) = match kind {
-        "hash" => ("HASH", 0x364CFF),
-        "list" => ("LIST", 0x008556),
-        "set" => ("SET", 0x9C5C2B),
-        "zset" => ("SORTED SET", 0xA80A62),
-        "string" => ("STRING", 0x6A1DC3),
-        "ReJSON-RL" => ("JSON", 0x3F4B5F),
-        "stream" => ("STREAM", 0x6A741B),
-        "none" => ("GONE", 0x5C6370),
-        "" => ("…", 0x3B3F46),
-        _ => ("OTHER", 0x5C6370),
+        "hash" => ("HASH", 0x5C8DFF),
+        "list" => ("LIST", 0x00C78A),
+        "set" => ("SET", 0xFF8C42),
+        "zset" => ("ZSET", 0xFF5FA2),
+        "string" => ("STRING", 0xB45AF2),
+        "ReJSON-RL" => ("JSON", 0xFFC010),
+        "stream" => ("STREAM", 0xC2D34A),
+        "none" => ("GONE", 0x889397),
+        "" => ("…", 0x889397),
+        _ => ("OTHER", 0x889397),
     };
     (label, rgb(color).into())
 }
 
 fn badge(kind: &str) -> impl IntoElement {
     let (label, color) = type_badge(kind);
-    div().px_1p5().rounded_sm().bg(color).child(
-        Label::new(label)
-            .size(LabelSize::XSmall)
-            .weight(gpui::FontWeight::SEMIBOLD)
-            .color(Color::Custom(gpui::white())),
-    )
+    div()
+        .flex_none()
+        .px_1p5()
+        .rounded_md()
+        .border_1()
+        .border_color(color.opacity(0.45))
+        .bg(color.opacity(0.14))
+        .child(
+            Label::new(label)
+                .size(LabelSize::XSmall)
+                .weight(gpui::FontWeight::SEMIBOLD)
+                .color(Color::Custom(color)),
+        )
 }
 
 /// A value in the chosen format; JSON pretty-prints only when the bytes are valid JSON.
@@ -1071,7 +1078,7 @@ impl DatabaseView {
                                     view.update(cx, |this, cx| this.open_key(key, cx)).ok();
                                 })
                                 .child(div().w(px(depth as f32 * 18. + 4.)).flex_none())
-                                .child(div().w(px(92.)).flex_none().child(badge(&info.kind)))
+                                .child(h_flex().w(px(60.)).flex_none().child(badge(&info.kind)))
                                 .child(
                                     div()
                                         .flex_1()
