@@ -45,13 +45,32 @@ impl Default for RedisTls {
     }
 }
 
-/// Whether a Redis connection string asks for TLS: `rediss://`, `rediss-cluster://`,
-/// `rediss-sentinel://` and their `valkeys` forms.
+/// The TLS schemes and the plain scheme each is parsed as.
+const TLS_SCHEMES: &[(&str, &str)] = &[
+    ("rediss", "redis"),
+    ("rediss-cluster", "redis-cluster"),
+    ("rediss-sentinel", "redis-sentinel"),
+    ("valkeys", "valkey"),
+    ("valkeys-cluster", "valkey-cluster"),
+    ("valkeys-sentinel", "valkey-sentinel"),
+];
+
+/// The connection string with a TLS scheme replaced by its plain one (any letter case), and
+/// whether it asked for TLS.
+pub fn split_tls_scheme(uri: &str) -> (String, bool) {
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return (uri.to_string(), false);
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    match TLS_SCHEMES.iter().find(|(tls, _)| *tls == scheme) {
+        Some((_, plain)) => (format!("{plain}://{rest}"), true),
+        None => (format!("{scheme}://{rest}"), false),
+    }
+}
+
+/// Whether a Redis connection string asks for TLS.
 pub fn tls_scheme(uri: &str) -> bool {
-    uri.split_once("://").is_some_and(|(scheme, _)| {
-        let scheme = scheme.to_ascii_lowercase();
-        scheme.starts_with("rediss") || scheme.starts_with("valkeys")
-    })
+    split_tls_scheme(uri).1
 }
 
 fn provider() -> Arc<CryptoProvider> {
@@ -235,9 +254,23 @@ mod tests {
         ] {
             assert!(tls_scheme(uri), "{uri}");
         }
-        for uri in ["redis://h", "redis-cluster://h", "h:6379", ""] {
+        for uri in [
+            "redis://h",
+            "redis-cluster://h",
+            "redissx://h",
+            "h:6379",
+            "",
+        ] {
             assert!(!tls_scheme(uri), "{uri}");
         }
+        assert_eq!(
+            split_tls_scheme("ReDiSs-Cluster://u:p@h:1?node=x:2"),
+            ("redis-cluster://u:p@h:1?node=x:2".to_string(), true)
+        );
+        assert_eq!(
+            split_tls_scheme("REDIS://h:1"),
+            ("redis://h:1".to_string(), false)
+        );
     }
 
     #[test]
@@ -406,6 +439,24 @@ mod tests {
                 .is_ok(),
             "with the check off, any server certificate is accepted"
         );
+        // Any letter case still gets Vilo's TLS, the profiler's connection included.
+        let shouting = url.replacen("rediss://", "REDISS://", 1);
+        let loud = RedisSession::connect_with(&shouting, None, Some(&mutual(&dir)))
+            .await
+            .unwrap();
+        let monitor = loud.monitor(&loud.scan_nodes().remove(0), 5).await.unwrap();
+        let mut started = false;
+        for _ in 0..100 {
+            let batch = monitor.take();
+            assert!(batch.ended.is_none(), "{:?}", batch.ended);
+            if batch.started {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(started, "MONITOR over TLS for {shouting}");
+        drop(monitor);
         let plain = url.replacen("rediss://", "redis://", 1);
         let error = RedisSession::connect_with(&plain, None, Some(&mutual(&dir)))
             .await
