@@ -159,34 +159,62 @@ fn time_of(message: &PubSubMessage) -> String {
 /// Publishes still awaiting their answer or ended unknown, by lock key: the operation holding
 /// the lock and whether its outcome is unknown (else pending). Shared by every window of this
 /// process, so no window can publish past another's unsettled publish.
-static PUBLISH_LOCKS: std::sync::Mutex<std::collections::BTreeMap<String, (String, bool)>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[derive(Default)]
+struct PublishLocks {
+    held: std::collections::BTreeMap<String, (String, bool)>,
+    /// Operations this process settled (a known answer or the user's check), so a log read
+    /// that started before they settled cannot lock their channel again.
+    settled: std::collections::BTreeSet<String>,
+}
 
-fn publish_locks()
--> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, (String, bool)>> {
-    // The map stays consistent even if a holder panicked: every change is a single insert or remove.
+static PUBLISH_LOCKS: std::sync::Mutex<PublishLocks> = std::sync::Mutex::new(PublishLocks {
+    held: std::collections::BTreeMap::new(),
+    settled: std::collections::BTreeSet::new(),
+});
+
+fn publish_locks() -> std::sync::MutexGuard<'static, PublishLocks> {
+    // The table stays consistent even if a holder panicked: every change is a single insert or remove.
     PUBLISH_LOCKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// From the write log at startup: locks an unsettled publish's channel as unknown, unless a
-/// publish of this process already holds it (a pending one keeps its own lock).
+/// From the write log: locks an unsettled publish's channel as unknown, unless this process
+/// already settled that publish or a publish of this process holds the lock.
 pub(crate) fn recover_publish_lock(lock: &str, operation: &str) {
-    publish_locks()
-        .entry(lock.to_string())
-        .or_insert_with(|| (operation.to_string(), true));
+    let mut locks = publish_locks();
+    if !locks.settled.contains(operation) {
+        locks
+            .held
+            .entry(lock.to_string())
+            .or_insert_with(|| (operation.to_string(), true));
+    }
 }
 
 pub(crate) fn publish_pending(operation: &str) -> bool {
     publish_locks()
+        .held
         .values()
         .any(|(owner, unknown)| owner == operation && !unknown)
 }
 
 /// The user checked these operations; their unknown publish locks go, pending ones never.
 pub(crate) fn acknowledge_publishes(operations: &[String]) {
-    publish_locks().retain(|_, (owner, unknown)| !(*unknown && operations.contains(owner)));
+    let mut locks = publish_locks();
+    locks
+        .held
+        .retain(|_, (owner, unknown)| !(*unknown && operations.contains(owner)));
+    let pending = locks
+        .held
+        .values()
+        .map(|(owner, _)| owner.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    locks.settled.extend(
+        operations
+            .iter()
+            .filter(|operation| !pending.contains(*operation))
+            .cloned(),
+    );
 }
 
 /// Channels are shared by every logical database of a server, so the lock is per connection.
@@ -377,7 +405,7 @@ impl DatabaseView {
             return refuse(self, "Type the connection name exactly to confirm.", cx);
         }
         let lock = lock_key(&connection.id, &channel);
-        let held = publish_locks().get(&lock).cloned();
+        let held = publish_locks().held.get(&lock).cloned();
         match held {
             Some((_, false)) => {
                 return refuse(
@@ -437,7 +465,9 @@ impl DatabaseView {
         let generation = self.generation;
         // Locked while in flight too, so a rebuilt tab cannot send the same channel again before
         // the answer is known; only this operation's own answer changes its lock.
-        publish_locks().insert(lock.clone(), (operation.clone(), false));
+        publish_locks()
+            .held
+            .insert(lock.clone(), (operation.clone(), false));
         if let Some(pubsub) = self.pubsub() {
             pubsub.publishing = true;
             pubsub.publish_result = Some((true, "Publishing…".into()));
@@ -451,12 +481,15 @@ impl DatabaseView {
             // by every window and must not stay pending.
             {
                 let mut locks = publish_locks();
-                if locks.get(&lock).is_some_and(|(owner, _)| *owner == operation) {
+                if locks.held.get(&lock).is_some_and(|(owner, _)| *owner == operation) {
                     if unknown {
-                        locks.insert(lock.clone(), (operation.clone(), true));
+                        locks.held.insert(lock.clone(), (operation.clone(), true));
                     } else {
-                        locks.remove(&lock);
+                        locks.held.remove(&lock);
                     }
+                }
+                if !unknown {
+                    locks.settled.insert(operation.clone());
                 }
             }
             this.update(cx, |this, cx| {
@@ -512,6 +545,7 @@ impl DatabaseView {
         };
         // Only an outcome already known to be unknown can be acknowledged, never a pending one.
         let held = publish_locks()
+            .held
             .get(&lock)
             .filter(|(_, unknown)| *unknown)
             .map(|(operation, _)| operation.clone());
@@ -530,10 +564,13 @@ impl DatabaseView {
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
+            // Released before touching the window, which may be closed by now.
+            if result.is_ok() {
+                acknowledge_publishes(std::slice::from_ref(&operation));
+            }
             this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
-                        acknowledge_publishes(std::slice::from_ref(&operation));
                         this.dangling_writes
                             .retain(|(known, _)| *known != operation);
                         this.unlogged_writes
@@ -841,27 +878,34 @@ mod tests {
     #[test]
     fn test_publish_locks() {
         // Unique names: the lock table is shared by the whole process.
-        publish_locks().insert("test/a".into(), ("pending-a".into(), false));
+        publish_locks()
+            .held
+            .insert("test/a".into(), ("pending-a".into(), false));
         recover_publish_lock("test/a", "pending-a");
         assert_eq!(
-            publish_locks().get("test/a"),
+            publish_locks().held.get("test/a"),
             Some(&("pending-a".to_string(), false)),
             "recovery keeps a pending lock"
         );
         assert!(publish_pending("pending-a"));
         acknowledge_publishes(&["pending-a".to_string()]);
         assert!(
-            publish_locks().contains_key("test/a"),
+            publish_locks().held.contains_key("test/a"),
             "a pending lock cannot be acknowledged"
         );
         recover_publish_lock("test/b", "old-b");
         assert!(!publish_pending("old-b"));
         acknowledge_publishes(&["old-b".to_string()]);
+        recover_publish_lock("test/b", "old-b");
         assert!(
-            !publish_locks().contains_key("test/b"),
+            !publish_locks().held.contains_key("test/b"),
+            "a stale log read cannot lock a settled publish again"
+        );
+        assert!(
+            !publish_locks().held.contains_key("test/b"),
             "an unknown lock goes once checked"
         );
-        publish_locks().remove("test/a");
+        publish_locks().held.remove("test/a");
     }
 
     #[test]

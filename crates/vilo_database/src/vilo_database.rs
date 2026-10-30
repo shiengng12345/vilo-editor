@@ -2044,6 +2044,10 @@ impl DatabaseView {
                                     // The list only clears once the acknowledgement is in the log.
                                     cx.spawn(async move |this, cx| {
                                         let result = task.await;
+                                        // Released before touching the window, which may be closed by now.
+                                        if result.is_ok() {
+                                            redis_pubsub::acknowledge_publishes(&operations);
+                                        }
                                         this.update(cx, |this, cx| {
                                             match result {
                                                 Ok(()) => {
@@ -2053,7 +2057,6 @@ impl DatabaseView {
                                                     this.unlogged_writes.retain(|(operation, _)| {
                                                         !operations.contains(operation)
                                                     });
-                                                    redis_pubsub::acknowledge_publishes(&operations);
                                                     this.audit_problem = None;
                                                 }
                                                 Err(error) => {
