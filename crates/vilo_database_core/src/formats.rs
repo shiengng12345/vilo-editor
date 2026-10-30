@@ -2096,26 +2096,14 @@ struct Fingerprints {
     visits: usize,
 }
 
-/// What a value is compared by as a dict key or set member. A key too large or too deeply
-/// nested to compare by value is the same key only as itself (its identity).
+/// What a value is compared by as a dict key or set member: its exact value when small, a
+/// 128-bit digest of its whole value when large, so equal keys always meet and keys stay
+/// small. Objects, names and NaN compare by identity, as Python's default equality does.
 fn fingerprint(
     arena: &Arena,
     cache: &mut Fingerprints,
     id: Id,
     depth: usize,
-) -> Result<Vec<u8>, String> {
-    let mut deep = false;
-    fingerprint_at(arena, cache, id, depth, &mut deep)
-}
-
-/// `deep` is set when the depth limit shaped the result; such a result depends on where the
-/// value was reached and is not remembered.
-fn fingerprint_at(
-    arena: &Arena,
-    cache: &mut Fingerprints,
-    id: Id,
-    depth: usize,
-    deep: &mut bool,
 ) -> Result<Vec<u8>, String> {
     if let Some(known) = cache.known.get(&id) {
         return Ok(known.clone());
@@ -2124,18 +2112,73 @@ fn fingerprint_at(
     if cache.visits > MAX_VISITS {
         return Err("too many dict keys to compare; not read further".into());
     }
-    let mut shaped = false;
-    let found = dict_key(arena, cache, id, depth, &mut shaped)?.unwrap_or_else(|| identity(id));
-    if shaped {
-        *deep = true;
-    } else {
-        cache.bytes = cache.bytes.saturating_add(found.len());
-        if cache.bytes > MAX_BYTES {
-            return Err("too many dict keys to compare; not read further".into());
-        }
-        cache.known.insert(id, found.clone());
+    // Deeper than this a key cannot be compared here; refused rather than guessed.
+    if depth > MAX_DEPTH {
+        return Err("a dict key nested too deeply to compare".into());
     }
+    let found = dict_key(arena, cache, id, depth)?;
+    cache.bytes = cache.bytes.saturating_add(found.len());
+    if cache.bytes > MAX_BYTES {
+        return Err("too many dict keys to compare; not read further".into());
+    }
+    cache.known.insert(id, found.clone());
     Ok(found)
+}
+
+/// Fingerprints longer than this are replaced by a digest of their content.
+const MAX_KEY: usize = 4096;
+
+/// A fingerprint built from a tag and parts: the parts themselves while short, else a digest
+/// of all of them fed as they come, so a large key never needs its whole text at once.
+struct KeyBuilder {
+    literal: Vec<u8>,
+    first: std::collections::hash_map::DefaultHasher,
+    second: std::collections::hash_map::DefaultHasher,
+    tag: u8,
+    long: bool,
+}
+
+impl KeyBuilder {
+    fn new(tag: u8) -> Self {
+        use std::hash::Hasher as _;
+        let mut first = std::collections::hash_map::DefaultHasher::new();
+        let mut second = std::collections::hash_map::DefaultHasher::new();
+        first.write_u8(tag);
+        second.write_u8(!tag);
+        second.write_u8(0x5a);
+        Self {
+            literal: vec![tag],
+            first,
+            second,
+            tag,
+            long: false,
+        }
+    }
+
+    fn push(&mut self, part: &[u8]) {
+        use std::hash::Hasher as _;
+        self.first.write(part);
+        self.second.write(part);
+        if !self.long {
+            if self.literal.len() + part.len() > MAX_KEY {
+                self.long = true;
+                self.literal = Vec::new();
+            } else {
+                self.literal.extend_from_slice(part);
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        use std::hash::Hasher as _;
+        if !self.long {
+            return self.literal;
+        }
+        let mut digest = vec![b'#', b'#', self.tag];
+        digest.extend_from_slice(&self.first.finish().to_le_bytes());
+        digest.extend_from_slice(&self.second.finish().to_le_bytes());
+        digest
+    }
 }
 
 fn dict_key(
@@ -2143,80 +2186,70 @@ fn dict_key(
     cache: &mut Fingerprints,
     id: Id,
     depth: usize,
-    deep: &mut bool,
-) -> Result<Option<Vec<u8>>, String> {
-    /// Keys larger than this are shown as they are but not compared with others; comparing
-    /// nested shared tuples could otherwise take unbounded memory.
-    const MAX_KEY: usize = 4096;
-    if depth > 16 {
-        *deep = true;
-        return Ok(None);
-    }
+) -> Result<Vec<u8>, String> {
     let Some(node) = arena.nodes.get(id) else {
-        return Ok(None);
+        return Ok(identity(id));
     };
-    Ok(Some(match node {
+    let scalar = |tag: u8, bytes: &[u8]| {
+        let mut key = KeyBuilder::new(tag);
+        key.push(bytes);
+        key.finish()
+    };
+    Ok(match node {
         Node::Null => b"n".to_vec(),
         Node::Bool(flag) => format!("i{}", i128::from(*flag)).into_bytes(),
         // Integers are kept in their plain form when read, so the text is the number.
-        Node::Int(text) if text.len() > MAX_KEY => return Ok(None),
-        Node::Int(text) => [b"i".as_slice(), text.as_bytes()].concat(),
+        Node::Int(text) => scalar(b'i', text.as_bytes()),
         // NaN equals no other NaN, but Python finds a key by identity first, so the same NaN
         // object reused through the memo is one key.
         Node::Float(value) if value.is_nan() => identity(id),
         // An integer-valued float equals that integer, however large.
         Node::Float(value) => match float_integer(*value) {
-            Some(integer) => [b"i".as_slice(), integer.as_bytes()].concat(),
+            Some(integer) => scalar(b'i', integer.as_bytes()),
             None => format!("f{}", value.to_bits()).into_bytes(),
         },
-        Node::Text(text) if text.len() > MAX_KEY => return Ok(None),
-        Node::Text(text) => [b"s".as_slice(), text.as_bytes()].concat(),
-        Node::Utf16(units) if units.len() * 2 > MAX_KEY => return Ok(None),
-        Node::CodePoints(points) if points.len() * 4 > MAX_KEY => return Ok(None),
-        Node::CodePoints(points) => std::iter::once(b'p')
-            .chain(points.iter().flat_map(|point| point.to_le_bytes()))
-            .collect(),
-        Node::Utf16(units) => std::iter::once(b'u')
-            .chain(units.iter().flat_map(|unit| unit.to_le_bytes()))
-            .collect(),
-        Node::Bytes(bytes) if bytes.len() > MAX_KEY => return Ok(None),
-        Node::Bytes(bytes) => [b"b".as_slice(), bytes].concat(),
-        Node::Tuple(items) => {
-            let mut key = b"(".to_vec();
-            for item in items {
-                let part = fingerprint_at(arena, cache, *item, depth + 1, deep)?;
-                key.extend_from_slice(&part.len().to_le_bytes());
-                key.extend_from_slice(&part);
-                if key.len() > MAX_KEY {
-                    return Ok(None);
-                }
+        Node::Text(text) => scalar(b's', text.as_bytes()),
+        Node::CodePoints(points) => {
+            let mut key = KeyBuilder::new(b'p');
+            for point in points {
+                key.push(&point.to_le_bytes());
             }
-            key
+            key.finish()
+        }
+        Node::Utf16(units) => {
+            let mut key = KeyBuilder::new(b'u');
+            for unit in units {
+                key.push(&unit.to_le_bytes());
+            }
+            key.finish()
+        }
+        Node::Bytes(bytes) => scalar(b'b', bytes),
+        Node::Tuple(items) => {
+            let mut key = KeyBuilder::new(b'(');
+            for item in items {
+                let part = fingerprint(arena, cache, *item, depth + 1)?;
+                key.push(&part.len().to_le_bytes());
+                key.push(&part);
+            }
+            key.finish()
         }
         // A frozenset equals one with the same members, in any order.
         Node::Set(members) => {
-            // Stops as soon as the members' fingerprints are past the limit.
-            let mut parts = Vec::new();
-            let mut size = 0_usize;
-            for member in members {
-                let part = fingerprint_at(arena, cache, *member, depth + 1, deep)?;
-                size += part.len() + 8;
-                if size > MAX_KEY {
-                    return Ok(None);
-                }
-                parts.push(part);
-            }
+            let mut parts = members
+                .iter()
+                .map(|member| fingerprint(arena, cache, *member, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?;
             parts.sort();
-            let mut key = b"{".to_vec();
+            let mut key = KeyBuilder::new(b'{');
             for part in parts {
-                key.extend_from_slice(&part.len().to_le_bytes());
-                key.extend_from_slice(&part);
+                key.push(&part.len().to_le_bytes());
+                key.push(&part);
             }
-            key
+            key.finish()
         }
         // Objects and names compare by identity, as Python's default equality does.
         _ => identity(id),
-    }))
+    })
 }
 
 /// A finite float with no fractional part as its exact integer text (`None` otherwise).
@@ -3257,6 +3290,31 @@ mod tests {
         assert_eq!(
             decode(Decoder::Pickle, b"S'\\a\\b\\f\\v\\q\\x41\\101'\n.").unwrap(),
             r#""\u0007\u0008\u000c\u000b\\qAA""#
+        );
+    }
+
+    #[test]
+    fn test_large_equal_keys_meet() {
+        // python3: two separate but equal 4,097-character keys are one entry, value 2.
+        let mut key = b"X".to_vec();
+        key.extend_from_slice(&4097_u32.to_le_bytes());
+        key.extend(std::iter::repeat_n(b'x', 4097));
+        let mut data = b"}".to_vec();
+        data.extend_from_slice(&key);
+        data.extend_from_slice(b"K\x01s");
+        data.extend_from_slice(&key);
+        data.extend_from_slice(b"K\x02s.");
+        let text = decode(Decoder::Pickle, &data).unwrap();
+        assert_eq!(text.matches(": ").count(), 1, "one entry");
+        assert!(text.ends_with(": 2,\n}"), "{}", &text[text.len() - 20..]);
+        // A key nested past the depth limit is refused, not guessed.
+        let mut deep = b"}K\x01".to_vec();
+        deep.extend(std::iter::repeat_n(0x85, 70));
+        deep.extend_from_slice(b"K\x00s.");
+        assert!(
+            decode(Decoder::Pickle, &deep)
+                .unwrap_err()
+                .contains("too deeply")
         );
     }
 
