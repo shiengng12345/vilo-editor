@@ -2,8 +2,10 @@
 //! toolbar, and documents as cards, a JSON listing or a table.
 
 use std::{
+    cell::RefCell,
     io::Write as _,
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -24,8 +26,8 @@ use vilo_database_core::{
     bson::{Bson, Document},
     display::{Shown, ValueKind, human_date, show, to_canonical_json},
     mongo::{
-        ExplainSummary, FieldSummary, FindRequest, Hint, summarize_explain, summarize_schema,
-        to_display_json,
+        ExplainSummary, FieldSummary, FindRequest, Hint, field_paths, summarize_explain,
+        summarize_schema, to_display_json,
     },
     shell::{parse_pipeline, parse_query},
 };
@@ -45,6 +47,144 @@ const HISTORY_PER_COLLECTION: usize = 30;
 /// Documents sampled for the schema view, as in Compass.
 const SCHEMA_SAMPLE: u32 = 1000;
 const COMPASS_GREEN: u32 = 0x00ED64;
+/// Field paths offered by query completions, per tab.
+const COMPLETION_FIELDS: usize = 500;
+const QUERY_OPERATORS: &[&str] = &[
+    "$eq",
+    "$ne",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$in",
+    "$nin",
+    "$exists",
+    "$type",
+    "$regex",
+    "$options",
+    "$and",
+    "$or",
+    "$nor",
+    "$not",
+    "$elemMatch",
+    "$size",
+    "$all",
+    "$expr",
+    "$mod",
+];
+/// Read-only stages and common accumulators; $out and $merge are left out on purpose.
+const PIPELINE_OPERATORS: &[&str] = &[
+    "$match",
+    "$project",
+    "$group",
+    "$sort",
+    "$limit",
+    "$skip",
+    "$unwind",
+    "$lookup",
+    "$count",
+    "$addFields",
+    "$set",
+    "$unset",
+    "$facet",
+    "$bucket",
+    "$sortByCount",
+    "$replaceRoot",
+    "$sample",
+    "$graphLookup",
+    "$sum",
+    "$avg",
+    "$min",
+    "$max",
+    "$first",
+    "$last",
+    "$push",
+    "$addToSet",
+];
+
+/// Completions for the query fields: `$…` gives operators (stages too in a pipeline), anything
+/// else gives the field paths seen in this collection's documents.
+struct QueryCompletions {
+    fields: Rc<RefCell<Vec<String>>>,
+    pipeline: bool,
+}
+
+impl editor::CompletionProvider for QueryCompletions {
+    fn completions(
+        &self,
+        buffer: &Entity<language::Buffer>,
+        buffer_position: language::Anchor,
+        _trigger: editor::CompletionContext,
+        _window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) -> Task<Result<Vec<project::CompletionResponse>>> {
+        use language::ToOffset as _;
+        let buffer = buffer.read(cx);
+        let mut word = String::new();
+        for character in buffer.reversed_chars_at(buffer_position) {
+            if character.is_alphanumeric() || matches!(character, '_' | '$' | '.') {
+                word.insert(0, character);
+            } else {
+                break;
+            }
+        }
+        let offset = buffer_position.to_offset(buffer);
+        let before = buffer.text_for_range(0..offset).collect::<String>();
+        // Inside a quoted value there is nothing to suggest.
+        let quotes = before
+            .chars()
+            .filter(|character| matches!(character, '\'' | '"'))
+            .count();
+        if quotes % 2 == 1 {
+            return Task::ready(Ok(Vec::new()));
+        }
+        let replace_range = buffer.anchor_before(offset - word.len())..buffer_position;
+        let candidates: Vec<String> = if word.starts_with('$') {
+            let operators = if self.pipeline {
+                PIPELINE_OPERATORS.iter().chain(QUERY_OPERATORS)
+            } else {
+                QUERY_OPERATORS.iter().chain(&[] as &[&str])
+            };
+            operators.map(|operator| operator.to_string()).collect()
+        } else {
+            self.fields.borrow().clone()
+        };
+        Task::ready(Ok(vec![project::CompletionResponse {
+            completions: candidates
+                .into_iter()
+                .map(|text| project::Completion {
+                    replace_range: replace_range.clone(),
+                    label: language::CodeLabel::plain(text.clone(), None),
+                    new_text: text,
+                    documentation: None,
+                    source: project::CompletionSource::Custom,
+                    icon_path: None,
+                    icon_color: None,
+                    match_start: None,
+                    snippet_deduplication_key: None,
+                    insert_text_mode: None,
+                    confirm: None,
+                    group: None,
+                })
+                .collect(),
+            display_options: project::CompletionDisplayOptions::default(),
+            is_incomplete: false,
+        }]))
+    }
+
+    fn is_completion_trigger(
+        &self,
+        _buffer: &Entity<language::Buffer>,
+        _position: language::Anchor,
+        text: &str,
+        _trigger_in_words: bool,
+        _cx: &mut Context<Editor>,
+    ) -> bool {
+        text.chars().last().is_some_and(|character| {
+            character.is_alphanumeric() || matches!(character, '_' | '$' | '.')
+        })
+    }
+}
 /// Compass's Max Time MS default.
 const DEFAULT_MAX_TIME: Duration = Duration::from_secs(60);
 
@@ -145,6 +285,8 @@ pub(crate) struct MongoTab {
     explain: Option<Fetch<ExplainResult>>,
     explain_raw: bool,
     indexes: Option<Fetch<Vec<Document>>>,
+    /// Field paths seen in this collection, shared with the query fields' completions.
+    fields: Rc<RefCell<Vec<String>>>,
     /// Index names whose definition is open in the Indexes list.
     open_indexes: HashSet<String>,
     /// The sample size and its fields.
@@ -184,18 +326,37 @@ impl MongoTab {
             editor.set_placeholder_text("[ { $match: { status: 'Success' } }, { $group: { _id: '$type', count: { $sum: 1 } } } ]", window, cx);
             editor
         });
+        let filter = mono("Type a query: { field: 'value' }", window, cx);
+        let projection = mono("{ field: 0 }", window, cx);
+        let sort = mono("{ field: -1 }", window, cx);
+        let collation = mono("{ locale: 'simple' }", window, cx);
+        let hint = mono("{ field: -1 } or \"indexName\"", window, cx);
+        let fields = Rc::new(RefCell::new(Vec::new()));
+        for (editor, pipeline) in [
+            (&filter, false),
+            (&projection, false),
+            (&sort, false),
+            (&collation, false),
+            (&hint, false),
+            (&pipeline, true),
+        ] {
+            let fields = fields.clone();
+            editor.update(cx, |editor, _| {
+                editor.set_completion_provider(Some(Rc::new(QueryCompletions { fields, pipeline })))
+            });
+        }
         Self {
             database,
             collection,
             sub_tab: SubTab::Documents,
             panel: Panel::Results,
             code_language: CodeLanguage::Shell,
-            filter: mono("Type a query: { field: 'value' }", window, cx),
-            projection: mono("{ field: 0 }", window, cx),
-            sort: mono("{ field: -1 }", window, cx),
+            filter,
+            projection,
+            sort,
             skip_editor: editor("0", "", false, window, cx),
-            collation: mono("{ locale: 'simple' }", window, cx),
-            hint: mono("{ field: -1 } or \"indexName\"", window, cx),
+            collation,
+            hint,
             max_time: editor("60000", "", false, window, cx),
             limit: editor("0", "", false, window, cx),
             pipeline,
@@ -213,6 +374,7 @@ impl MongoTab {
             explain_raw: false,
             indexes: None,
             open_indexes: HashSet::default(),
+            fields,
             schema: None,
             options: None,
             export: None,
@@ -227,6 +389,36 @@ impl MongoTab {
 
     pub(crate) fn title(&self) -> String {
         self.collection.clone()
+    }
+
+    fn learn_fields(&self, documents: &[Document]) {
+        let mut fields = self.fields.borrow_mut();
+        for path in field_paths(documents, COMPLETION_FIELDS) {
+            if fields.len() >= COMPLETION_FIELDS {
+                break;
+            }
+            if !fields.contains(&path) {
+                fields.push(path);
+            }
+        }
+    }
+
+    /// Gives the query fields brackets and quotes that close themselves, and highlighting.
+    pub(crate) fn set_query_language(&self, language: &Arc<language::Language>, cx: &mut App) {
+        for editor in [
+            &self.filter,
+            &self.projection,
+            &self.sort,
+            &self.collation,
+            &self.hint,
+            &self.pipeline,
+        ] {
+            if let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_language(Some(language.clone()), cx)
+                });
+            }
+        }
     }
 
     fn query_editors(&self) -> [&Entity<Editor>; 8] {
@@ -680,6 +872,9 @@ impl DatabaseView {
             return;
         }
         let mut tab = MongoTab::new(database.clone(), collection.clone(), window, cx);
+        if let Some(language) = &self.query_language {
+            tab.set_query_language(language, cx);
+        }
         if let Some(session) = self.mongo() {
             let connection = self.generation;
             let task = run(cx, async move {
@@ -981,6 +1176,9 @@ impl DatabaseView {
                 if let Some(tab) = this.tab_at(&database, &collection)
                     && tab.generation == generation
                 {
+                    if let Ok(page) = &result {
+                        tab.learn_fields(&page.documents);
+                    }
                     tab.page = Some(fetched(result));
                     cx.notify();
                 }
@@ -1146,6 +1344,14 @@ impl DatabaseView {
                     && let Some(tab) = this.tab_at(&database, &collection)
                     && tab.generation == generation
                 {
+                    if let Ok((_, fields)) = &result {
+                        let mut known = tab.fields.borrow_mut();
+                        for field in fields {
+                            if !known.contains(&field.name) && known.len() < COMPLETION_FIELDS {
+                                known.push(field.name.clone());
+                            }
+                        }
+                    }
                     tab.schema = Some(fetched(result));
                     cx.notify();
                 }
@@ -2302,32 +2508,18 @@ impl DatabaseView {
                         })
                 }))
             });
-        // Compass lays the options out as labelled lines, with the numbers boxed on the right.
-        let option = |label: &'static str, editor: &Entity<Editor>| {
-            h_flex()
+        let option = |label: &'static str, editor: &Entity<Editor>, cx: &App| {
+            v_flex()
                 .flex_1()
                 .min_w_0()
-                .h(px(28.))
-                .gap_3()
-                .child(
-                    div().w(px(88.)).flex_none().child(
-                        Label::new(label)
-                            .size(LabelSize::Small)
-                            .weight(gpui::FontWeight::SEMIBOLD),
-                    ),
-                )
-                .child(div().flex_1().min_w_0().child(editor.clone()))
-        };
-        let number = |label: &'static str, editor: &Entity<Editor>, cx: &App| {
-            h_flex()
-                .flex_none()
-                .gap_2()
+                .gap_1()
                 .child(
                     Label::new(label)
                         .size(LabelSize::Small)
-                        .weight(gpui::FontWeight::SEMIBOLD),
+                        .weight(gpui::FontWeight::SEMIBOLD)
+                        .color(Color::Muted),
                 )
-                .child(div().w(px(180.)).child(boxed(editor.clone(), cx)))
+                .child(boxed(editor.clone(), cx))
         };
         let untouched = tab
             .query_editors()
@@ -2407,21 +2599,25 @@ impl DatabaseView {
                     ),
             )
             .when(tab.show_options, |this| {
-                this.child(h_flex().child(option("Project", &tab.projection)))
-                    .child(
-                        h_flex()
-                            .gap_4()
-                            .child(option("Sort", &tab.sort))
-                            .child(number("Max Time MS", &tab.max_time, cx)),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_4()
-                            .child(option("Collation", &tab.collation))
-                            .child(number("Skip", &tab.skip_editor, cx))
-                            .child(number("Limit", &tab.limit, cx)),
-                    )
-                    .child(h_flex().child(option("Index Hint", &tab.hint)))
+                this.child(
+                    h_flex()
+                        .gap_4()
+                        .child(option("Project", &tab.projection, cx))
+                        .child(option("Sort", &tab.sort, cx)),
+                )
+                .child(
+                    h_flex()
+                        .gap_4()
+                        .child(option("Collation", &tab.collation, cx))
+                        .child(option("Index Hint", &tab.hint, cx)),
+                )
+                .child(
+                    h_flex()
+                        .gap_4()
+                        .child(option("Skip", &tab.skip_editor, cx))
+                        .child(option("Limit", &tab.limit, cx))
+                        .child(option("Max Time MS", &tab.max_time, cx)),
+                )
             })
             .into_any_element()
     }

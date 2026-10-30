@@ -226,6 +226,8 @@ pub struct DatabaseView {
     focus_handle: FocusHandle,
     /// For opening mongosh in a Vilo terminal.
     workspace: gpui::WeakEntity<Workspace>,
+    /// JavaScript, for self-closing brackets and highlighting in the query fields; loaded once.
+    query_language: Option<Arc<language::Language>>,
     path: PathBuf,
     connections: Vec<Connection>,
     active: Option<String>,
@@ -375,10 +377,30 @@ impl DatabaseView {
             ),
             redis_state: None,
             rail_peek: false,
+            query_language: None,
             rail_pinned: rail_pin_path().exists(),
             tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
+        let workspace = view.workspace.clone();
+        cx.spawn(async move |this, cx| {
+            let language = workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .languages()
+                        .language_for_name("JavaScript")
+                })?
+                .await?;
+            this.update(cx, |this, cx| {
+                for tab in &this.tabs {
+                    tab.set_query_language(&language, cx);
+                }
+                this.query_language = Some(language);
+            })
+        })
+        .detach_and_log_err(cx);
         if view.connections.is_empty() {
             view.open_form(None, window, cx);
         }

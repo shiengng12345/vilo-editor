@@ -295,10 +295,58 @@ pub fn summarize_schema(documents: &[Document]) -> Vec<FieldSummary> {
         }
     }
     for field in &mut fields {
-        field.types.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        field
+            .types
+            .sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     }
     fields.sort_by_key(|field| (field.name != "_id", field.name.to_lowercase()));
     fields
+}
+
+/// Field paths for query completions: nested documents as dotted paths, objects inside arrays as
+/// paths without an index, at most `limit` paths.
+pub fn field_paths(documents: &[Document], limit: usize) -> Vec<String> {
+    const DEPTH: usize = 4;
+    fn walk(
+        document: &Document,
+        prefix: &str,
+        depth: usize,
+        limit: usize,
+        paths: &mut Vec<String>,
+    ) {
+        for (key, value) in document {
+            if paths.len() >= limit {
+                return;
+            }
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            if !paths.contains(&path) {
+                paths.push(path.clone());
+            }
+            if depth + 1 >= DEPTH {
+                continue;
+            }
+            match value {
+                Bson::Document(inner) => walk(inner, &path, depth + 1, limit, paths),
+                Bson::Array(items) => {
+                    for item in items {
+                        if let Bson::Document(inner) = item {
+                            walk(inner, &path, depth + 1, limit, paths);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    for document in documents {
+        walk(document, "", 0, limit, &mut paths);
+    }
+    paths
 }
 
 pub fn summarize_explain(explain: &Document) -> ExplainSummary {
@@ -531,6 +579,19 @@ pub fn to_display_json(document: &Document) -> String {
 mod tests {
     use super::*;
     use mongodb::bson::{Decimal128, oid::ObjectId};
+
+    #[test]
+    fn test_field_paths() {
+        let documents = vec![
+            doc! { "a": 1, "b": { "c": 2 }, "list": [{ "x": 1 }, { "y": 2 }] },
+            doc! { "a": 2, "d": true },
+        ];
+        assert_eq!(
+            field_paths(&documents, 100),
+            ["a", "b", "b.c", "list", "list.x", "list.y", "d"]
+        );
+        assert_eq!(field_paths(&documents, 2).len(), 2);
+    }
 
     #[test]
     fn test_schema_summary() {
