@@ -496,6 +496,11 @@ impl DatabaseView {
         else {
             return;
         };
+        if self.active.as_ref() == Some(&id) && self.session.is_some() {
+            self.form = None;
+            cx.notify();
+            return;
+        }
         self.reset();
         self.active = Some(id);
         self.form = None;
@@ -754,7 +759,11 @@ impl DatabaseView {
             }
             .await;
             this.update(cx, |this, cx| match result {
-                Ok(()) => this.connect(connection.id.clone(), cx),
+                Ok(()) => {
+                    // An edited connection must reconnect with its new settings.
+                    this.active = None;
+                    this.connect(connection.id.clone(), cx)
+                }
                 Err(error) => {
                     if let Some(form) = &mut this.form {
                         form.checking = false;
@@ -1425,10 +1434,13 @@ impl DatabaseView {
 
 impl Render for DatabaseView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The open connection shows only under its own kind; switching kinds keeps it connected.
+        // The open connection shows only under its own kind and site; switching keeps it connected.
+        let current_site = self.current_site();
         let connection = self
             .active_connection()
-            .filter(|connection| connection.kind == self.kind_view)
+            .filter(|connection| {
+                connection.kind == self.kind_view && connection.site_label() == current_site
+            })
             .cloned();
         let full_bleed = self.form.is_none() && self.session.is_some() && connection.is_some();
         let main = match (&self.form, &connection, &self.session) {
