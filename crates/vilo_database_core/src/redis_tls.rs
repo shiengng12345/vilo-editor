@@ -522,5 +522,13 @@ mod tests {
             format!("{error:#}").contains("only has database 0"),
             "{error:#}"
         );
+        let in_the_url = RedisSession::connect(&format!("{single}/3"))
+            .await
+            .err()
+            .expect("a database in the URL itself");
+        assert!(
+            format!("{in_the_url:#}").contains("only has database 0"),
+            "{in_the_url:#}"
+        );
     }
 }
