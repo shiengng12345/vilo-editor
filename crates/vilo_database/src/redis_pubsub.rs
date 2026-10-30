@@ -503,8 +503,8 @@ impl DatabaseView {
                             ));
                         }
                         match outcome {
-                            // PUBLISH counts only the node that took it; a Cluster forwards to the others.
-                            Ok(count) if clustered && !sharded => (true, format!("Published; {count} subscribers on the node that took it received it. Subscribers on other nodes are not counted.")),
+                            // PUBLISH and SPUBLISH count only the node that took it; a Cluster forwards to the others.
+                            Ok(count) if clustered => (true, format!("Published; {count} subscribers on the node that took it received it. Subscribers on other nodes (or the shard's replicas) are not counted.")),
                             Ok(0) => (true, "Published; no subscriber was listening, so nobody received it.".to_string()),
                             Ok(count) => (true, format!("Published; {count} subscribers received it.")),
                             Err(WriteError::Refused(message)) => (false, format!("Not published: {message}")),
