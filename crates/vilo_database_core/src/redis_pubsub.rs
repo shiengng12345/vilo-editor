@@ -52,6 +52,14 @@ pub struct PubSubMessage {
     pub size: usize,
 }
 
+impl PubSubMessage {
+    /// What keeping the message costs, counted against the queue and view budgets: its payload
+    /// and channel plus a fixed share for the entry itself, so empty messages are not free.
+    pub fn cost(&self) -> usize {
+        self.payload.len() + self.channel.len() + 64
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PubSubEvent {
     Message(PubSubMessage),
@@ -78,8 +86,7 @@ pub struct Events {
 impl Events {
     fn taken(&self, event: Option<PubSubEvent>) -> Option<PubSubEvent> {
         if let Some(PubSubEvent::Message(message)) = &event {
-            self.queued
-                .fetch_sub(message.payload.len(), Ordering::Relaxed);
+            self.queued.fetch_sub(message.cost(), Ordering::Relaxed);
         }
         event
     }
@@ -174,7 +181,7 @@ impl RedisSession {
                         received = messages.recv() => match received {
                             Ok(received) => {
                                 let received = message(received);
-                                let size = received.payload.len();
+                                let size = received.cost();
                                 if queued.load(Ordering::Relaxed) + size > QUEUE_BYTES {
                                     lost += 1;
                                     continue;

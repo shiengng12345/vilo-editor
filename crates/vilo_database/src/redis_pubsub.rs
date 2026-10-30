@@ -54,7 +54,7 @@ pub(crate) struct PubSubState {
     confirm: Option<Entity<Editor>>,
     publishing: bool,
     publish_result: Option<(bool, SharedString)>,
-    /// The channel whose last publish has an unknown outcome, until the user checked it.
+    /// The lock of a publish whose outcome is unknown, until the user checked it.
     publish_locked: Option<String>,
     scroll: UniformListScrollHandle,
 }
@@ -93,6 +93,7 @@ impl PubSubState {
 
     fn unsubscribe(&mut self, note: &'static str) {
         self.attempt += 1;
+        self.problem = None;
         if self.live.take().is_some() {
             self.push(Entry::Note(note.into()));
             self.subscribed_to = None;
@@ -101,13 +102,13 @@ impl PubSubState {
 
     fn push(&mut self, entry: Entry) {
         if let Entry::Message(message) = &entry {
-            self.bytes += message.payload.len();
+            self.bytes += message.cost();
         }
         self.entries.push_back(entry);
         while self.bytes > BUFFER_BYTES {
             match self.entries.pop_front() {
                 Some(Entry::Message(message)) => {
-                    self.bytes -= message.payload.len();
+                    self.bytes -= message.cost();
                     self.trimmed += 1;
                 }
                 Some(Entry::Note(_)) => {}
@@ -319,6 +320,10 @@ impl DatabaseView {
         }
         let lock = lock_key(&connection.id, &channel);
         if self.unknown_writes.contains(&lock) {
+            // The tab may have been rebuilt since; offer the confirmation again.
+            if let Some(pubsub) = self.pubsub() {
+                pubsub.publish_locked = Some(lock);
+            }
             return refuse(
                 self,
                 "An earlier publish to this channel has an unknown outcome. Check whether its subscribers got it, then press I checked it.",
@@ -343,7 +348,7 @@ impl DatabaseView {
         });
         let summary = mongo_write::summarize_intent(&intent);
         let task = run(cx, {
-            let (operation, channel) = (operation.clone(), channel.clone());
+            let operation = operation.clone();
             async move {
                 mongo_write::audit(intent)?;
                 let outcome = session.publish(&channel, payload.as_bytes(), sharded).await;
@@ -383,8 +388,8 @@ impl DatabaseView {
                             Err(WriteError::Refused(message)) => (false, format!("Not published: {message}")),
                             Err(WriteError::Unknown(message)) => {
                                 // A publish cannot be checked by reloading anything, and is never sent again.
-                                this.unknown_writes.insert(lock);
-                                locked = Some(channel);
+                                this.unknown_writes.insert(lock.clone());
+                                locked = Some(lock.clone());
                                 (false, format!("The outcome is unknown ({message}): it may have been delivered. Vilo will not send it again; check the subscribers, then press I checked it."))
                             }
                         }
@@ -413,8 +418,8 @@ impl DatabaseView {
             pubsub.publish_result = None;
             pubsub.publish_locked.take()
         });
-        if let (Some(connection), Some(channel)) = (self.active.clone(), locked) {
-            self.unknown_writes.remove(&lock_key(&connection, &channel));
+        if let Some(lock) = locked {
+            self.unknown_writes.remove(&lock);
         }
         cx.notify();
     }
@@ -692,13 +697,23 @@ mod tests {
     #[test]
     fn test_buffer_keeps_newest_within_bytes() {
         let mut state = PubSubState::default();
-        let size = BUFFER_BYTES / 4;
+        // Four fit with their per-entry share; the fifth and sixth push out the oldest two.
+        let size = BUFFER_BYTES / 4 - 100;
         for _ in 0..6 {
             state.take(PubSubEvent::Message(message(size)));
         }
         assert_eq!(state.received, 6);
         assert_eq!(state.trimmed, 2);
         assert!(state.bytes <= BUFFER_BYTES);
+        let mut empty = PubSubState::default();
+        for _ in 0..200_000 {
+            empty.take(PubSubEvent::Message(message(0)));
+        }
+        assert!(
+            empty.bytes <= BUFFER_BYTES,
+            "empty messages still cost room"
+        );
+        assert!(empty.trimmed > 0);
         state.take(PubSubEvent::Lost(3));
         assert_eq!(state.lost, 3);
         assert!(
