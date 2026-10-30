@@ -780,6 +780,10 @@ impl RedisSession {
         let (url, tls_scheme) = crate::redis_tls::plain_url(url)?;
         let mut config = Config::from_url(&url).context("The Redis URL is not valid")?;
         let host = url_host(&url)?;
+        let sentinel = matches!(
+            config.server,
+            fred::types::config::ServerConfig::Sentinel { .. }
+        );
         // fred ignores the path of a cluster URL; a database there must not quietly become 0.
         if config.server.is_clustered() {
             anyhow::ensure!(
@@ -790,7 +794,8 @@ impl RedisSession {
         let tls_config = match (tls_scheme, tls) {
             (true, settings) => Some(Arc::new(crate::redis_tls::client_config(
                 &settings.cloned().unwrap_or_default(),
-                &host,
+                // Behind Sentinel the server is the master it names, not the host in the URL.
+                (!sentinel).then_some(host.as_str()),
             )?)),
             (false, Some(_)) => bail!("TLS settings need a TLS connection; turn Use TLS on."),
             (false, None) => None,
@@ -2346,6 +2351,102 @@ impl RedisSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn tcp_port(session: &RedisSession) -> Option<String> {
+        session
+            .call("INFO", vec!["server".into()])
+            .await
+            .ok()?
+            .as_string()?
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("tcp_port:").map(str::to_string))
+    }
+
+    #[tokio::test]
+    async fn test_sentinel_finds_the_master() {
+        let Ok(url) = std::env::var("VILO_TEST_REDIS_SENTINEL") else {
+            return;
+        };
+        let session = RedisSession::connect(&url).await.unwrap();
+        assert!(!session.is_clustered());
+        session
+            .call("SET", vec!["vilo_test:sentinel".into(), "1".into()])
+            .await
+            .unwrap();
+        let role = session.call("ROLE", Vec::new()).await.unwrap();
+        assert_eq!(
+            role.into_array()
+                .first()
+                .and_then(|role| role.as_string())
+                .as_deref(),
+            Some("master"),
+            "writes go to the master Sentinel names"
+        );
+        let node = session.scan_nodes().remove(0);
+        let error = session
+            .monitor(&node, 5)
+            .await
+            .err()
+            .expect("the profiler does not go through Sentinel");
+        assert!(format!("{error:#}").contains("Sentinel"), "{error:#}");
+        session
+            .call("DEL", vec!["vilo_test:sentinel".into()])
+            .await
+            .unwrap();
+
+        // After a failover a new session reaches the new master.
+        let before = tcp_port(&session).await;
+        let sentinel_url = url.split('?').next().unwrap().replacen(
+            "redis-sentinel://:master-pw@",
+            "redis://:sentinel-pw@",
+            1,
+        );
+        let sentinel = RedisSession::connect(&sentinel_url).await.unwrap();
+        for _ in 0..2 {
+            sentinel
+                .call("SENTINEL", vec!["FAILOVER".into(), "mymaster".into()])
+                .await
+                .unwrap();
+            let mut moved = false;
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if let Ok(next) = RedisSession::connect(&url).await
+                    && tcp_port(&next).await != before
+                    && next
+                        .call("SET", vec!["vilo_test:sentinel".into(), "2".into()])
+                        .await
+                        .is_ok()
+                {
+                    moved = true;
+                    break;
+                }
+            }
+            if moved {
+                break;
+            }
+        }
+        let after = RedisSession::connect(&url).await.unwrap();
+        assert_ne!(
+            tcp_port(&after).await,
+            before,
+            "the new master, as Sentinel names it"
+        );
+        after
+            .call("DEL", vec!["vilo_test:sentinel".into()])
+            .await
+            .unwrap();
+        // Back to the first master, so the next run starts the same way.
+        sentinel
+            .call("SENTINEL", vec!["FAILOVER".into(), "mymaster".into()])
+            .await
+            .ok();
+
+        let wrong_password = url.replace("sentinelPassword=sentinel-pw", "sentinelPassword=nope");
+        assert!(RedisSession::connect(&wrong_password).await.is_err());
+        let unknown_master =
+            url.replace("sentinelServiceName=mymaster", "sentinelServiceName=other");
+        assert!(RedisSession::connect(&unknown_master).await.is_err());
+    }
 
     #[test]
     fn test_certificates_are_checked_against_the_url_host() {

@@ -208,8 +208,9 @@ fn certificates(path: &PathBuf, what: &str) -> Result<Vec<CertificateDer<'static
     Ok(certificates)
 }
 
-/// The rustls settings for these TLS options; certificates are checked against `host`.
-pub fn client_config(settings: &RedisTls, host: &str) -> Result<ClientConfig> {
+/// The rustls settings for these TLS options. Certificates are checked against `pinned` when
+/// given, else against the name each server is reached by (behind Sentinel, the master it names).
+pub fn client_config(settings: &RedisTls, pinned: Option<&str>) -> Result<ClientConfig> {
     let provider = provider();
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -233,14 +234,19 @@ pub fn client_config(settings: &RedisTls, host: &str) -> Result<ClientConfig> {
                 );
             }
         }
-        let name = ServerName::try_from(host.to_string())
-            .with_context(|| format!("{host} is not a valid TLS server name"))?;
         let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
             .build()
             .context("TLS could not be set up")?;
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedName { inner, name }))
+        match pinned {
+            Some(host) => {
+                let name = ServerName::try_from(host.to_string())
+                    .with_context(|| format!("{host} is not a valid TLS server name"))?;
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(PinnedName { inner, name }))
+            }
+            None => builder.with_webpki_verifier(inner),
+        }
     } else {
         // Not needed with the check off, but a path the user gave is still read, so a typo shows.
         if let Some(path) = &settings.ca_file {
@@ -316,7 +322,7 @@ mod tests {
             ..RedisTls::default()
         };
         assert!(
-            format!("{:#}", client_config(&half, "localhost").unwrap_err())
+            format!("{:#}", client_config(&half, Some("localhost")).unwrap_err())
                 .contains("both its certificate")
         );
         let missing = RedisTls {
@@ -324,19 +330,22 @@ mod tests {
             ..RedisTls::default()
         };
         assert!(
-            format!("{:#}", client_config(&missing, "localhost").unwrap_err())
-                .contains("Could not read")
+            format!(
+                "{:#}",
+                client_config(&missing, Some("localhost")).unwrap_err()
+            )
+            .contains("Could not read")
         );
         let unchecked_typo = RedisTls {
             verify: false,
-            ..missing.clone()
+            ..missing
         };
         assert!(
-            client_config(&unchecked_typo, "localhost").is_err(),
+            client_config(&unchecked_typo, Some("localhost")).is_err(),
             "a CA path given with the check off is still read"
         );
         assert!(
-            client_config(&RedisTls::default(), "localhost").is_ok(),
+            client_config(&RedisTls::default(), Some("localhost")).is_ok(),
             "system roots"
         );
         assert!(
@@ -345,7 +354,7 @@ mod tests {
                     verify: false,
                     ..RedisTls::default()
                 },
-                "localhost"
+                Some("localhost")
             )
             .is_ok()
         );
@@ -359,16 +368,22 @@ mod tests {
             verify: true,
         };
         assert!(
-            format!("{:#}", client_config(&mismatched, "localhost").unwrap_err())
-                .contains("do not match")
+            format!(
+                "{:#}",
+                client_config(&mismatched, Some("localhost")).unwrap_err()
+            )
+            .contains("do not match")
         );
         let not_pem = RedisTls {
             ca_file: Some(dir.join("server.ext")),
             ..RedisTls::default()
         };
         assert!(
-            format!("{:#}", client_config(&not_pem, "localhost").unwrap_err())
-                .contains("no certificate")
+            format!(
+                "{:#}",
+                client_config(&not_pem, Some("localhost")).unwrap_err()
+            )
+            .contains("no certificate")
         );
     }
 

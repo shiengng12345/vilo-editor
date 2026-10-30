@@ -338,7 +338,7 @@ impl RedisSession {
             (Some(server), _) => server.clone(),
             (None, ServerConfig::Centralized { server }) => server.clone(),
             _ => bail!(
-                "The profiler works on a single server or one cluster node; this connection is neither."
+                "The profiler does not work through Sentinel yet; connect to the master directly to profile it."
             ),
         };
         let host = server.host.to_string();

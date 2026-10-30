@@ -255,6 +255,9 @@ struct RedisFields {
     /// Kept from the saved string; see `RedisParts`.
     mode: String,
     query: String,
+    sentinel_master: Entity<Editor>,
+    sentinel_username: Entity<Editor>,
+    sentinel_password: Entity<Editor>,
     ca_file: Entity<Editor>,
     cert_file: Entity<Editor>,
     key_file: Entity<Editor>,
@@ -290,16 +293,36 @@ struct RedisParts {
     /// or `-sentinel` and the query, such as further `node=` seeds.
     mode: String,
     query: String,
+    /// Behind Sentinel (mode `-sentinel`): the master group, and the Sentinel's own sign-in when
+    /// it differs from the data nodes'.
+    sentinel_master: String,
+    sentinel_username: String,
+    sentinel_password: String,
 }
 
+/// Query parameters fred reads for Sentinel; the form shows them as fields.
+const SENTINEL_PARAMETERS: [&str; 3] = [
+    "sentinelServiceName",
+    "sentinelUsername",
+    "sentinelPassword",
+];
+
 impl RedisParts {
+    fn sentinel(&self) -> bool {
+        self.mode == "-sentinel"
+    }
+
     fn to_uri(&self) -> Result<String> {
         let scheme = format!("{}{}", if self.tls { "rediss" } else { "redis" }, self.mode);
-        let port = if self.port.is_empty() {
-            "6379"
-        } else {
-            &self.port
+        let port = match (self.port.as_str(), self.sentinel()) {
+            ("", true) => "26379",
+            ("", false) => "6379",
+            (port, _) => port,
         };
+        anyhow::ensure!(
+            !self.sentinel() || !self.sentinel_master.is_empty(),
+            "Fill in the master group name Sentinel watches."
+        );
         port.parse::<u16>().context("Port must be a number")?;
         let mut url = url::Url::parse(&format!("{scheme}://{}:{port}", self.host))
             .context("Host is not valid")?;
@@ -316,7 +339,23 @@ impl RedisParts {
                 .context("Database must be a number from 0")?;
             url.set_path(&format!("/{}", self.database));
         }
-        if !self.query.is_empty() {
+        if self.sentinel() {
+            let kept = url::form_urlencoded::parse(self.query.as_bytes())
+                .filter(|(name, _)| !SENTINEL_PARAMETERS.contains(&name.as_ref()))
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>();
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("sentinelServiceName", &self.sentinel_master);
+            if !self.sentinel_username.is_empty() {
+                pairs.append_pair("sentinelUsername", &self.sentinel_username);
+            }
+            if !self.sentinel_password.is_empty() {
+                pairs.append_pair("sentinelPassword", &self.sentinel_password);
+            }
+            for (name, value) in &kept {
+                pairs.append_pair(name, value);
+            }
+        } else if !self.query.is_empty() {
             url.set_query(Some(&self.query));
         }
         Ok(url.to_string())
@@ -324,6 +363,12 @@ impl RedisParts {
 
     fn from_uri(uri: &str) -> Option<Self> {
         let url = url::Url::parse(uri).ok()?;
+        let parameter = |name: &str| {
+            url.query_pairs()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default()
+        };
         let decode = |text: &str| {
             urlencoding::decode(text)
                 .map(|text| text.into_owned())
@@ -342,6 +387,9 @@ impl RedisParts {
                 .unwrap_or_default()
                 .to_string(),
             query: url.query().unwrap_or_default().to_string(),
+            sentinel_master: parameter("sentinelServiceName"),
+            sentinel_username: parameter("sentinelUsername"),
+            sentinel_password: parameter("sentinelPassword"),
         })
     }
 }
@@ -1083,6 +1131,25 @@ impl DatabaseView {
                     tls: false,
                     mode: String::new(),
                     query: String::new(),
+                    sentinel_master: editor("e.g. mymaster", "", false, window, cx),
+                    sentinel_username: editor(
+                        "Only if Sentinel has its own",
+                        "",
+                        false,
+                        window,
+                        cx,
+                    ),
+                    sentinel_password: editor(
+                        if existing.is_some() {
+                            "Leave empty to keep the saved one"
+                        } else {
+                            "Only if Sentinel has its own"
+                        },
+                        "",
+                        true,
+                        window,
+                        cx,
+                    ),
                 },
             ),
             editing,
@@ -1111,6 +1178,9 @@ impl DatabaseView {
                                     (&redis.username, parts.username),
                                     (&redis.password, parts.password),
                                     (&redis.database, parts.database),
+                                    (&redis.sentinel_master, parts.sentinel_master),
+                                    (&redis.sentinel_username, parts.sentinel_username),
+                                    (&redis.sentinel_password, parts.sentinel_password),
                                 ] {
                                     editor
                                         .update(cx, |editor, cx| editor.set_text(text, window, cx));
@@ -1155,6 +1225,9 @@ impl DatabaseView {
                 tls: redis.tls,
                 mode: redis.mode.clone(),
                 query: redis.query.clone(),
+                sentinel_master: text(&redis.sentinel_master, cx),
+                sentinel_username: text(&redis.sentinel_username, cx),
+                sentinel_password: text(&redis.sentinel_password, cx),
             };
             // An edited connection whose fields never loaded keeps its saved string.
             uri = if parts.host.is_empty() {
@@ -1978,6 +2051,27 @@ impl DatabaseView {
                                     })),
                             ),
                     )
+                    .child(
+                        Button::new("database-redis-sentinel", "Through Sentinel")
+                            .style(if redis.mode == "-sentinel" { ButtonStyle::Filled } else { ButtonStyle::Outlined })
+                            .start_icon(Icon::new(if redis.mode == "-sentinel" { IconName::Check } else { IconName::Circle }).size(IconSize::XSmall))
+                            .toggle_state(redis.mode == "-sentinel")
+                            .tooltip(Tooltip::text("Host and port are a Sentinel's; it names the current master"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(redis) = this.form.as_mut().and_then(|form| form.redis.as_mut()) {
+                                    redis.mode = if redis.mode == "-sentinel" { String::new() } else { "-sentinel".into() };
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .when(redis.mode == "-sentinel", |this| {
+                        this.child(input("Master group name", &redis.sentinel_master, cx)).child(
+                            h_flex()
+                                .gap_3()
+                                .child(div().flex_1().child(input("Sentinel username", &redis.sentinel_username, cx)))
+                                .child(div().flex_1().child(input("Sentinel password", &redis.sentinel_password, cx))),
+                        )
+                    })
                     .when(redis.tls, |this| {
                         this.child(input("CA certificate", &redis.ca_file, cx))
                             .child(
@@ -2464,6 +2558,50 @@ mod tests {
         let uri = parts.to_uri().unwrap();
         assert!(uri.starts_with("rediss://default:"));
         assert_eq!(RedisParts::from_uri(&uri), Some(parts));
+        let sentinel = RedisParts::from_uri(
+            "redis-sentinel://:data@s1:26379/2?sentinelServiceName=mymaster&sentinelPassword=s%26p&node=s2:26379",
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                sentinel.sentinel_master.as_str(),
+                sentinel.sentinel_password.as_str(),
+                sentinel.password.as_str()
+            ),
+            ("mymaster", "s&p", "data")
+        );
+        let saved = sentinel.to_uri().unwrap();
+        let again = RedisParts::from_uri(&saved).unwrap();
+        assert_eq!(
+            (
+                &again.sentinel_master,
+                &again.sentinel_password,
+                &again.password,
+                &again.database
+            ),
+            (
+                &sentinel.sentinel_master,
+                &sentinel.sentinel_password,
+                &sentinel.password,
+                &sentinel.database
+            )
+        );
+        assert_eq!(
+            again.to_uri().unwrap(),
+            saved,
+            "saving again changes nothing"
+        );
+        assert!(saved.contains("node=s2"), "{saved}");
+        assert!(
+            RedisParts {
+                host: "s1".into(),
+                mode: "-sentinel".into(),
+                ..Default::default()
+            }
+            .to_uri()
+            .is_err(),
+            "the master group name is needed"
+        );
         // An explicit cluster and its extra seeds survive an edit.
         for saved in [
             "redis-cluster://host-a:6379?node=host-b:6379",

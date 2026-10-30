@@ -17,7 +17,7 @@ anyhow.workspace = true
 base64.workspace = true
 futures.workspace = true
 mongodb = "3.3"
-fred = { version = "10.1", default-features = false, features = ["i-std", "i-memory", "i-cluster", "i-pubsub", "enable-rustls-ring"] }
+fred = { version = "10.1", default-features = false, features = ["i-std", "i-memory", "i-cluster", "i-pubsub", "enable-rustls-ring", "sentinel-auth"] }
 rustls = { workspace = true, features = ["ring"] }
 rustls-native-certs = "0.8"
 tokio-rustls = { workspace = true, features = ["ring", "tls12"] }
