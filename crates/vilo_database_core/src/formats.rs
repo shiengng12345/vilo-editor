@@ -414,7 +414,8 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
                 out.push(" {\n");
                 for (name, value) in fields {
                     out.push(&indent);
-                    out.push(name);
+                    // A field name from the data never adds a line of its own.
+                    out.push(&name.replace(|character: char| character.is_control(), "?"));
                     out.push(": ");
                     render(arena, *value, depth + 1, path, out);
                     out.push(",\n");
@@ -712,9 +713,10 @@ impl Php<'_> {
                     return self.error("a reference to a value that does not exist");
                 };
                 // A reference is not a value of its own for later references' numbering, but
-                // `r:` counts as one in PHP; both are kept as the value they point at.
+                // `r:` counts as one in PHP; both are kept as the value they point at, and each
+                // use is an entry.
+                self.arena.entries(1)?;
                 if kind == b'r' {
-                    self.arena.entries(1)?;
                     self.values.push(target);
                 }
                 Ok(target)
@@ -816,18 +818,22 @@ impl Php<'_> {
             return self.error("a property name too long");
         }
         // Visibility is read from the bytes, before a name that is not text is escaped.
-        let text = |bytes: &[u8]| {
-            String::from_utf8(bytes.to_vec())
-                .unwrap_or_else(|error| crate::redis::quote_bytes(error.as_bytes()))
-        };
         let split = name.strip_prefix(b"\0").and_then(|rest| {
             let end = rest.iter().position(|byte| *byte == 0)?;
             Some((&rest[..end], &rest[end + 1..]))
         });
+        // Names are always quoted, with visibility outside the quotes, so a public name cannot
+        // pass for a protected one or break the layout.
+        let quoted = |bytes: &[u8]| match std::str::from_utf8(bytes) {
+            Ok(text) => serde_json::Value::String(text.to_string()).to_string(),
+            Err(_) => crate::redis::quote_bytes(bytes),
+        };
         Ok(match split {
-            Some((b"*", property)) => format!("{} (protected)", text(property)),
-            Some((class, property)) => format!("{} (private to {})", text(property), text(class)),
-            None => text(&name),
+            Some((b"*", property)) => format!("{} (protected)", quoted(property)),
+            Some((class, property)) => {
+                format!("{} (private to {})", quoted(property), quoted(class))
+            }
+            None => quoted(&name),
         })
     }
 }
@@ -2415,12 +2421,21 @@ mod tests {
         let object = "O:4:\"User\":5:{s:4:\"name\";s:3:\"Ann\";s:5:\"\0*\0id\";i:7;s:12:\"\0User\0secret\";s:1:\"s\";s:4:\"tags\";a:2:{s:1:\"x\";i:1;i:2;a:3:{i:0;b:1;i:1;N;i:2;d:1.5;}}s:4:\"self\";r:1;}";
         let text = decode(Decoder::Php, object.as_bytes()).unwrap();
         assert!(text.starts_with("User {"), "{text}");
-        assert!(text.contains("id (protected): 7"));
-        assert!(text.contains(r#"secret (private to User): "s""#));
+        assert!(text.contains(r#""id" (protected): 7"#), "{text}");
+        assert!(text.contains(r#""secret" (private to "User"): "s""#));
         assert!(
-            text.contains("self: <refers back to an enclosing value>"),
+            text.contains(r#""self": <refers back to an enclosing value>"#),
             "{text}"
         );
+        // A public name that spells a marker, or holds a newline, stays visibly a name.
+        let forged = b"O:1:\"A\":2:{s:13:\"x (protected)\";i:1;s:4:\"\x00*\x00x\";i:2;}";
+        let shown = decode(Decoder::Php, forged).unwrap();
+        assert!(
+            shown.contains(r#""x (protected)": 1"#) && shown.contains(r#""x" (protected): 2"#),
+            "{shown}"
+        );
+        let lines = decode(Decoder::Php, b"O:1:\"A\":1:{s:3:\"a\nb\";i:1;}").unwrap();
+        assert!(lines.contains(r#""a\nb": 1"#), "{lines}");
         assert!(text.contains("true") && text.contains("null") && text.contains("1.5"));
         // php 8.3: r: takes a number for later references, R: does not.
         let refs = "a:4:{i:0;O:8:\"stdClass\":0:{}i:1;r:2;i:2;O:8:\"stdClass\":0:{}i:3;r:4;}";
