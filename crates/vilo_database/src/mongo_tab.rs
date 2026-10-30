@@ -287,6 +287,9 @@ pub(crate) struct MongoTab {
     indexes: Option<Fetch<Vec<Document>>>,
     /// Field paths seen in this collection, shared with the query fields' completions.
     fields: Rc<RefCell<Vec<String>>>,
+    /// Filters the Indexes list by name or field.
+    index_search: Entity<Editor>,
+    _index_search_changed: Option<gpui::Subscription>,
     /// Index names whose definition is open in the Indexes list.
     open_indexes: HashSet<String>,
     /// The sample size and its fields.
@@ -374,6 +377,8 @@ impl MongoTab {
             explain_raw: false,
             indexes: None,
             open_indexes: HashSet::default(),
+            index_search: editor("Search indexes by name or field", "", false, window, cx),
+            _index_search_changed: None,
             fields,
             schema: None,
             options: None,
@@ -816,20 +821,35 @@ fn compass_empty(
         .into_any_element()
 }
 
-/// Compass's outlined pill, used for index types and properties.
-fn compass_pill(text: String, cx: &App) -> gpui::Div {
-    let colors = cx.theme().colors();
+/// A tinted pill for index types and properties, coloured by what it says.
+fn compass_pill(text: String) -> gpui::Div {
+    let color: gpui::Hsla = rgb(match text.split(' ').next().unwrap_or_default() {
+        "REGULAR" => 0x0498EC,
+        "TEXT" => 0xFFC010,
+        "GEOSPATIAL" => 0x00ED64,
+        "HASHED" => 0xFF8C42,
+        "WILDCARD" => 0xB45AF2,
+        "UNIQUE" => 0x00ED64,
+        "PARTIAL" => 0xFFC010,
+        "TTL" => 0xFF6960,
+        "SPARSE" => 0xB45AF2,
+        "COLLATION" => 0x0498EC,
+        _ => 0x889397,
+    })
+    .into();
     div()
+        .flex_none()
         .px_2()
         .py_0p5()
         .rounded_full()
         .border_1()
-        .border_color(colors.border)
-        .bg(colors.element_background)
+        .border_color(color.opacity(0.5))
+        .bg(color.opacity(0.15))
         .child(
             Label::new(text.to_uppercase())
                 .size(LabelSize::XSmall)
-                .weight(gpui::FontWeight::SEMIBOLD),
+                .weight(gpui::FontWeight::SEMIBOLD)
+                .color(Color::Custom(color)),
         )
 }
 
@@ -875,6 +895,11 @@ impl DatabaseView {
         if let Some(language) = &self.query_language {
             tab.set_query_language(language, cx);
         }
+        tab._index_search_changed = Some(
+            cx.subscribe(&tab.index_search, |_, _, _: &editor::EditorEvent, cx| {
+                cx.notify()
+            }),
+        );
         if let Some(session) = self.mongo() {
             let connection = self.generation;
             let task = run(cx, async move {
@@ -2970,6 +2995,7 @@ impl DatabaseView {
                     .start_icon(Icon::new(IconName::RotateCw).size(IconSize::XSmall))
                     .on_click(cx.listener(|this, _, _, cx| this.load_indexes(cx))),
             )
+            .child(div().w(px(280.)).child(boxed(tab.index_search.clone(), cx)))
             .child(div().flex_1())
             .child(
                 Label::new("VIEWING")
@@ -3033,77 +3059,80 @@ impl DatabaseView {
                 .child(header("Type", Some(120.)))
                 .child(header("Properties", Some(260.))),
         );
+        let search = tab.index_search.read(cx).text(cx).trim().to_lowercase();
         for index in indexes {
             let keys = index.get_document("key").cloned().unwrap_or_default();
             let name = index.get_str("name").unwrap_or_default().to_string();
+            if !search.is_empty()
+                && !name.to_lowercase().contains(&search)
+                && !keys.keys().any(|key| key.to_lowercase().contains(&search))
+            {
+                continue;
+            }
             let open = tab.open_indexes.contains(&name);
             let toggle = name.clone();
-            table = table.child(
-                v_flex()
-                    .id(SharedString::from(format!("database-index-{name}")))
-                    .px_3()
-                    .py_2()
-                    .gap_1()
-                    .border_b_1()
-                    .border_color(colors.border_variant)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(colors.element_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(tab) = this.tab_mut()
-                            && !tab.open_indexes.remove(&toggle)
-                        {
-                            tab.open_indexes.insert(toggle.clone());
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap_2()
-                                    .child(
-                                        Icon::new(if open {
-                                            IconName::ChevronDown
-                                        } else {
-                                            IconName::ChevronRight
-                                        })
-                                        .size(IconSize::Small),
-                                    )
-                                    .child(Label::new(name.clone()).buffer_font(cx).truncate()),
-                            )
-                            .child(
-                                div()
-                                    .w(px(120.))
-                                    .flex_none()
-                                    .child(compass_pill(index_type(&keys).to_string(), cx)),
-                            )
-                            .child(
-                                h_flex()
-                                    .w(px(260.))
-                                    .flex_none()
-                                    .gap_1()
-                                    .flex_wrap()
-                                    .children(
-                                        index_properties(index)
-                                            .into_iter()
-                                            .map(|property| compass_pill(property, cx)),
-                                    ),
-                            ),
-                    )
-                    .when(open, |this| {
-                        this.child(
-                            div().pl_6().child(
-                                Label::new(to_display_json(&keys))
-                                    .size(LabelSize::Small)
-                                    .buffer_font(cx)
-                                    .color(Color::Muted),
-                            ),
+            table =
+                table.child(
+                    v_flex()
+                        .id(SharedString::from(format!("database-index-{name}")))
+                        .px_3()
+                        .py_2()
+                        .gap_1()
+                        .border_b_1()
+                        .border_color(colors.border_variant)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(colors.element_hover))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(tab) = this.tab_mut()
+                                && !tab.open_indexes.remove(&toggle)
+                            {
+                                tab.open_indexes.insert(toggle.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_2()
+                                        .child(
+                                            Icon::new(if open {
+                                                IconName::ChevronDown
+                                            } else {
+                                                IconName::ChevronRight
+                                            })
+                                            .size(IconSize::Small),
+                                        )
+                                        .child(Label::new(name.clone()).buffer_font(cx).truncate()),
+                                )
+                                .child(div().w(px(120.)).flex_none().child(
+                                    h_flex().child(compass_pill(index_type(&keys).to_string())),
+                                ))
+                                .child(
+                                    h_flex()
+                                        .w(px(260.))
+                                        .flex_none()
+                                        .gap_1()
+                                        .flex_wrap()
+                                        .children(
+                                            index_properties(index).into_iter().map(compass_pill),
+                                        ),
+                                ),
                         )
-                    }),
-            );
+                        .when(open, |this| {
+                            this.child(
+                                div().pl_6().child(
+                                    Label::new(to_display_json(&keys))
+                                        .size(LabelSize::Small)
+                                        .buffer_font(cx)
+                                        .color(Color::Muted),
+                                ),
+                            )
+                        }),
+                );
         }
         v_flex()
             .flex_1()
