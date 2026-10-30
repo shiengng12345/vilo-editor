@@ -1179,45 +1179,84 @@ impl DatabaseView {
                     continue;
                 }
                 let id = connection.id.clone();
-                tree = tree.child(
-                    h_flex()
-                        .id(SharedString::from(format!(
-                            "database-connection-{}",
-                            connection.id
-                        )))
-                        .px_2()
-                        .py_1()
-                        .gap_1p5()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .when(active, |this| this.bg(colors.element_selected))
-                        .hover(|style| style.bg(colors.element_hover))
-                        .on_click(cx.listener(move |this, _, _, cx| this.connect(id.clone(), cx)))
-                        .child(
-                            Icon::new(if active {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .size(IconSize::XSmall)
+                let (edit_id, menu_id) = (connection.id.clone(), connection.id.clone());
+                let group =
+                    SharedString::from(format!("database-connection-group-{}", connection.id));
+                let row = h_flex()
+                    .id(SharedString::from(format!(
+                        "database-connection-{}",
+                        connection.id
+                    )))
+                    .group(group.clone())
+                    .px_2()
+                    .py_1()
+                    .gap_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(active, |this| this.bg(colors.element_selected))
+                    .hover(|style| style.bg(colors.element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.connect(id.clone(), cx)))
+                    .child(
+                        Icon::new(if active {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::DatabaseZap)
+                            .size(IconSize::Small)
                             .color(Color::Muted),
+                    )
+                    .child(Label::new(connection.name.clone()).truncate())
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!(
+                                "database-connection-edit-{}",
+                                connection.id
+                            )),
+                            IconName::Pencil,
                         )
-                        .child(
-                            Icon::new(IconName::DatabaseZap)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(Label::new(connection.name.clone()).truncate())
-                        .child(div().flex_1())
-                        .child(
-                            Label::new(connection.environment.clone())
-                                .size(LabelSize::XSmall)
-                                .color(if connection.production() {
-                                    Color::Warning
-                                } else {
-                                    Color::Muted
-                                }),
-                        ),
+                        .icon_size(IconSize::XSmall)
+                        .visible_on_hover(group)
+                        .tooltip(Tooltip::text("Edit connection"))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_form(Some(edit_id.clone()), window, cx)
+                            },
+                        )),
+                    )
+                    .child(
+                        Label::new(connection.environment.clone())
+                            .size(LabelSize::XSmall)
+                            .color(if connection.production() {
+                                Color::Warning
+                            } else {
+                                Color::Muted
+                            }),
+                    );
+                let view = cx.entity().downgrade();
+                tree = tree.child(
+                    right_click_menu(SharedString::from(format!(
+                        "database-connection-menu-{}",
+                        connection.id
+                    )))
+                    .trigger(move |_, _, _| row)
+                    .menu(move |window, cx| {
+                        let (view, id) = (view.clone(), menu_id.clone());
+                        ContextMenu::build(window, cx, move |menu, _, _| {
+                            menu.entry("Edit connection…", None, move |window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.open_form(Some(id.clone()), window, cx)
+                                })
+                                .ok();
+                            })
+                        })
+                    }),
                 );
                 if !mongo_open {
                     continue;
