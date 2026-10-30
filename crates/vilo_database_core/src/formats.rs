@@ -1470,6 +1470,12 @@ impl Java<'_> {
                 Handle::Value(_) => self.error("a class reference to a value"),
             },
             0x72 => {
+                // Every description is kept with its handle; each counts as a step and an entry.
+                self.steps += 1;
+                self.arena.entries(1)?;
+                if self.steps > MAX_STEPS {
+                    return self.error("too much to read");
+                }
                 let name = self.utf(false)?;
                 self.arena.charge(name.len())?;
                 self.take(8)?;
@@ -1509,6 +1515,11 @@ impl Java<'_> {
                 Ok(Some(class))
             }
             0x7D => {
+                self.steps += 1;
+                self.arena.entries(1)?;
+                if self.steps > MAX_STEPS {
+                    return self.error("too much to read");
+                }
                 let slot = self.handle(Handle::Value(0));
                 let count = u32::from_be_bytes(self.array()?);
                 let mut names = Vec::new();
@@ -1715,16 +1726,18 @@ impl Java<'_> {
                     chain.push(class);
                 }
                 let mut fields = Vec::new();
-                for class in chain.iter().rev() {
-                    if class.flags & SC_EXTERNALIZABLE != 0 {
-                        if class.flags & SC_BLOCK_DATA == 0 {
-                            return self.error("old-style externalizable data cannot be read");
-                        }
-                        let items = self.annotations(depth + 1)?;
-                        let custom = self.arena.add(Node::List(items))?;
-                        fields.push((format!("{} external data", class.name), custom));
-                        continue;
+                // An externalizable object writes one external-data section for itself, not
+                // one per class (ObjectOutputStream's writeExternalData).
+                if class.flags & SC_EXTERNALIZABLE != 0 {
+                    if class.flags & SC_BLOCK_DATA == 0 {
+                        return self.error("old-style externalizable data cannot be read");
                     }
+                    let items = self.annotations(depth + 1)?;
+                    let custom = self.arena.add(Node::List(items))?;
+                    fields.push((format!("{} external data", class.name), custom));
+                    chain.clear();
+                }
+                for class in chain.iter().rev() {
                     if class.flags & SC_WRITE_METHOD == 0 {
                         fields.extend(self.default_fields(class, depth)?);
                         continue;
@@ -1992,67 +2005,102 @@ fn raw_unicode_escape(bytes: &[u8]) -> Option<Node> {
 /// What makes two pickled dict keys the same key, as Python compares them: equal numbers are
 /// one key whatever their type (1, 1.0 and True), text and bytes by content, tuples by their
 /// items. Keys this cannot compare (objects) are never merged.
+/// Fingerprints worked out so far, with the bytes they hold (counted against `MAX_BYTES`).
+#[derive(Default)]
+struct Fingerprints {
+    known: std::collections::HashMap<Id, Vec<u8>>,
+    bytes: usize,
+}
+
+/// What a value is compared by as a dict key or set member. A key too large or too deeply
+/// nested to compare by value is the same key only as itself (its identity).
 fn fingerprint(
     arena: &Arena,
-    cache: &mut std::collections::HashMap<Id, Option<Vec<u8>>>,
+    cache: &mut Fingerprints,
     id: Id,
     depth: usize,
-) -> Option<Vec<u8>> {
-    if let Some(known) = cache.get(&id) {
-        return known.clone();
+) -> Result<Vec<u8>, String> {
+    let mut deep = false;
+    fingerprint_at(arena, cache, id, depth, &mut deep)
+}
+
+/// `deep` is set when the depth limit shaped the result; such a result depends on where the
+/// value was reached and is not remembered.
+fn fingerprint_at(
+    arena: &Arena,
+    cache: &mut Fingerprints,
+    id: Id,
+    depth: usize,
+    deep: &mut bool,
+) -> Result<Vec<u8>, String> {
+    if let Some(known) = cache.known.get(&id) {
+        return Ok(known.clone());
     }
-    // A key too large or deep to compare by value is still the same key as itself.
-    let found = Some(dict_key(arena, cache, id, depth).unwrap_or_else(|| identity(id)));
-    cache.insert(id, found.clone());
-    found
+    let mut shaped = false;
+    let found = dict_key(arena, cache, id, depth, &mut shaped)?.unwrap_or_else(|| identity(id));
+    if shaped {
+        *deep = true;
+    } else {
+        cache.bytes = cache.bytes.saturating_add(found.len());
+        if cache.bytes > MAX_BYTES {
+            return Err("too many dict keys to compare; not read further".into());
+        }
+        cache.known.insert(id, found.clone());
+    }
+    Ok(found)
 }
 
 fn dict_key(
     arena: &Arena,
-    cache: &mut std::collections::HashMap<Id, Option<Vec<u8>>>,
+    cache: &mut Fingerprints,
     id: Id,
     depth: usize,
-) -> Option<Vec<u8>> {
+    deep: &mut bool,
+) -> Result<Option<Vec<u8>>, String> {
     /// Keys larger than this are shown as they are but not compared with others; comparing
     /// nested shared tuples could otherwise take unbounded memory.
     const MAX_KEY: usize = 4096;
     if depth > 16 {
-        return None;
+        *deep = true;
+        return Ok(None);
     }
-    Some(match arena.nodes.get(id)? {
+    let Some(node) = arena.nodes.get(id) else {
+        return Ok(None);
+    };
+    Ok(Some(match node {
         Node::Null => b"n".to_vec(),
         Node::Bool(flag) => format!("i{}", i128::from(*flag)).into_bytes(),
         // Integers are kept in their plain form when read, so the text is the number.
-        Node::Int(text) if text.len() > MAX_KEY => return None,
+        Node::Int(text) if text.len() > MAX_KEY => return Ok(None),
         Node::Int(text) => [b"i".as_slice(), text.as_bytes()].concat(),
-        // An integer-valued float equals that integer, however large.
-        Node::Float(value) if float_integer(*value).is_some() => {
-            [b"i".as_slice(), float_integer(*value)?.as_bytes()].concat()
-        }
         // NaN equals no other NaN, but Python finds a key by identity first, so the same NaN
         // object reused through the memo is one key.
         Node::Float(value) if value.is_nan() => identity(id),
-        Node::Float(value) => format!("f{}", value.to_bits()).into_bytes(),
-        Node::Text(text) if text.len() > MAX_KEY => return None,
+        // An integer-valued float equals that integer, however large.
+        Node::Float(value) => match float_integer(*value) {
+            Some(integer) => [b"i".as_slice(), integer.as_bytes()].concat(),
+            None => format!("f{}", value.to_bits()).into_bytes(),
+        },
+        Node::Text(text) if text.len() > MAX_KEY => return Ok(None),
         Node::Text(text) => [b"s".as_slice(), text.as_bytes()].concat(),
-        Node::Utf16(units) if units.len() * 2 > MAX_KEY => return None,
-        Node::CodePoints(points) if points.len() * 4 > MAX_KEY => return None,
+        Node::Utf16(units) if units.len() * 2 > MAX_KEY => return Ok(None),
+        Node::CodePoints(points) if points.len() * 4 > MAX_KEY => return Ok(None),
         Node::CodePoints(points) => std::iter::once(b'p')
             .chain(points.iter().flat_map(|point| point.to_le_bytes()))
             .collect(),
         Node::Utf16(units) => std::iter::once(b'u')
             .chain(units.iter().flat_map(|unit| unit.to_le_bytes()))
             .collect(),
-        Node::Bytes(bytes) if bytes.len() > MAX_KEY => return None,
+        Node::Bytes(bytes) if bytes.len() > MAX_KEY => return Ok(None),
         Node::Bytes(bytes) => [b"b".as_slice(), bytes].concat(),
         Node::Tuple(items) => {
             let mut key = b"(".to_vec();
             for item in items {
-                let part = fingerprint(arena, cache, *item, depth + 1)?;
+                let part = fingerprint_at(arena, cache, *item, depth + 1, deep)?;
                 key.extend_from_slice(&part.len().to_le_bytes());
                 key.extend_from_slice(&part);
                 if key.len() > MAX_KEY {
-                    return None;
+                    return Ok(None);
                 }
             }
             key
@@ -2063,10 +2111,10 @@ fn dict_key(
             let mut parts = Vec::new();
             let mut size = 0_usize;
             for member in members {
-                let part = fingerprint(arena, cache, *member, depth + 1)?;
+                let part = fingerprint_at(arena, cache, *member, depth + 1, deep)?;
                 size += part.len() + 8;
                 if size > MAX_KEY {
-                    return None;
+                    return Ok(None);
                 }
                 parts.push(part);
             }
@@ -2075,15 +2123,12 @@ fn dict_key(
             for part in parts {
                 key.extend_from_slice(&part.len().to_le_bytes());
                 key.extend_from_slice(&part);
-                if key.len() > MAX_KEY {
-                    return None;
-                }
             }
             key
         }
         // Objects and names compare by identity, as Python's default equality does.
         _ => identity(id),
-    })
+    }))
 }
 
 /// A finite float with no fractional part as its exact integer text (`None` otherwise).
@@ -2123,13 +2168,13 @@ fn identity(id: Id) -> Vec<u8> {
 #[derive(Default)]
 struct Keys {
     positions: std::collections::HashMap<(Id, Vec<u8>), usize>,
-    fingerprints: std::collections::HashMap<Id, Option<Vec<u8>>>,
+    fingerprints: Fingerprints,
 }
 
 /// Adds members the way Python's set does: one equal to a member already there is dropped.
 fn add_to_set(arena: &mut Arena, keys: &mut Keys, set: Id, items: Vec<Id>) -> Result<(), String> {
     for item in items {
-        let fingerprint = fingerprint(arena, &mut keys.fingerprints, item, 0);
+        let fingerprint = Some(fingerprint(arena, &mut keys.fingerprints, item, 0)?);
         if let Some(fingerprint) = &fingerprint {
             if keys.positions.contains_key(&(set, fingerprint.clone())) {
                 continue;
@@ -2205,7 +2250,7 @@ fn set_items(
     pairs: Vec<(Id, Id)>,
 ) -> Result<(), String> {
     for (key, value) in pairs {
-        let fingerprint = fingerprint(arena, &mut keys.fingerprints, key, 0);
+        let fingerprint = Some(fingerprint(arena, &mut keys.fingerprints, key, 0)?);
         // Remembered fingerprints are held text too.
         if let Some(fingerprint) = &fingerprint {
             arena.charge(fingerprint.len())?;
@@ -2868,10 +2913,10 @@ mod tests {
             keys.extend_from_slice(b"\x86h\x01s");
         }
         keys.push(b'.');
+        let refused = decode(Decoder::Pickle, &keys).unwrap_err();
         assert!(
-            decode(Decoder::Pickle, &keys)
-                .unwrap_err()
-                .contains("MB of text")
+            refused.contains("MB of text") || refused.contains("dict keys"),
+            "{refused}"
         );
         let class = format!("O:5000:\"{}\":0:{{}}", "\u{ff}".repeat(2500));
         assert!(
@@ -3014,6 +3059,29 @@ mod tests {
             "the reused key is one key, as in Python"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_depth_does_not_poison_keys() {
+        // python3: two entries, the nested tuple and 1: 2.
+        let mut data = b"}K\x01q\x000h\x00".to_vec();
+        data.extend(std::iter::repeat_n(0x85, 17));
+        data.extend_from_slice(b"K\x00sh\x00K\x01sK\x01K\x02s.");
+        let text = decode(Decoder::Pickle, &data).unwrap();
+        assert!(text.contains("1: 2") && !text.contains("1: 1"), "{text}");
+        // Externalizable Child extends Parent: one external section for the object.
+        let mut external = b"\xac\xed\x00\x05\x73\x72\x00\x05Child".to_vec();
+        external.extend_from_slice(&[0; 8]);
+        external.extend_from_slice(&[0x0c, 0x00, 0x00, 0x78, 0x72, 0x00, 0x06]);
+        external.extend_from_slice(b"Parent");
+        external.extend_from_slice(&[0; 8]);
+        external.extend_from_slice(&[0x0c, 0x00, 0x00, 0x78, 0x70]);
+        external.extend_from_slice(&[0x77, 0x04, 0, 0, 0, 42, 0x78]);
+        let text = decode(Decoder::Java, &external).unwrap();
+        assert!(
+            text.contains("Child external data") && !text.contains("Parent external"),
+            "{text}"
+        );
     }
 
     #[test]
