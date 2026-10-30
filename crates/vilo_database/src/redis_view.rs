@@ -270,7 +270,7 @@ impl RedisState {
                 keys.sort();
                 keys.into_iter()
                     .map(|key| KeyRow::Key {
-                        label: key_label(&key),
+                        label: escape_bytes(&key),
                         key,
                         depth: 0,
                     })
@@ -283,19 +283,6 @@ impl RedisState {
 }
 
 /// Printable ASCII as is, everything else as `\xNN`, so different bytes never look the same.
-/// A key name for the list: spaces at either end show as ␣, so " a" and "a" never look the same.
-fn key_label(bytes: &[u8]) -> String {
-    let text = escape_bytes(bytes);
-    let start = text.len() - text.trim_start_matches(' ').len();
-    let end = text.trim_end_matches(' ').len().max(start);
-    format!(
-        "{}{}{}",
-        "␣".repeat(start),
-        &text[start..end],
-        "␣".repeat(text.len() - end)
-    )
-}
-
 pub(crate) fn escape_bytes(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -473,7 +460,7 @@ fn tree_rows(keys: &[Bytes], delimiter: &[u8], expanded: &HashSet<Bytes>) -> Vec
     ) {
         for (prefix, child) in &folder.folders {
             let open = expanded.contains(prefix);
-            let label = key_label(&prefix[parent..prefix.len() - delimiter.len()]);
+            let label = escape_bytes(&prefix[parent..prefix.len() - delimiter.len()]);
             rows.push(KeyRow::Folder {
                 prefix: prefix.clone(),
                 label,
@@ -489,7 +476,7 @@ fn tree_rows(keys: &[Bytes], delimiter: &[u8], expanded: &HashSet<Bytes>) -> Vec
         keys.sort();
         for key in keys {
             rows.push(KeyRow::Key {
-                label: key_label(&key[parent..]),
+                label: escape_bytes(&key[parent..]),
                 key,
                 depth,
             });
@@ -1431,7 +1418,7 @@ impl DatabaseView {
                     .gap_2()
                     .child(badge(&detail.info.kind))
                     .child(
-                        Label::new(key_label(&detail.key))
+                        Label::new(escape_bytes(&detail.key))
                             .size(LabelSize::Large)
                             .weight(gpui::FontWeight::SEMIBOLD)
                             .single_line()
@@ -2134,9 +2121,6 @@ mod tests {
     #[test]
     fn test_formats_numbers_and_info() {
         assert_eq!(escape_bytes(b"a\\x00"), "a\\\\x00");
-        assert_eq!(key_label(b" a b "), "␣a b␣");
-        assert_eq!(key_label(b"  "), "␣␣");
-        assert_eq!(key_label(b"a"), "a");
         assert_ne!(escape_bytes(b"a\\x00"), escape_bytes(b"a\x00"));
         assert_eq!(formatted(br#"{"a":1}"#, Format::Json), "{\n  \"a\": 1\n}");
         assert_eq!(formatted(b"\xff", Format::Unicode), "\\xff");
