@@ -768,19 +768,33 @@ impl RedisSession {
                 hostnames: fred::types::config::TlsHostMapping::None,
             });
         }
-        let session = match Self::open(config, database, tls_config.clone()).await {
-            Err(error)
-                if format!("{error:#}").contains("SELECT is not allowed in cluster mode") =>
-            {
-                bail!("This server is a cluster node, and a cluster only has database 0.")
+        let selects = database
+            .or(config.database)
+            .is_some_and(|database| database > 0);
+        let session = match Self::open(config.clone(), database, tls_config.clone()).await {
+            Ok(session) => session,
+            // A cluster node refuses SELECT; asked once more without it, the node says whether it
+            // is one, whatever words its refusal used.
+            Err(error) if selects => {
+                let mut plain = config;
+                plain.database = None;
+                if let Ok(probe) = Self::open(plain, None, tls_config.clone()).await {
+                    let cluster = probe.is_cluster_node().await.unwrap_or(false);
+                    probe.quit().await.ok();
+                    anyhow::ensure!(
+                        !cluster,
+                        "This server is a cluster node, and a cluster only has database 0."
+                    );
+                }
+                return Err(error);
             }
-            opened => opened?,
+            Err(error) => return Err(error),
         };
         if session.clustered {
             return Ok(session);
         }
-        let info = match session.call("INFO", vec!["cluster".into()]).await {
-            Ok(info) => info.as_string().unwrap_or_default(),
+        let cluster = match session.is_cluster_node().await {
+            Ok(cluster) => cluster,
             // Without INFO there is no telling; a working single connection is kept, and said.
             Err(error) => {
                 let mut session = session;
@@ -791,11 +805,7 @@ impl RedisSession {
             }
         };
         let Server { host, port, .. } = match &session.config.server {
-            fred::types::config::ServerConfig::Centralized { server }
-                if info.lines().any(|line| line.trim() == "cluster_enabled:1") =>
-            {
-                server.clone()
-            }
+            fred::types::config::ServerConfig::Centralized { server } if cluster => server.clone(),
             _ => return Ok(session),
         };
         anyhow::ensure!(
@@ -809,6 +819,16 @@ impl RedisSession {
             fred::types::config::ServerConfig::new_clustered(vec![(host.to_string(), port)]);
         cluster.database = None;
         Self::open(cluster, None, tls_config).await
+    }
+
+    /// Whether the server this single connection reached runs in cluster mode.
+    async fn is_cluster_node(&self) -> Result<bool> {
+        let info = self.call("INFO", vec!["cluster".into()]).await?;
+        Ok(info
+            .as_string()
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.trim() == "cluster_enabled:1"))
     }
 
     async fn open(

@@ -343,7 +343,10 @@ impl RedisSession {
         let port = server.port;
         // The node's own name for the handshake; the certificate is checked against the
         // connected host by the session's verifier.
-        let tls = self.tls.clone().map(|config| (config, host.clone()));
+        let tls = self
+            .tls
+            .clone()
+            .map(|config| (config, host.trim_matches(['[', ']']).to_string()));
         let username = self.config.username.clone();
         let password = self.config.password.clone();
         let shared = Arc::new(Mutex::new(Shared::default()));
