@@ -45,6 +45,15 @@ impl Default for RedisTls {
     }
 }
 
+/// Whether a Redis connection string asks for TLS: `rediss://`, `rediss-cluster://`,
+/// `rediss-sentinel://` and their `valkeys` forms.
+pub fn tls_scheme(uri: &str) -> bool {
+    uri.split_once("://").is_some_and(|(scheme, _)| {
+        let scheme = scheme.to_ascii_lowercase();
+        scheme.starts_with("rediss") || scheme.starts_with("valkeys")
+    })
+}
+
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
@@ -213,6 +222,22 @@ mod tests {
 
     fn test_files() -> Option<PathBuf> {
         std::env::var("VILO_TEST_TLS_DIR").ok().map(PathBuf::from)
+    }
+
+    #[test]
+    fn test_tls_schemes() {
+        for uri in [
+            "rediss://h:1",
+            "rediss-cluster://h:1",
+            "rediss-sentinel://h:1",
+            "valkeys://h",
+            "REDISS://h",
+        ] {
+            assert!(tls_scheme(uri), "{uri}");
+        }
+        for uri in ["redis://h", "redis-cluster://h", "h:6379", ""] {
+            assert!(!tls_scheme(uri), "{uri}");
+        }
     }
 
     #[test]

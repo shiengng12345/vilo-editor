@@ -325,7 +325,7 @@ impl RedisParts {
             username: decode(url.username()),
             password: url.password().map(decode).unwrap_or_default(),
             database: url.path().trim_start_matches('/').to_string(),
-            tls: url.scheme() == "rediss",
+            tls: vilo_database_core::redis_tls::tls_scheme(uri),
         })
     }
 }
@@ -456,7 +456,7 @@ async fn connect(connection: &Connection, uri: String, cx: &AsyncApp) -> Result<
             let tls = connection
                 .redis_tls
                 .clone()
-                .filter(|_| uri.starts_with("rediss://"));
+                .filter(|_| vilo_database_core::redis_tls::tls_scheme(&uri));
             cx.update(|cx| {
                 run(cx, async move {
                     Ok(Session::Redis(Arc::new(

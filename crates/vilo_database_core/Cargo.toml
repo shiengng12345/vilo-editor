@@ -21,6 +21,7 @@ fred = { version = "10.1", default-features = false, features = ["i-std", "i-mem
 rustls = { workspace = true, features = ["ring"] }
 rustls-native-certs = "0.8"
 tokio-rustls = { workspace = true, features = ["ring", "tls12"] }
+url.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true

@@ -988,7 +988,7 @@ impl DatabaseView {
                 let tls = connection
                     .redis_tls
                     .clone()
-                    .filter(|_| uri.starts_with("rediss://"));
+                    .filter(|_| vilo_database_core::redis_tls::tls_scheme(&uri));
                 let task = cx.update(|cx| {
                     run(cx, async move {
                         vilo_database_core::redis::RedisSession::connect_with(

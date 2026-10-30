@@ -669,6 +669,19 @@ pub(crate) fn cluster_hash(name: &str, args: &[Value]) -> fred::types::ClusterHa
     }
 }
 
+/// The host a connection string names, which TLS certificates are checked against. Taken from
+/// the URL itself rather than from fred's seeds, which put `node=` entries first.
+fn url_host(url: &str) -> Result<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.trim_matches(['[', ']']).to_string())
+        })
+        .filter(|host| !host.is_empty())
+        .context("The Redis URL has no host")
+}
+
 pub(crate) fn bytes_arg(bytes: &[u8]) -> Value {
     Value::Bytes(bytes.to_vec().into())
 }
@@ -751,14 +764,7 @@ impl RedisSession {
             _ => (url.to_string(), false),
         };
         let mut config = Config::from_url(&url).context("The Redis URL is not valid")?;
-        let host = match &config.server {
-            fred::types::config::ServerConfig::Centralized { server } => server.host.to_string(),
-            fred::types::config::ServerConfig::Clustered { hosts, .. } => hosts
-                .first()
-                .map(|server| server.host.to_string())
-                .unwrap_or_default(),
-            _ => String::new(),
-        };
+        let host = url_host(&url)?;
         let tls_config = match (tls_scheme, tls) {
             (true, settings) => Some(Arc::new(crate::redis_tls::client_config(
                 &settings.cloned().unwrap_or_default(),
@@ -812,6 +818,7 @@ impl RedisSession {
             "This server is a cluster node, and a cluster only has database 0."
         );
         let mut cluster = session.config.clone();
+        // The single connection is replaced either way; dropping the session closes it.
         session.quit().await.ok();
         cluster.server =
             fred::types::config::ServerConfig::new_clustered(vec![(host.to_string(), port)]);
@@ -2289,6 +2296,17 @@ impl RedisSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_certificates_are_checked_against_the_url_host() {
+        assert_eq!(
+            url_host("redis-cluster://trusted.example:6379?node=other.example:6379").unwrap(),
+            "trusted.example"
+        );
+        assert_eq!(url_host("redis://[::1]:6379").unwrap(), "::1");
+        assert_eq!(url_host("redis://user:pw@h:1/2").unwrap(), "h");
+        assert!(url_host("redis://").is_err());
+    }
 
     #[test]
     fn test_cluster_hash_uses_the_key() {
