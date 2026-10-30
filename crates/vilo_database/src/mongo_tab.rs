@@ -38,7 +38,7 @@ use crate::{
 const FIELDS_SHOWN: usize = 25;
 /// Array items shown when an array is opened, then more on request.
 const ITEMS_SHOWN: usize = 100;
-const ROW_HEIGHT: f32 = 20.;
+const ROW_HEIGHT: f32 = 22.;
 const PAGE_SIZES: [u32; 6] = [10, 20, 25, 50, 75, 100];
 const HISTORY_PER_COLLECTION: usize = 30;
 /// Compass's Max Time MS default.
@@ -159,6 +159,18 @@ impl MongoTab {
         window: &mut Window,
         cx: &mut gpui::App,
     ) -> Self {
+        // Compass types queries in a monospaced font.
+        let mono = |placeholder: &str, window: &mut Window, cx: &mut gpui::App| {
+            let query = editor(placeholder, "", false, window, cx);
+            let font = theme::theme_settings(cx).buffer_font(cx).clone();
+            query.update(cx, |query, _| {
+                query.set_text_style_refinement(gpui::TextStyleRefinement {
+                    font_family: Some(font.family),
+                    ..Default::default()
+                })
+            });
+            query
+        };
         let pipeline = cx.new(|cx| {
             let mut editor = Editor::auto_height(4, 16, window, cx);
             editor.set_placeholder_text("[ { $match: { status: 'Success' } }, { $group: { _id: '$type', count: { $sum: 1 } } } ]", window, cx);
@@ -170,12 +182,12 @@ impl MongoTab {
             sub_tab: SubTab::Documents,
             panel: Panel::Results,
             code_language: CodeLanguage::Shell,
-            filter: editor("Type a query: { field: 'value' }", "", false, window, cx),
-            projection: editor("{ field: 0 }", "", false, window, cx),
-            sort: editor("{ field: -1 }", "", false, window, cx),
+            filter: mono("Type a query: { field: 'value' }", window, cx),
+            projection: mono("{ field: 0 }", window, cx),
+            sort: mono("{ field: -1 }", window, cx),
             skip_editor: editor("0", "", false, window, cx),
-            collation: editor("{ locale: 'simple' }", "", false, window, cx),
-            hint: editor("{ field: -1 } or \"indexName\"", "", false, window, cx),
+            collation: mono("{ locale: 'simple' }", window, cx),
+            hint: mono("{ field: -1 } or \"indexName\"", window, cx),
             max_time: editor("60000", "", false, window, cx),
             limit: editor("0", "", false, window, cx),
             pipeline,
@@ -574,7 +586,7 @@ fn compass_primary(
 fn compass_button(id: &'static str, label: &'static str, icon: IconName) -> Button {
     Button::new(id, label)
         .label_size(LabelSize::Small)
-        .style(ButtonStyle::Outlined)
+        .style(ButtonStyle::Filled)
         .start_icon(Icon::new(icon).size(IconSize::XSmall))
 }
 
@@ -1466,10 +1478,10 @@ impl DatabaseView {
                         .gap_1()
                         .border_l_1()
                         .border_r_1()
-                        .border_color(colors.border)
-                        .bg(colors.editor_background)
-                        .when(row.first, |this| this.border_t_1().rounded_t_md())
-                        .when(row.last, |this| this.border_b_1().rounded_b_md());
+                        .border_color(colors.border_variant)
+                        .bg(colors.surface_background)
+                        .when(row.first, |this| this.border_t_1().rounded_t_lg())
+                        .when(row.last, |this| this.border_b_1().rounded_b_lg());
                     // The card's expand toggle sits left of its first line, as in Compass.
                     // Compass shows it only while the pointer is on the document.
                     let first_field = index
@@ -2216,10 +2228,10 @@ impl DatabaseView {
         v_flex()
             .p_3()
             .gap_2()
-            .rounded_md()
+            .rounded_lg()
             .border_1()
-            .border_color(colors.border)
-            .bg(colors.editor_background)
+            .border_color(colors.border_variant)
+            .bg(colors.surface_background)
             .on_action(cx.listener(move |this, _: &menu::Confirm, _, cx| find(this, cx)))
             .child(
                 h_flex()

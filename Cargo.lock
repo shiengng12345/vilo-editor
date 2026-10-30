@@ -20145,6 +20145,7 @@ dependencies = [
  "serde",
  "serde_json",
  "task",
+ "theme",
  "ui",
  "util",
  "uuid",
