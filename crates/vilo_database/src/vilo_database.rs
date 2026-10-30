@@ -1576,11 +1576,11 @@ impl Render for DatabaseView {
         let full_bleed = self.session.is_some() && connection.is_some();
         let naming = self.name_edit.is_some() || self.name_message.is_some();
         let dialog = if naming {
-            Some((px(380.), self.render_name_form(cx)))
+            Some((false, self.render_name_form(cx)))
         } else {
             self.form
                 .as_ref()
-                .map(|form| (px(520.), self.render_form(form, cx)))
+                .map(|form| (true, self.render_form(form, cx)))
         };
         // A save that is still connecting keeps the dialog open; closing it would cancel the save halfway.
         let closable =
@@ -1624,7 +1624,7 @@ impl Render for DatabaseView {
                     .when(!full_bleed, |this| this.p_4())
                     .child(main),
             )
-            .when_some(dialog, |this, (width, dialog)| {
+            .when_some(dialog, |this, (big, dialog)| {
                 this.child(
                     div()
                         .id("database-name-backdrop")
@@ -1647,7 +1647,14 @@ impl Render for DatabaseView {
                         .child(
                             div()
                                 .id("database-name-dialog")
-                                .w(width)
+                                // The connection form takes most of the page; the name form stays small.
+                                .when(big, |this| {
+                                    this.w(gpui::relative(0.8))
+                                        .h(gpui::relative(0.8))
+                                        .p_6()
+                                        .overflow_y_scroll()
+                                })
+                                .when(!big, |this| this.w(px(380.)))
                                 .p_4()
                                 .rounded_lg()
                                 .border_1()
