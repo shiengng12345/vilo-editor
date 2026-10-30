@@ -334,6 +334,10 @@ impl DatabaseView {
                 }
                 // The window closed: stop before the next batch rather than delete unseen.
                 if !alive {
+                    ended = Some((
+                        format!("Stopped: the window closed after {} of {total} batches; the rest were not sent.", index + 1),
+                        Color::Warning,
+                    ));
                     break;
                 }
             }
@@ -397,6 +401,10 @@ impl DatabaseView {
                     Ok(()) => {
                         if let Some(run) = run {
                             run.unknown = None;
+                            run.outcome = Some((
+                                "Checked. Preview again before deleting more.".into(),
+                                Color::Muted,
+                            ));
                         }
                         this.dangling_writes
                             .retain(|(known, _)| *known != operation);
@@ -449,8 +457,10 @@ impl DatabaseView {
                 let view = view.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     let choices = std::iter::once(("All types", None)).chain(
+                        // The list's own "all types" entry has no SCAN TYPE; it is the one above.
                         KEY_TYPES
                             .iter()
+                            .filter(|(_, value)| !value.is_empty())
                             .map(|(label, value)| (*label, Some(*value))),
                     );
                     for (label, kind) in choices {
