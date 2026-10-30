@@ -567,7 +567,7 @@ impl DatabaseView {
             let pick = pick.clone();
             async move |this, cx| {
                 cx.background_executor()
-                    .timer(std::time::Duration::from_millis(200))
+                    .timer(std::time::Duration::from_millis(100))
                     .await;
                 this.update(cx, |this, cx| {
                     match pick {
