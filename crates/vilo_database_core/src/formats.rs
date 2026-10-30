@@ -30,6 +30,9 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Reading steps for one Java input, never given back when a guess is rolled back, so nested
 /// guesses cannot multiply the work.
 const MAX_STEPS: usize = 2_000_000;
+/// Byte steps one input may spend converting large integers to decimal (about 16 integers of
+/// the largest size).
+const MAX_CONVERSION: usize = 256 * 1024 * 1024;
 /// Bytes a pickle global's name may have; names are built by joining others, so unbounded
 /// joining could grow a tiny input into a huge allocation.
 const MAX_NAME: usize = 4096;
@@ -920,7 +923,14 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
         }
         Ok(name.to_string())
     };
-    let small = |bytes: &[u8]| -> Result<String, String> {
+    // Converting an n-byte integer to decimal takes about n² steps; the whole input shares a
+    // budget for it, counted before each conversion.
+    let mut conversion = 0_usize;
+    let mut small = |bytes: &[u8]| -> Result<String, String> {
+        conversion = conversion.saturating_add(bytes.len().saturating_mul(bytes.len()));
+        if conversion > MAX_CONVERSION {
+            return Err("not a pickle Vilo shows: its integers are too large to convert".into());
+        }
         decimal(bytes).ok_or_else(|| {
             format!(
                 "not a pickle Vilo shows: a {}-byte integer is too large",
@@ -1985,8 +1995,9 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
         Node::Float(value) if value.fract() == 0.0 && value.abs() < 1e30 => {
             format!("i{}", *value as i128).into_bytes()
         }
-        // NaN equals nothing, not even another NaN, so NaN keys are never merged.
-        Node::Float(value) if value.is_nan() => return None,
+        // NaN equals no other NaN, but Python finds a key by identity first, so the same NaN
+        // object reused through the memo is one key.
+        Node::Float(value) if value.is_nan() => identity(id),
         Node::Float(value) => format!("f{}", value.to_bits()).into_bytes(),
         Node::Text(text) if text.len() > MAX_KEY => return None,
         Node::Text(text) => [b"s".as_slice(), text.as_bytes()].concat(),
@@ -2012,8 +2023,13 @@ fn dict_key(arena: &Arena, id: Id, depth: usize) -> Option<Vec<u8>> {
             }
             key
         }
-        _ => return None,
+        // Objects and names compare by identity, as Python's default equality does.
+        _ => identity(id),
     })
+}
+
+fn identity(id: Id) -> Vec<u8> {
+    std::iter::once(b'#').chain(id.to_le_bytes()).collect()
 }
 
 /// Adds members the way Python's set does: one equal to a member already there is dropped.
@@ -2815,6 +2831,29 @@ mod tests {
         );
         assert_eq!(decimal(&[]).as_deref(), Some("0"));
         assert_eq!(decimal(&[0xff]).as_deref(), Some("-1"));
+    }
+
+    #[test]
+    fn test_identity_keys_and_conversion_budget() {
+        // python3: the same NaN, memoized and set twice, is one key: {nan: 2}.
+        let text = decode(
+            Decoder::Pickle,
+            b"}G\x7f\xf8\x00\x00\x00\x00\x00\x00q\x00K\x01sh\x00K\x02s.",
+        )
+        .unwrap();
+        assert_eq!(text, "{\n  NaN: 2,\n}", "{text}");
+        // Many maximal LONG4 integers stop at the conversion budget instead of blocking.
+        let mut ints = b"\x80\x04]".to_vec();
+        for _ in 0..4_000 {
+            ints.push(0x8b);
+            ints.extend_from_slice(&4096_u32.to_le_bytes());
+            ints.extend(std::iter::repeat_n(0x7f, 4096));
+            ints.extend_from_slice(b"a");
+        }
+        ints.push(b'.');
+        let started = std::time::Instant::now();
+        assert!(decode(Decoder::Pickle, &ints).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
