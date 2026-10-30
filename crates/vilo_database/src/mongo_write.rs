@@ -103,6 +103,18 @@ fn audit_path() -> std::path::PathBuf {
 /// Writes to check: an intent with no result or acknowledgement after it, or whose result was
 /// "unknown" and has not been acknowledged; each may or may not have reached the server.
 /// Returns (operation id, what and where, kind), oldest first.
+/// The kind given to a damaged log line.
+pub(crate) const DAMAGED: &str = "damaged";
+
+/// A stable name for a damaged line (FNV-1a of its text), so acknowledging it holds across
+/// restarts.
+fn damaged_id(line: &str) -> String {
+    let hash = line.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("damaged:{hash:016x}")
+}
+
 /// Unsettled writes: operation, a summary to show, the kind, and the lock a publish holds.
 pub(crate) type Dangling = (String, String, String, Option<String>);
 
@@ -110,6 +122,18 @@ pub(crate) fn dangling_writes(log: &str) -> Vec<Dangling> {
     let mut open: Vec<Dangling> = Vec::new();
     for line in log.lines() {
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            // A damaged line may have been an unsettled write, so it is checked like one.
+            if !line.trim().is_empty() {
+                open.push((
+                    damaged_id(line),
+                    format!(
+                        "A line of the write log could not be read; it may have been a write: {}",
+                        line.chars().take(120).collect::<String>()
+                    ),
+                    DAMAGED.to_string(),
+                    None,
+                ));
+            }
             continue;
         };
         let Some(operation) = entry.get("operation").and_then(|value| value.as_str()) else {
@@ -176,11 +200,21 @@ pub(crate) fn summarize_intent(entry: &serde_json::Value) -> String {
 
 /// Reads the write log for dangling writes; a missing log has none.
 pub(crate) fn read_dangling_writes() -> Result<Vec<Dangling>> {
-    match std::fs::read_to_string(audit_path()) {
-        Ok(log) => Ok(dangling_writes(&log)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(error).context("Vilo could not read the write log"),
-    }
+    let _guard = AUDIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut file = match std::fs::File::open(audit_path()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("Vilo could not read the write log"),
+    };
+    // Shared, so no entry is half written while it is read.
+    file.lock_shared()
+        .context("Vilo could not lock the write log")?;
+    let mut log = String::new();
+    std::io::Read::read_to_string(&mut file, &mut log)
+        .context("Vilo could not read the write log")?;
+    Ok(dangling_writes(&log))
 }
 
 /// Marks dangling writes as checked by the user, so they are not reported again.
@@ -195,6 +229,10 @@ pub(crate) fn acknowledge_writes(operations: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Serializes the log's writers and readers in this process; the file lock covers other Vilo
+/// processes. Without both, two entries written at once could interleave into a damaged line.
+static AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) fn audit(line: serde_json::Value) -> Result<()> {
     let path = audit_path();
     if let Some(parent) = path.parent() {
@@ -204,10 +242,17 @@ pub(crate) fn audit(line: serde_json::Value) -> Result<()> {
     options.create(true).append(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    // The whole entry goes out in one write.
+    let entry = format!("{line}\n");
+    let _guard = AUDIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut file = options
         .open(&path)
         .context("Vilo could not open the write log")?;
-    writeln!(file, "{line}").context("Vilo could not write to the write log")?;
+    file.lock().context("Vilo could not lock the write log")?;
+    file.write_all(entry.as_bytes())
+        .context("Vilo could not write to the write log")?;
     file.sync_data()
         .context("Vilo could not save the write log")?;
     Ok(())
@@ -720,9 +765,13 @@ mod tests {
             dangling
                 .iter()
                 .map(|(operation, ..)| operation.as_str())
+                .filter(|operation| !operation.starts_with("damaged:"))
                 .collect::<Vec<_>>(),
             ["b", "d", "e", "g"]
         );
+        let (damaged, dangling): (Vec<_>, Vec<_>) = dangling
+            .into_iter()
+            .partition(|(_, _, kind, _)| kind == DAMAGED);
         assert!(dangling[0].1.contains("UNLINK on \"k\" (R, UAT)"));
         assert!(dangling[2].1.ends_with("· outcome unknown"));
         assert_eq!(dangling[2].2, "SLOWLOG RESET");
@@ -732,6 +781,22 @@ mod tests {
             "a publish keeps its lock"
         );
         assert_eq!(dangling[0].3, None);
+        assert_eq!(damaged.len(), 1);
+        let damaged = &damaged[0];
+        assert!(
+            damaged.1.contains("not json"),
+            "a damaged line is checked, not skipped"
+        );
+        let acknowledged = format!(
+            "{log}\n{}",
+            serde_json::json!({ "operation": damaged.0, "phase": "acknowledged" })
+        );
+        assert!(
+            dangling_writes(&acknowledged)
+                .iter()
+                .all(|(_, _, kind, _)| kind != DAMAGED),
+            "acknowledging a damaged line settles it"
+        );
         let with_db = serde_json::json!({ "kind": "SET", "key": "k", "db": 3, "time": "t", "name": "R", "environment": "QAT" });
         assert_eq!(summarize_intent(&with_db), "t SET on db3 k (R, QAT)");
         let threshold = serde_json::json!({ "kind": "CONFIG SET slowlog-log-slower-than", "value": "10000", "target": "node server", "time": "t", "name": "R", "environment": "QAT" });

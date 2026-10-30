@@ -1966,7 +1966,12 @@ impl DatabaseView {
                             .filter(|(operation, ..)| !redis_pubsub::publish_pending(operation))
                             .map(|(operation, summary, ..)| (operation, summary))
                             .collect();
-                        this.write_log_checked = true;
+                        // A damaged line might hide an unsettled publish, so publishing waits
+                        // until the user checked it.
+                        this.write_log_checked = !this
+                            .dangling_writes
+                            .iter()
+                            .any(|(operation, _)| operation.starts_with("damaged:"));
                         this.audit_problem = None;
                     }
                     Err(error) => this.audit_problem = Some(
@@ -2058,6 +2063,8 @@ impl DatabaseView {
                                                         !operations.contains(operation)
                                                     });
                                                     this.audit_problem = None;
+                                                    // Read again, so publishing resumes once nothing is left to check.
+                                                    this.check_write_log(cx);
                                                 }
                                                 Err(error) => {
                                                     this.audit_problem = Some(
