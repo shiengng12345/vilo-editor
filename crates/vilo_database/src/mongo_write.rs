@@ -103,8 +103,11 @@ fn audit_path() -> std::path::PathBuf {
 /// Writes to check: an intent with no result or acknowledgement after it, or whose result was
 /// "unknown" and has not been acknowledged; each may or may not have reached the server.
 /// Returns (operation id, what and where, kind), oldest first.
-pub(crate) fn dangling_writes(log: &str) -> Vec<(String, String, String)> {
-    let mut open: Vec<(String, String, String)> = Vec::new();
+/// Unsettled writes: operation, a summary to show, the kind, and the lock a publish holds.
+pub(crate) type Dangling = (String, String, String, Option<String>);
+
+pub(crate) fn dangling_writes(log: &str) -> Vec<Dangling> {
+    let mut open: Vec<Dangling> = Vec::new();
     for line in log.lines() {
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -121,16 +124,20 @@ pub(crate) fn dangling_writes(log: &str) -> Vec<(String, String, String)> {
                     .and_then(|value| value.as_str())
                     .unwrap_or_default()
                     .to_string(),
+                entry
+                    .get("lock")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
             )),
             // Only the user's acknowledgement settles an unknown outcome, also across restarts.
             Some("result")
                 if entry.get("result").and_then(|value| value.as_str()) == Some("unknown") =>
             {
-                if let Some(write) = open.iter_mut().find(|(known, _, _)| known == operation) {
+                if let Some(write) = open.iter_mut().find(|(known, ..)| known == operation) {
                     write.1.push_str(" · outcome unknown");
                 }
             }
-            Some("result" | "acknowledged") => open.retain(|(known, _, _)| known != operation),
+            Some("result" | "acknowledged") => open.retain(|(known, ..)| known != operation),
             _ => {}
         }
     }
@@ -168,7 +175,7 @@ pub(crate) fn summarize_intent(entry: &serde_json::Value) -> String {
 }
 
 /// Reads the write log for dangling writes; a missing log has none.
-pub(crate) fn read_dangling_writes() -> Result<Vec<(String, String, String)>> {
+pub(crate) fn read_dangling_writes() -> Result<Vec<Dangling>> {
     match std::fs::read_to_string(audit_path()) {
         Ok(log) => Ok(dangling_writes(&log)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -704,19 +711,27 @@ mod tests {
             r#"{"operation":"f","phase":"intent","kind":"SET","key":"k","time":"t6","name":"R","environment":"QAT"}"#,
             r#"{"operation":"f","phase":"result","result":"unknown"}"#,
             r#"{"operation":"f","phase":"acknowledged"}"#,
+            r#"{"operation":"g","phase":"intent","kind":"PUBLISH","key":"\"news\"","lock":"c1/redis/pubsub/news","time":"t7","name":"R","environment":"QAT"}"#,
+            r#"{"operation":"g","phase":"result","result":"unknown"}"#,
         ]
         .join("\n");
         let dangling = dangling_writes(&log);
         assert_eq!(
             dangling
                 .iter()
-                .map(|(operation, _, _)| operation.as_str())
+                .map(|(operation, ..)| operation.as_str())
                 .collect::<Vec<_>>(),
-            ["b", "d", "e"]
+            ["b", "d", "e", "g"]
         );
         assert!(dangling[0].1.contains("UNLINK on \"k\" (R, UAT)"));
         assert!(dangling[2].1.ends_with("· outcome unknown"));
         assert_eq!(dangling[2].2, "SLOWLOG RESET");
+        assert_eq!(
+            dangling[3].3.as_deref(),
+            Some("c1/redis/pubsub/news"),
+            "a publish keeps its lock"
+        );
+        assert_eq!(dangling[0].3, None);
         let with_db = serde_json::json!({ "kind": "SET", "key": "k", "db": 3, "time": "t", "name": "R", "environment": "QAT" });
         assert_eq!(summarize_intent(&with_db), "t SET on db3 k (R, QAT)");
         let threshold = serde_json::json!({ "kind": "CONFIG SET slowlog-log-slower-than", "value": "10000", "target": "node server", "time": "t", "name": "R", "environment": "QAT" });

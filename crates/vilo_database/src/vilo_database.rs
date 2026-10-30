@@ -1952,14 +1952,19 @@ impl DatabaseView {
                             vilo_database_core::redis::AdminWrite::SlowlogThreshold { micros: 0 }
                                 .name(),
                         ];
-                        for (operation, _, kind) in &dangling {
+                        for (operation, _, kind, lock) in &dangling {
                             if admin.contains(&kind.as_str()) {
                                 this.admin_to_check.insert(operation.clone());
+                            }
+                            // A publish without a settled answer keeps its channel locked.
+                            if let Some(lock) = lock {
+                                this.publish_locks
+                                    .insert(lock.clone(), (operation.clone(), true));
                             }
                         }
                         this.dangling_writes = dangling
                             .into_iter()
-                            .map(|(operation, summary, _)| (operation, summary))
+                            .map(|(operation, summary, ..)| (operation, summary))
                             .collect();
                         this.audit_problem = None;
                     }
@@ -2045,6 +2050,9 @@ impl DatabaseView {
                                                         !operations.contains(operation)
                                                     });
                                                     this.unlogged_writes.retain(|(operation, _)| {
+                                                        !operations.contains(operation)
+                                                    });
+                                                    this.publish_locks.retain(|_, (operation, _)| {
                                                         !operations.contains(operation)
                                                     });
                                                     this.audit_problem = None;

@@ -371,6 +371,8 @@ impl DatabaseView {
             "key": quote_bytes(channel.as_bytes()),
             "target": format!("channel {} ({} bytes)", quote_bytes(channel.as_bytes()), payload.len()),
             "kind": kind,
+            // Restores the channel's lock after a restart until the outcome is settled.
+            "lock": lock,
             "phase": "intent",
         });
         let summary = mongo_write::summarize_intent(&intent);
@@ -457,21 +459,64 @@ impl DatabaseView {
         cx.notify();
     }
 
+    /// Settles an unknown publish once the user checked it: the acknowledgement goes into the
+    /// write log first, so the channel stays settled after a restart.
     fn release_publish_lock(&mut self, cx: &mut Context<Self>) {
-        let locked = self.pubsub().and_then(|pubsub| {
-            pubsub.publish_result = None;
-            pubsub.publish_locked.take()
-        });
+        let Some(lock) = self
+            .pubsub()
+            .and_then(|pubsub| pubsub.publish_locked.clone())
+        else {
+            return;
+        };
         // Only an outcome already known to be unknown can be acknowledged, never a pending one.
-        if let Some(lock) = locked
-            && self
-                .publish_locks
-                .get(&lock)
-                .is_some_and(|(_, unknown)| *unknown)
-        {
-            self.publish_locks.remove(&lock);
-        }
-        cx.notify();
+        let Some(operation) = self
+            .publish_locks
+            .get(&lock)
+            .filter(|(_, unknown)| *unknown)
+            .map(|(operation, _)| operation.clone())
+        else {
+            return;
+        };
+        let task = cx.background_spawn({
+            let operation = operation.clone();
+            async move { mongo_write::acknowledge_writes(&[operation]) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        if this
+                            .publish_locks
+                            .get(&lock)
+                            .is_some_and(|(owner, _)| *owner == operation)
+                        {
+                            this.publish_locks.remove(&lock);
+                        }
+                        this.dangling_writes
+                            .retain(|(known, _)| *known != operation);
+                        this.unlogged_writes
+                            .retain(|(known, _)| *known != operation);
+                        if let Some(pubsub) = this.pubsub() {
+                            pubsub.publish_locked = None;
+                            pubsub.publish_result = None;
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(pubsub) = this.pubsub() {
+                            pubsub.publish_result = Some((
+                                false,
+                                format!("Vilo could not record that it was checked: {error:#}")
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(crate) fn render_pubsub(&self, pubsub: &PubSubState, cx: &mut Context<Self>) -> AnyElement {
