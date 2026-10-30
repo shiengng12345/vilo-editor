@@ -667,7 +667,7 @@ pub(crate) fn bytes_arg(bytes: &[u8]) -> Value {
     Value::Bytes(bytes.to_vec().into())
 }
 
-fn value_bytes(value: &Value) -> Bytes {
+pub(crate) fn value_bytes(value: &Value) -> Bytes {
     value
         .as_bytes()
         .map(<[u8]>::to_vec)
@@ -675,7 +675,7 @@ fn value_bytes(value: &Value) -> Bytes {
 }
 
 /// RESP2 sends pairs flat ([a, b, a, b]); RESP3 sends maps or nested pairs. Both come back as pairs.
-fn pairs(value: Value) -> Vec<(Value, Value)> {
+pub(crate) fn pairs(value: Value) -> Vec<(Value, Value)> {
     match value {
         Value::Map(map) => map
             .inner()

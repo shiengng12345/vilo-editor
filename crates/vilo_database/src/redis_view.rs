@@ -50,6 +50,7 @@ pub(crate) enum RedisTab {
     Workbench,
     Analyze,
     PubSub,
+    Search,
 }
 
 /// One hash field, list item or member of the shown value, which its row can edit or remove.
@@ -249,7 +250,7 @@ struct Stats {
 type RowsKey = (usize, usize, &'static str, u64, String, bool);
 
 pub(crate) struct RedisState {
-    tab: RedisTab,
+    pub(crate) tab: RedisTab,
     key_view: KeyView,
     delimiter: String,
     kind_filter: &'static str,
@@ -310,6 +311,7 @@ pub(crate) struct RedisState {
     _auto_refresh: Option<Task<()>>,
     pub(crate) analyze: crate::redis_analyze::AnalyzeState,
     pub(crate) pubsub: crate::redis_pubsub::PubSubState,
+    pub(crate) search: crate::redis_search::SearchState,
     /// The consumer group opened under a stream key.
     pub(crate) stream_group: Option<crate::redis_stream::StreamGroupView>,
     /// A database number typed in when the menu cannot know how many there are.
@@ -379,6 +381,7 @@ impl RedisState {
             _auto_refresh: None,
             analyze: Default::default(),
             pubsub: Default::default(),
+            search: Default::default(),
             stream_group: None,
             database_input: None,
         }
@@ -3534,6 +3537,9 @@ impl DatabaseView {
                             if target == RedisTab::PubSub {
                                 this.open_pubsub(window, cx);
                             }
+                            if target == RedisTab::Search {
+                                this.open_search(window, cx);
+                            }
                             cx.notify();
                         }))
                 })
@@ -3565,6 +3571,7 @@ impl DatabaseView {
             RedisTab::Workbench => self.render_workbench(state, cx),
             RedisTab::Analyze => self.render_analyze(&state.analyze, cx),
             RedisTab::PubSub => self.render_pubsub(&state.pubsub, cx),
+            RedisTab::Search => self.render_search(&state.search, cx),
         };
         let cli_lines = Self::workbench_lines(state);
         v_flex()
@@ -3665,7 +3672,12 @@ impl DatabaseView {
                         Some(RedisTab::Browse),
                         cx,
                     ))
-                    .child(tab("database-redis-tab-search", "Search", None, cx))
+                    .child(tab(
+                        "database-redis-tab-search",
+                        "Search",
+                        Some(RedisTab::Search),
+                        cx,
+                    ))
                     .child(tab(
                         "database-redis-tab-workbench",
                         "Workbench",
