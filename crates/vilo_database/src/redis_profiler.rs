@@ -43,6 +43,8 @@ pub(crate) struct ProfilerState {
     lost: u64,
     trimmed: u64,
     status: Option<(SharedString, Color)>,
+    /// Where and for how long the current run goes, for its status once the server accepts it.
+    target: SharedString,
     scroll: UniformListScrollHandle,
 }
 
@@ -63,6 +65,7 @@ impl Default for ProfilerState {
             lost: 0,
             trimmed: 0,
             status: None,
+            target: SharedString::default(),
             scroll: UniformListScrollHandle::new(),
         }
     }
@@ -80,6 +83,9 @@ impl ProfilerState {
     }
 
     fn take(&mut self, batch: MonitorBatch) {
+        if batch.started {
+            self.status = Some((format!("Running {}…", self.target).into(), Color::Success));
+        }
         self.lost += batch.lost;
         for line in batch.lines {
             self.received += 1;
@@ -94,7 +100,10 @@ impl ProfilerState {
             self.trimmed += 1;
         }
         if let Some(ended) = batch.ended {
-            self.status = Some((ended.into(), Color::Muted));
+            self.status = Some(match ended {
+                Ok(reason) => (reason.into(), Color::Muted),
+                Err(reason) => (reason.into(), Color::Warning),
+            });
             self.monitor = None;
         }
     }
@@ -150,7 +159,7 @@ impl DatabaseView {
         }
     }
 
-    fn start_profiler(&mut self, cx: &mut Context<Self>) {
+    fn start_profiler(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.redis() else {
             return;
         };
@@ -185,12 +194,16 @@ impl DatabaseView {
         let Some(node) = nodes.get(profiler.node).cloned() else {
             return;
         };
+        // The name is typed again for every run.
+        if let Some(confirm) = &profiler.confirm {
+            confirm.update(cx, |confirm, cx| confirm.set_text("", window, cx));
+        }
         let seconds = profiler.seconds;
         profiler.attempt += 1;
         let attempt = profiler.attempt;
         profiler.starting = true;
         profiler.status = Some(("Starting…".into(), Color::Muted));
-        let label = node.label.clone();
+        profiler.target = format!("on {} for {seconds} s", node.label).into();
         let task = run(cx, async move { session.monitor(&node, seconds).await });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -209,10 +222,6 @@ impl DatabaseView {
                 match result {
                     Ok(monitor) => {
                         profiler.monitor = Some(monitor);
-                        profiler.status = Some((
-                            format!("Running on {label} for {seconds} s…").into(),
-                            Color::Success,
-                        ));
                         profiler._poll = Some(cx.spawn(async move |this, cx| {
                             loop {
                                 cx.background_executor().timer(POLL).await;
@@ -442,7 +451,7 @@ impl DatabaseView {
                             .tooltip(Tooltip::text(
                                 "MONITOR copies every command the server runs to Vilo, which slows a busy server",
                             ))
-                            .on_click(cx.listener(|this, _, _, cx| this.start_profiler(cx)))
+                            .on_click(cx.listener(|this, _, window, cx| this.start_profiler(window, cx)))
                     })
                     .child(
                         Button::new(
@@ -467,6 +476,7 @@ impl DatabaseView {
                                 if let Some(profiler) = this.profiler() {
                                     profiler.entries.clear();
                                     profiler.bytes = 0;
+                                    profiler.trimmed = 0;
                                 }
                                 cx.notify();
                             })),
@@ -530,13 +540,22 @@ mod tests {
     #[test]
     fn test_buffer_keeps_newest_within_limits() {
         let mut profiler = ProfilerState::default();
+        profiler.target = "on server for 10 s".into();
+        profiler.take(MonitorBatch {
+            started: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            profiler.status,
+            Some(("Running on server for 10 s…".into(), Color::Success))
+        );
         let big = vec![b'x'; 1024 * 1024];
         profiler.take(MonitorBatch {
             lines: (0..6)
                 .map(|_| line(&[b"set", &big], false, false))
                 .collect(),
             lost: 2,
-            ended: None,
+            ..Default::default()
         });
         assert_eq!(profiler.received, 6);
         assert_eq!(profiler.lost, 2);
@@ -547,13 +566,21 @@ mod tests {
             lines: (0..BUFFER_LINES + 5)
                 .map(|_| line(&[b"ping"], false, false))
                 .collect(),
-            lost: 0,
-            ended: Some("Stopped after 10 s.".into()),
+            ended: Some(Ok("Stopped after 10 s.".into())),
+            ..Default::default()
         });
         assert_eq!(profiler.entries.len(), BUFFER_LINES);
         assert_eq!(
             profiler.status,
             Some(("Stopped after 10 s.".into(), Color::Muted))
+        );
+        profiler.take(MonitorBatch {
+            ended: Some(Err("MONITOR was refused: NOPERM".into())),
+            ..Default::default()
+        });
+        assert_eq!(
+            profiler.status,
+            Some(("MONITOR was refused: NOPERM".into(), Color::Warning))
         );
     }
 }
