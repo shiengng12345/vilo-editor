@@ -669,14 +669,16 @@ pub(crate) fn cluster_hash(name: &str, args: &[Value]) -> fred::types::ClusterHa
     }
 }
 
-/// The database in a connection string's path, as fred reads it for a single server.
-fn url_database(url: &str) -> Option<u8> {
-    url::Url::parse(url)
-        .ok()?
-        .path()
-        .trim_matches('/')
-        .parse()
-        .ok()
+/// The database in a connection string's path, if it names one.
+fn url_database(url: &str) -> Result<Option<u8>> {
+    let url = url::Url::parse(url).context("The Redis URL is not valid")?;
+    let path = url.path().trim_matches('/');
+    if path.is_empty() {
+        return Ok(None);
+    }
+    path.parse().map(Some).with_context(|| {
+        format!("The database in the URL must be a number from 0 to 255, not {path}.")
+    })
 }
 
 /// fred keeps an IPv6 seed as `[::1]` and hands that to rustls as the server name, which rustls
@@ -780,7 +782,7 @@ impl RedisSession {
         // fred ignores the path of a cluster URL; a database there must not quietly become 0.
         if config.server.is_clustered() {
             anyhow::ensure!(
-                database.or(url_database(&url)).unwrap_or(0) == 0,
+                database.or(url_database(&url)?).unwrap_or(0) == 0,
                 "A Redis cluster only has database 0."
             );
         }
@@ -839,7 +841,7 @@ impl RedisSession {
                 return Ok(session);
             }
         };
-        let Server { host, port, .. } = match &session.config.server {
+        let seed = match &session.config.server {
             fred::types::config::ServerConfig::Centralized { server } if cluster => server.clone(),
             _ => return Ok(session),
         };
@@ -850,9 +852,15 @@ impl RedisSession {
         let mut cluster = session.config.clone();
         // The single connection is replaced either way; dropping the session closes it.
         session.quit().await.ok();
-        cluster.server =
-            fred::types::config::ServerConfig::new_clustered(vec![(host.to_string(), port)]);
+        // The same seed, so its TLS name (an IPv6 address without brackets) is kept.
+        cluster.server = fred::types::config::ServerConfig::Clustered {
+            hosts: vec![seed],
+            policy: Default::default(),
+        };
         cluster.database = None;
+        if tls_config.is_some() {
+            unbracket_tls_names(&mut cluster);
+        }
         Self::open(cluster, None, tls_config).await
     }
 
@@ -2346,8 +2354,12 @@ mod tests {
         assert_eq!(url_host("redis://[::1]:6379").unwrap(), "::1");
         assert_eq!(url_host("redis://user:pw@h:1/2").unwrap(), "h");
         assert!(url_host("redis://").is_err());
-        assert_eq!(url_database("redis-cluster://h:1/2"), Some(2));
-        assert_eq!(url_database("redis://h:1"), None);
+        assert_eq!(url_database("redis-cluster://h:1/2").unwrap(), Some(2));
+        assert_eq!(url_database("redis://h:1").unwrap(), None);
+        assert_eq!(url_database("redis://h:1/").unwrap(), None);
+        for refused in ["redis-cluster://h:1/256", "redis-cluster://h:1/abc"] {
+            assert!(url_database(refused).is_err(), "{refused}");
+        }
     }
 
     #[test]
