@@ -8,7 +8,14 @@ use fred::{
     prelude::{Builder, Value},
     types::MessageKind,
 };
-use futures::channel::{mpsc, oneshot};
+use futures::{
+    StreamExt as _,
+    channel::{mpsc, oneshot},
+};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::{
@@ -18,8 +25,11 @@ use crate::{
 
 /// A message larger than this is cut, and says so.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
-/// Events waiting for the view; beyond this they are dropped and counted as lost.
-const QUEUE: usize = 1024;
+/// Message bytes waiting for the view; messages beyond this are dropped and counted as lost.
+/// Notes about losses and the end are always delivered, and are tiny.
+const QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// How soon losses are reported when no further message comes to carry them.
+const LOSS_REPORT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Subscribe {
@@ -55,8 +65,36 @@ pub enum PubSubEvent {
 /// A live subscription. Dropping it (or its `Stop` once split) unsubscribes and closes its
 /// connection.
 pub struct Subscription {
-    pub events: mpsc::Receiver<PubSubEvent>,
+    pub events: Events,
     stop: Stop,
+}
+
+/// The subscription's events in order. Taking a message frees its bytes in the queue budget.
+pub struct Events {
+    receiver: mpsc::UnboundedReceiver<PubSubEvent>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Events {
+    fn taken(&self, event: Option<PubSubEvent>) -> Option<PubSubEvent> {
+        if let Some(PubSubEvent::Message(message)) = &event {
+            self.queued
+                .fetch_sub(message.payload.len(), Ordering::Relaxed);
+        }
+        event
+    }
+
+    /// The next event; `None` once the subscription has ended and everything was taken.
+    pub async fn next(&mut self) -> Option<PubSubEvent> {
+        let event = self.receiver.next().await;
+        self.taken(event)
+    }
+
+    /// An event already waiting, if any.
+    pub fn try_next(&mut self) -> Option<PubSubEvent> {
+        let event = self.receiver.try_recv().ok();
+        self.taken(event)
+    }
 }
 
 pub struct Stop {
@@ -64,7 +102,7 @@ pub struct Stop {
 }
 
 impl Subscription {
-    pub fn into_parts(self) -> (mpsc::Receiver<PubSubEvent>, Stop) {
+    pub fn into_parts(self) -> (Events, Stop) {
         (self.events, self.stop)
     }
 }
@@ -73,11 +111,14 @@ fn message(message: fred::types::Message) -> PubSubMessage {
     let bytes = match &message.value {
         Value::Bytes(bytes) => bytes.to_vec(),
         Value::String(text) => text.as_bytes().to_vec(),
-        other => other.as_string().unwrap_or_default().into_bytes(),
+        other => other
+            .as_string()
+            .unwrap_or_else(|| format!("{other:?}"))
+            .into_bytes(),
     };
     let size = bytes.len();
-    let mut payload = bytes;
-    payload.truncate(MAX_MESSAGE_BYTES);
+    // A copy of the kept part, so a cut message does not hold on to its full allocation.
+    let payload = bytes[..size.min(MAX_MESSAGE_BYTES)].to_vec();
     PubSubMessage {
         time: std::time::SystemTime::now(),
         channel: message.channel.to_string(),
@@ -90,7 +131,10 @@ fn message(message: fred::types::Message) -> PubSubMessage {
 impl RedisSession {
     /// Subscribes on a new connection made with this session's settings.
     pub async fn subscribe(&self, kind: Subscribe, names: Vec<String>) -> Result<Subscription> {
-        anyhow::ensure!(!names.is_empty(), "Name at least one channel or pattern.");
+        anyhow::ensure!(
+            !names.is_empty() && names.iter().all(|name| !name.is_empty()),
+            "Name at least one channel or pattern."
+        );
         let mut builder = Builder::from_config(self.config.clone());
         builder.with_connection_config(|connection| connection.max_command_attempts = 1);
         let client = builder.build()?;
@@ -109,45 +153,58 @@ impl RedisSession {
             client.quit().await.ok();
             return Err(error).context("Redis refused the subscription");
         }
-        let (mut sender, events) = mpsc::channel(QUEUE);
+        let (sender, receiver) = mpsc::unbounded();
+        let queued = Arc::new(AtomicUsize::new(0));
         let (stop, mut stopped) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let mut lost = 0_u64;
-            let ended = loop {
-                // Report losses as soon as the view has room again.
-                if lost > 0 && sender.try_send(PubSubEvent::Lost(lost)).is_ok() {
-                    lost = 0;
-                }
-                tokio::select! {
-                    _ = &mut stopped => break None,
-                    received = messages.recv() => match received {
-                        Ok(received) => {
-                            if sender.try_send(PubSubEvent::Message(message(received))).is_err() {
-                                if sender.is_closed() {
+        tokio::spawn({
+            let queued = queued.clone();
+            async move {
+                let mut lost = 0_u64;
+                let mut report = tokio::time::interval(LOSS_REPORT);
+                let flush = |lost: &mut u64| {
+                    if *lost > 0 {
+                        sender.unbounded_send(PubSubEvent::Lost(*lost)).ok();
+                        *lost = 0;
+                    }
+                };
+                let ended = loop {
+                    tokio::select! {
+                        _ = &mut stopped => break None,
+                        _ = report.tick() => flush(&mut lost),
+                        received = messages.recv() => match received {
+                            Ok(received) => {
+                                let received = message(received);
+                                let size = received.payload.len();
+                                if queued.load(Ordering::Relaxed) + size > QUEUE_BYTES {
+                                    lost += 1;
+                                    continue;
+                                }
+                                // Losses go before the message that follows them.
+                                flush(&mut lost);
+                                queued.fetch_add(size, Ordering::Relaxed);
+                                if sender.unbounded_send(PubSubEvent::Message(received)).is_err() {
                                     break None;
                                 }
-                                lost += 1;
                             }
-                        }
-                        Err(RecvError::Lagged(skipped)) => lost += skipped,
-                        Err(RecvError::Closed) => break Some("The connection closed.".to_string()),
-                    },
-                    error = errors.recv() => match error {
-                        Ok((error, _)) => break Some(format!("The connection dropped: {error}")),
-                        Err(RecvError::Lagged(_)) => {}
-                        Err(RecvError::Closed) => break Some("The connection closed.".to_string()),
-                    },
+                            Err(RecvError::Lagged(skipped)) => lost += skipped,
+                            Err(RecvError::Closed) => break Some("The connection closed.".to_string()),
+                        },
+                        error = errors.recv() => match error {
+                            Ok((error, _)) => break Some(format!("The connection dropped: {error}")),
+                            Err(RecvError::Lagged(_)) => {}
+                            Err(RecvError::Closed) => break Some("The connection closed.".to_string()),
+                        },
+                    }
+                };
+                if let Some(reason) = ended {
+                    flush(&mut lost);
+                    sender.unbounded_send(PubSubEvent::Ended(reason)).ok();
                 }
-            };
-            if let Some(reason) = ended {
-                if lost > 0 {
-                    sender.try_send(PubSubEvent::Lost(lost)).ok();
-                }
-                sender.try_send(PubSubEvent::Ended(reason)).ok();
+                // Unsubscribing happens by closing; there is no one left to tell if that fails.
+                client.quit().await.ok();
             }
-            // Unsubscribing happens by closing; there is no one left to tell if that fails.
-            client.quit().await.ok();
         });
+        let events = Events { receiver, queued };
         Ok(Subscription {
             events,
             stop: Stop { _sender: stop },
@@ -162,6 +219,9 @@ impl RedisSession {
         payload: &[u8],
         sharded: bool,
     ) -> Result<i64, WriteError> {
+        if channel.is_empty() {
+            return Err(WriteError::Refused("Name the channel.".into()));
+        }
         let payload = Value::Bytes(payload.to_vec().into());
         let sent = if sharded {
             self.client.spublish::<i64, _, _>(channel, payload).await
@@ -175,7 +235,6 @@ impl RedisSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt as _;
 
     async fn next_message(subscription: &mut Subscription) -> PubSubMessage {
         let event = tokio::time::timeout(
@@ -189,6 +248,22 @@ mod tests {
             PubSubEvent::Message(message) => message,
             other => panic!("expected a message, got {other:?}"),
         }
+    }
+
+    /// Subscriptions are registered by the server a moment after fred returns; wait for them.
+    async fn wait_for_subscribers(session: &RedisSession, channel: &str, count: i64) {
+        for _ in 0..100 {
+            let reply = session
+                .call("PUBSUB", vec!["NUMSUB".into(), channel.into()])
+                .await
+                .unwrap();
+            let found = reply.into_array().get(1).and_then(|count| count.as_i64());
+            if found >= Some(count) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("{channel} never had {count} subscribers");
     }
 
     #[tokio::test]
@@ -205,6 +280,14 @@ mod tests {
             .subscribe(Subscribe::Channels, vec!["vilo_test.ps.exact".into()])
             .await
             .unwrap();
+        wait_for_subscribers(&session, "vilo_test.ps.exact", 1).await;
+        for _ in 0..100 {
+            let patterns = session.call("PUBSUB", vec!["NUMPAT".into()]).await.unwrap();
+            if patterns.as_i64() >= Some(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert_eq!(
             session
                 .publish("vilo_test.ps.exact", b"hello", false)
@@ -265,6 +348,16 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            session
+                .subscribe(Subscribe::Channels, vec![String::new()])
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            session.publish("", b"x", false).await,
+            Err(WriteError::Refused(_))
+        ));
     }
 
     #[tokio::test]
@@ -277,11 +370,28 @@ mod tests {
             .subscribe(Subscribe::Patterns, vec!["vilo_test.cps.*".into()])
             .await
             .unwrap();
-        session
-            .publish("vilo_test.cps.a", b"one", false)
+        // In a Cluster the pattern is registered on one node a moment later; publish until it
+        // arrives instead of guessing how long that takes.
+        let mut received = None;
+        for _ in 0..25 {
+            session
+                .publish("vilo_test.cps.a", b"one", false)
+                .await
+                .unwrap();
+            if let Ok(Some(PubSubEvent::Message(message))) = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                patterns.events.next(),
+            )
             .await
-            .unwrap();
-        assert_eq!(next_message(&mut patterns).await.payload, b"one");
+            {
+                received = Some(message);
+                break;
+            }
+        }
+        assert_eq!(
+            received.map(|message| message.payload),
+            Some(b"one".to_vec())
+        );
         let mut shard = session
             .subscribe(Subscribe::Shard, vec!["vilo_test.cshard".into()])
             .await

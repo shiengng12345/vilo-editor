@@ -6,7 +6,6 @@
 use std::collections::VecDeque;
 
 use editor::Editor;
-use futures::StreamExt as _;
 use gpui::{
     Entity, ListHorizontalSizingBehavior, UniformListScrollHandle, Window, prelude::*, uniform_list,
 };
@@ -38,6 +37,9 @@ pub(crate) struct PubSubState {
     /// The subscription and the task moving its events into `entries`; dropping both
     /// unsubscribes and closes the connection.
     live: Option<(Stop, gpui::Task<()>)>,
+    /// Bumped by each subscribe and by leaving, so a subscription that finishes opening after
+    /// the user moved on is closed at once instead of running off-screen.
+    attempt: u64,
     subscribed_to: Option<SharedString>,
     entries: VecDeque<Entry>,
     bytes: usize,
@@ -52,7 +54,8 @@ pub(crate) struct PubSubState {
     confirm: Option<Entity<Editor>>,
     publishing: bool,
     publish_result: Option<(bool, SharedString)>,
-    _publish: Option<gpui::Task<()>>,
+    /// The channel whose last publish has an unknown outcome, until the user checked it.
+    publish_locked: Option<String>,
     scroll: UniformListScrollHandle,
 }
 
@@ -62,6 +65,7 @@ impl Default for PubSubState {
             kind: Subscribe::Patterns,
             names: None,
             live: None,
+            attempt: 0,
             subscribed_to: None,
             entries: VecDeque::new(),
             bytes: 0,
@@ -75,7 +79,7 @@ impl Default for PubSubState {
             confirm: None,
             publishing: false,
             publish_result: None,
-            _publish: None,
+            publish_locked: None,
             scroll: UniformListScrollHandle::new(),
         }
     }
@@ -88,6 +92,7 @@ impl PubSubState {
     }
 
     fn unsubscribe(&mut self, note: &'static str) {
+        self.attempt += 1;
         if self.live.take().is_some() {
             self.push(Entry::Note(note.into()));
             self.subscribed_to = None;
@@ -143,8 +148,9 @@ fn time_of(message: &PubSubMessage) -> String {
         .to_string()
 }
 
-fn lock_key(connection: &str, database: u8, channel: &str) -> String {
-    format!("{connection}/redis/db{database}/pubsub/{channel}")
+/// Channels are shared by every logical database of a server, so the lock is per connection.
+fn lock_key(connection: &str, channel: &str) -> String {
+    format!("{connection}/redis/pubsub/{channel}")
 }
 
 impl DatabaseView {
@@ -197,6 +203,9 @@ impl DatabaseView {
             .collect::<Vec<_>>();
         let kind = pubsub.kind;
         pubsub.live = None;
+        pubsub.subscribed_to = None;
+        pubsub.attempt += 1;
+        let attempt = pubsub.attempt;
         pubsub.problem = Some("Subscribing…".into());
         let task = run(cx, async move { session.subscribe(kind, names).await });
         cx.spawn(async move |this, cx| {
@@ -208,6 +217,10 @@ impl DatabaseView {
                 let Some(pubsub) = this.pubsub() else {
                     return;
                 };
+                // Dropping a subscription that arrives too late closes it.
+                if pubsub.attempt != attempt {
+                    return;
+                }
                 match result {
                     Ok(subscription) => {
                         let (mut events, stop) = subscription.into_parts();
@@ -217,9 +230,9 @@ impl DatabaseView {
                             while let Some(first) = events.next().await {
                                 let mut batch = vec![first];
                                 while batch.len() < BATCH {
-                                    match events.try_recv() {
-                                        Ok(event) => batch.push(event),
-                                        Err(_) => break,
+                                    match events.try_next() {
+                                        Some(event) => batch.push(event),
+                                        None => break,
                                     }
                                 }
                                 let alive = this
@@ -235,9 +248,21 @@ impl DatabaseView {
                                     })
                                     .unwrap_or(false);
                                 if !alive {
-                                    break;
+                                    return;
                                 }
                             }
+                            // The stream ended without saying why; never show it as still live.
+                            this.update(cx, |this, cx| {
+                                if let Some(pubsub) = this.pubsub()
+                                    && pubsub.live.is_some()
+                                {
+                                    pubsub.take(PubSubEvent::Ended(
+                                        "The subscription stopped.".into(),
+                                    ));
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
                         });
                         pubsub.live = Some((stop, pump));
                     }
@@ -292,7 +317,7 @@ impl DatabaseView {
         if mongo_write::guarded(&connection) && typed.trim() != connection.name.trim() {
             return refuse(self, "Type the connection name exactly to confirm.", cx);
         }
-        let lock = lock_key(&connection.id, database, &channel);
+        let lock = lock_key(&connection.id, &channel);
         if self.unknown_writes.contains(&lock) {
             return refuse(
                 self,
@@ -318,7 +343,7 @@ impl DatabaseView {
         });
         let summary = mongo_write::summarize_intent(&intent);
         let task = run(cx, {
-            let operation = operation.clone();
+            let (operation, channel) = (operation.clone(), channel.clone());
             async move {
                 mongo_write::audit(intent)?;
                 let outcome = session.publish(&channel, payload.as_bytes(), sharded).await;
@@ -333,58 +358,63 @@ impl DatabaseView {
                 Ok((outcome, logged))
             }
         });
+        let generation = self.generation;
         if let Some(pubsub) = self.pubsub() {
             pubsub.publishing = true;
             pubsub.publish_result = Some((true, "Publishing…".into()));
-            pubsub._publish = Some(cx.spawn(async move |this, cx| {
-                let result = task.await;
-                this.update(cx, |this, cx| {
-                    let message = match result {
-                        Ok((outcome, logged)) => {
-                            if let Some(error) = logged {
-                                this.unlogged_writes.push((
-                                    operation,
-                                    format!("{summary} · its result is not in the log: {error}"),
-                                ));
-                            }
-                            match outcome {
-                                Ok(0) => (true, "Published; no subscriber was listening, so nobody received it.".to_string()),
-                                Ok(count) => (true, format!("Published; {count} subscribers received it.")),
-                                Err(WriteError::Refused(message)) => (false, format!("Not published: {message}")),
-                                Err(WriteError::Unknown(message)) => {
-                                    // A publish cannot be checked by reloading anything, and is never sent again.
-                                    this.unknown_writes.insert(lock);
-                                    (false, format!("The outcome is unknown ({message}): it may have been delivered. Vilo will not send it again; check the subscribers, then press I checked it."))
-                                }
+        }
+        // Detached, not kept in the tab's state: the outcome must reach the write log and the
+        // lock even if the user switches connection or database while it is in flight.
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                let mut locked = None;
+                let message = match result {
+                    Ok((outcome, logged)) => {
+                        if let Some(error) = logged {
+                            this.unlogged_writes.push((
+                                operation,
+                                format!("{summary} · its result is not in the log: {error}"),
+                            ));
+                        }
+                        match outcome {
+                            Ok(0) => (true, "Published; no subscriber was listening, so nobody received it.".to_string()),
+                            Ok(count) => (true, format!("Published; {count} subscribers received it.")),
+                            Err(WriteError::Refused(message)) => (false, format!("Not published: {message}")),
+                            Err(WriteError::Unknown(message)) => {
+                                // A publish cannot be checked by reloading anything, and is never sent again.
+                                this.unknown_writes.insert(lock);
+                                locked = Some(channel);
+                                (false, format!("The outcome is unknown ({message}): it may have been delivered. Vilo will not send it again; check the subscribers, then press I checked it."))
                             }
                         }
-                        Err(error) => (false, format!("Not sent: {error:#}")),
-                    };
-                    if let Some(pubsub) = this.pubsub() {
-                        pubsub.publishing = false;
-                        pubsub.publish_result = Some((message.0, message.1.into()));
                     }
-                    cx.notify();
-                })
-                .ok();
-            }));
-        }
+                    Err(error) => (false, format!("Not sent: {error:#}")),
+                };
+                if this.generation == generation
+                    && let Some(pubsub) = this.pubsub()
+                {
+                    pubsub.publishing = false;
+                    pubsub.publish_result = Some((message.0, message.1.into()));
+                    if locked.is_some() {
+                        pubsub.publish_locked = locked;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
     fn release_publish_lock(&mut self, cx: &mut Context<Self>) {
-        let channel = self
-            .redis_state
-            .as_ref()
-            .and_then(|state| state.pubsub.publish_channel.as_ref())
-            .map(|editor| editor.read(cx).text(cx))
-            .unwrap_or_default();
-        if let (Some(connection), Some(session)) = (self.active.clone(), self.redis()) {
-            self.unknown_writes
-                .remove(&lock_key(&connection, session.database(), &channel));
-        }
-        if let Some(pubsub) = self.pubsub() {
+        let locked = self.pubsub().and_then(|pubsub| {
             pubsub.publish_result = None;
+            pubsub.publish_locked.take()
+        });
+        if let (Some(connection), Some(channel)) = (self.active.clone(), locked) {
+            self.unknown_writes.remove(&lock_key(&connection, &channel));
         }
         cx.notify();
     }
@@ -530,10 +560,7 @@ impl DatabaseView {
                 .map(|editor| boxed(editor, cx).into_any_element())
                 .unwrap_or_else(|| div().into_any_element())
         };
-        let locked = pubsub
-            .publish_result
-            .as_ref()
-            .is_some_and(|(_, message)| message.contains("I checked it"));
+        let locked = pubsub.publish_locked.is_some();
         v_flex()
             .size_full()
             .p_3()
