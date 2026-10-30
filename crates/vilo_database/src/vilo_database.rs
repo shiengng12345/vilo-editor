@@ -1139,17 +1139,7 @@ impl DatabaseView {
                         window,
                         cx,
                     ),
-                    sentinel_password: editor(
-                        if existing.is_some() {
-                            "Leave empty to keep the saved one"
-                        } else {
-                            "Only if Sentinel has its own"
-                        },
-                        "",
-                        true,
-                        window,
-                        cx,
-                    ),
+                    sentinel_password: editor("Only if Sentinel has its own", "", true, window, cx),
                 },
             ),
             editing,
@@ -1220,14 +1210,15 @@ impl DatabaseView {
                 host: text(&redis.host, cx),
                 port: text(&redis.port, cx),
                 username: text(&redis.username, cx),
-                password: text(&redis.password, cx),
+                // Passwords as typed: spaces at either end can be part of them.
+                password: redis.password.read(cx).text(cx),
                 database: text(&redis.database, cx),
                 tls: redis.tls,
                 mode: redis.mode.clone(),
                 query: redis.query.clone(),
                 sentinel_master: text(&redis.sentinel_master, cx),
                 sentinel_username: text(&redis.sentinel_username, cx),
-                sentinel_password: text(&redis.sentinel_password, cx),
+                sentinel_password: redis.sentinel_password.read(cx).text(cx),
             };
             // An edited connection whose fields never loaded keeps its saved string.
             uri = if parts.host.is_empty() {
@@ -2601,6 +2592,20 @@ mod tests {
             .to_uri()
             .is_err(),
             "the master group name is needed"
+        );
+        let spaced = RedisParts {
+            host: "h".into(),
+            password: " pw ".into(),
+            mode: "-sentinel".into(),
+            sentinel_master: "m".into(),
+            sentinel_password: " s p ".into(),
+            ..Default::default()
+        };
+        let again = RedisParts::from_uri(&spaced.to_uri().unwrap()).unwrap();
+        assert_eq!(
+            (again.password.as_str(), again.sentinel_password.as_str()),
+            (" pw ", " s p "),
+            "spaces at either end of a password are kept"
         );
         // An explicit cluster and its extra seeds survive an edit.
         for saved in [
