@@ -18,7 +18,9 @@ use vilo_database_core::{
 
 use crate::{
     DatabaseView, boxed, editor as single_line, mongo_write,
-    redis_pubsub::{acknowledge_publishes, settle_operation_lock, take_operation_lock},
+    redis_pubsub::{
+        acknowledge_publishes, pass_operation_lock, settle_operation_lock, take_operation_lock,
+    },
     redis_view::{KEY_TYPES, escape_bytes},
     run,
 };
@@ -48,9 +50,8 @@ struct BulkRun {
     stop: Arc<AtomicBool>,
     running: bool,
     outcome: Option<(SharedString, Color)>,
-    /// The run holding the bulk lock and the batch whose outcome is unknown, until the user
-    /// checked it.
-    unknown: Option<(String, String)>,
+    /// The batch whose outcome is unknown and which holds the bulk lock, until the user checked it.
+    unknown: Option<String>,
 }
 
 impl BulkForm {
@@ -187,7 +188,10 @@ impl DatabaseView {
         }
         let lock = lock_key(&connection.id, database);
         let run_id = uuid::Uuid::new_v4().simple().to_string();
-        if let Err(unknown) = take_operation_lock(&lock, &run_id) {
+        // The lock is always owned by the batch in flight, the operation id its log lines carry,
+        // so a log read meanwhile sees that batch as pending and a restart restores the lock.
+        let mut owner = format!("{run_id}:0");
+        if let Err(unknown) = take_operation_lock(&lock, &owner) {
             form.message = Some(
                 if unknown {
                     "A bulk delete on this connection has an unknown outcome. Check its keys, then press I checked it in its window or in the write log banner."
@@ -228,6 +232,16 @@ impl DatabaseView {
                     break;
                 }
                 let operation = format!("{run_id}:{index}");
+                if operation != owner {
+                    if !pass_operation_lock(&lock, &owner, &operation) {
+                        ended = Some((
+                            format!("Stopped: the bulk lock was lost after {index} of {total} batches; the rest were not sent."),
+                            Color::Error,
+                        ));
+                        break;
+                    }
+                    owner = operation.clone();
+                }
                 let intent = serde_json::json!({
                     "time": chrono::Utc::now().to_rfc3339(),
                     "operation": operation,
@@ -288,7 +302,14 @@ impl DatabaseView {
                     })
                     .is_ok();
                 match result {
-                    Ok((Ok(_), _)) => {}
+                    Ok((Ok(_), None)) => {}
+                    Ok((Ok(_), Some(error))) => {
+                        ended = Some((
+                            format!("Batch {} was deleted but its result could not be logged ({error}); the rest were not sent.", index + 1),
+                            Color::Error,
+                        ));
+                        break;
+                    }
                     Ok((Err(WriteError::Refused(message)), _)) => {
                         ended = Some((
                             format!("Batch {} was refused ({message}); the rest were not sent.", index + 1),
@@ -317,7 +338,7 @@ impl DatabaseView {
                 }
             }
             // Settled before touching the window, which may be closed by now.
-            settle_operation_lock(&lock, &run_id, unknown.is_some());
+            settle_operation_lock(&lock, &owner, unknown.is_some());
             this.update(cx, |this, cx| {
                 if let Some((_, summary, message)) = &unknown {
                     this.write_notice = Some(
@@ -339,7 +360,7 @@ impl DatabaseView {
                             Color::Success,
                         )
                     }));
-                    run.unknown = unknown.map(|(operation, _, _)| (run_id.clone(), operation));
+                    run.unknown = unknown.map(|(operation, _, _)| operation);
                 }
                 this.close_redis_key();
                 this.scan(true, cx);
@@ -352,7 +373,7 @@ impl DatabaseView {
     }
 
     fn release_bulk_lock(&mut self, cx: &mut Context<Self>) {
-        let Some((run_id, operation)) = self
+        let Some(operation) = self
             .bulk_delete
             .as_ref()
             .and_then(|form| form.run.as_ref())
@@ -368,7 +389,7 @@ impl DatabaseView {
             let result = task.await;
             // Released before touching the window, which may be closed by now.
             if result.is_ok() {
-                acknowledge_publishes(&[run_id.clone(), operation.clone()]);
+                acknowledge_publishes(std::slice::from_ref(&operation));
             }
             this.update(cx, |this, cx| {
                 let run = this.bulk_delete.as_mut().and_then(|form| form.run.as_mut());

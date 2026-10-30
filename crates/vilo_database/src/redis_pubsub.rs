@@ -230,6 +230,20 @@ pub(crate) fn take_operation_lock(lock: &str, operation: &str) -> Result<(), boo
     Ok(())
 }
 
+/// Hands a held lock from one operation of a run to the next, which is about to be sent, so
+/// the lock's owner is always the operation in flight. False if `from` no longer holds it.
+pub(crate) fn pass_operation_lock(lock: &str, from: &str, to: &str) -> bool {
+    let mut locks = publish_locks();
+    match locks.held.get_mut(lock) {
+        Some((owner, false)) if owner == from => {
+            *owner = to.to_string();
+            locks.settled.insert(from.to_string());
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Records an operation's answer: a known one frees its lock, an unknown one keeps it until
 /// the user checked it.
 pub(crate) fn settle_operation_lock(lock: &str, operation: &str, unknown: bool) {
@@ -977,6 +991,29 @@ mod tests {
         assert_eq!(take_operation_lock("test/op", "four"), Ok(()));
         settle_operation_lock("test/op", "four", false);
         assert_eq!(operation_lock("test/op"), None, "a known answer frees it");
+    }
+
+    #[test]
+    fn test_a_run_passes_its_lock_from_batch_to_batch() {
+        assert_eq!(take_operation_lock("test/run", "run:0"), Ok(()));
+        assert!(pass_operation_lock("test/run", "run:0", "run:1"));
+        assert!(
+            publish_pending("run:1"),
+            "the batch in flight owns the lock"
+        );
+        assert!(!publish_pending("run:0"));
+        assert!(
+            !pass_operation_lock("test/run", "run:0", "run:2"),
+            "only the owner hands it on"
+        );
+        settle_operation_lock("test/run", "run:1", true);
+        assert!(
+            !pass_operation_lock("test/run", "run:1", "run:2"),
+            "an unknown outcome keeps it"
+        );
+        assert_eq!(take_operation_lock("test/run", "other"), Err(true));
+        acknowledge_publishes(&["run:1".to_string()]);
+        assert_eq!(operation_lock("test/run"), None);
     }
 
     #[test]

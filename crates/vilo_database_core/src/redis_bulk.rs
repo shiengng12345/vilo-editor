@@ -24,6 +24,8 @@ pub const MAX_KEYS: usize = 100_000;
 pub const BATCH_KEYS: usize = 100;
 const SCAN_COUNT: u32 = 1000;
 const PREVIEW_TIME: Duration = Duration::from_secs(60);
+/// How often a running SCAN looks at the Stop button.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BulkPreview {
@@ -75,7 +77,8 @@ pub fn batches(keys: &[Bytes], clustered: bool) -> Vec<Batch> {
 
 impl RedisSession {
     /// SCANs every node (every primary of a cluster) for keys matching `pattern`, and `kind`
-    /// when given, keeping at most `limit`. Stops at `PREVIEW_TIME` or when `cancel` is set.
+    /// when given, keeping at most `limit`. Stops at `PREVIEW_TIME`, when `cancel` is set, or
+    /// when a SCAN fails, keeping the keys found so far and saying why it is incomplete.
     pub async fn bulk_preview(
         &self,
         pattern: &str,
@@ -90,18 +93,45 @@ impl RedisSession {
         'nodes: for node in self.scan_nodes() {
             let mut cursor = "0".to_string();
             loop {
-                if cancel.load(Ordering::Relaxed) {
-                    incomplete = Some("You stopped the scan.".to_string());
-                    break 'nodes;
-                }
-                if started.elapsed() > PREVIEW_TIME {
-                    incomplete = Some(format!(
+                let stopped = || Some("You stopped the scan.".to_string());
+                let timed_out = || {
+                    Some(format!(
                         "The scan stopped after {} s.",
                         PREVIEW_TIME.as_secs()
-                    ));
+                    ))
+                };
+                if cancel.load(Ordering::Relaxed) {
+                    incomplete = stopped();
                     break 'nodes;
                 }
-                let page = self.scan(&node, &cursor, pattern, SCAN_COUNT, kind).await?;
+                let Some(left) = PREVIEW_TIME.checked_sub(started.elapsed()) else {
+                    incomplete = timed_out();
+                    break 'nodes;
+                };
+                let cancelled = async {
+                    while !cancel.load(Ordering::Relaxed) {
+                        tokio::time::sleep(CANCEL_POLL).await;
+                    }
+                };
+                // A SCAN in flight still answers to Stop and to the time limit.
+                let page = tokio::select! {
+                    page = self.scan(&node, &cursor, pattern, SCAN_COUNT, kind) => page,
+                    _ = tokio::time::sleep(left) => {
+                        incomplete = timed_out();
+                        break 'nodes;
+                    }
+                    _ = cancelled => {
+                        incomplete = stopped();
+                        break 'nodes;
+                    }
+                };
+                let page = match page {
+                    Ok(page) => page,
+                    Err(error) => {
+                        incomplete = Some(format!("SCAN failed on {}: {error:#}.", node.label));
+                        break 'nodes;
+                    }
+                };
                 for key in page.keys {
                     keys.insert(key);
                     if keys.len() > limit {
