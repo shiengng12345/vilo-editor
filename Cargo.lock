@@ -20168,6 +20168,7 @@ dependencies = [
  "fred",
  "futures 0.3.34",
  "mongodb",
+ "serde",
  "serde_json",
  "time",
  "tokio",

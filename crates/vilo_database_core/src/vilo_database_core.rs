@@ -7,4 +7,5 @@ pub mod display;
 pub mod edit;
 pub mod mongo;
 pub mod redis;
+pub mod redis_docs;
 pub mod shell;

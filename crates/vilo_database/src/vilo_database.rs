@@ -349,6 +349,8 @@ pub struct DatabaseView {
     pattern: Entity<Editor>,
     /// Searches the values of the open Redis key.
     value_search: Entity<Editor>,
+    /// Searches the Command Helper's offline documentation.
+    helper_search: Entity<Editor>,
     workbench_input: Entity<Editor>,
     /// Workbench read commands, oldest first, kept in database_redis_history.json.
     command_history: Vec<String>,
@@ -457,7 +459,38 @@ impl DatabaseView {
             names
         });
         let search = editor("Search connections and collections", "", false, window, cx);
+        let helper_search = editor("Search for a command", "", false, window, cx);
+        let workbench_input = {
+            let input = editor(
+                "Enter a Redis command, e.g. HGETALL user:1",
+                "",
+                false,
+                window,
+                cx,
+            );
+            input.update(cx, |input, _| {
+                input
+                    .set_completion_provider(Some(std::rc::Rc::new(redis_view::CommandCompletions)))
+            });
+            input
+        };
         let subscriptions = vec![
+            // The Command Helper follows the search and the command being typed.
+            cx.subscribe(
+                &helper_search,
+                |this, _, event: &editor::EditorEvent, cx| {
+                    // A new search replaces the command picked from the last one.
+                    if matches!(event, editor::EditorEvent::Edited { .. })
+                        && let Some(state) = this.redis_state.as_mut()
+                    {
+                        state.clear_helper_pick();
+                    }
+                    cx.notify();
+                },
+            ),
+            cx.subscribe(&workbench_input, |_, _, _: &editor::EditorEvent, cx| {
+                cx.notify()
+            }),
             cx.subscribe(&search, |this, _, _: &editor::EditorEvent, cx| {
                 // Searching needs every database's collections; load the ones not opened yet.
                 if !this.search.read(cx).text(cx).trim().is_empty() {
@@ -490,21 +523,8 @@ impl DatabaseView {
             local_dates: false,
             pattern: editor("Filter by Key Name or Pattern", "", false, window, cx),
             value_search: editor("Search this key's values (Enter)", "", false, window, cx),
-            workbench_input: {
-                let input = editor(
-                    "Enter a Redis command, e.g. HGETALL user:1",
-                    "",
-                    false,
-                    window,
-                    cx,
-                );
-                input.update(cx, |input, _| {
-                    input.set_completion_provider(Some(std::rc::Rc::new(
-                        redis_view::CommandCompletions,
-                    )))
-                });
-                input
-            },
+            helper_search,
+            workbench_input,
             command_history: Vec::new(),
             history_position: None,
             history_problem: None,

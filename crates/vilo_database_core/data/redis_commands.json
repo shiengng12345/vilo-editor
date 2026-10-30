@@ -1,0 +1,3182 @@
+[
+{
+"name": "ACL",
+"summary": "A container for Access List Control commands.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "Depends on subcommand.",
+"syntax": "ACL"
+},
+{
+"name": "ACL CAT",
+"summary": "Lists the ACL categories, or the commands inside a category.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(1) since the categories and commands are a fixed set.",
+"syntax": "ACL CAT [category]"
+},
+{
+"name": "ACL DELUSER",
+"summary": "Deletes ACL users, and terminates their connections.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(1) amortized time considering the typical user.",
+"syntax": "ACL DELUSER username [username ...]"
+},
+{
+"name": "ACL DRYRUN",
+"summary": "Simulates the execution of a command by a user, without executing the command.",
+"group": "Server Management",
+"since": "7.0.0",
+"complexity": "O(1).",
+"syntax": "ACL DRYRUN username command [arg [arg ...]]"
+},
+{
+"name": "ACL GENPASS",
+"summary": "Generates a pseudorandom, secure password that can be used to identify ACL users.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(1)",
+"syntax": "ACL GENPASS [bits]"
+},
+{
+"name": "ACL GETUSER",
+"summary": "Lists the ACL rules of a user.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(N). Where N is the number of password, command and pattern rules that the user has.",
+"syntax": "ACL GETUSER username"
+},
+{
+"name": "ACL HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(1)",
+"syntax": "ACL HELP"
+},
+{
+"name": "ACL LIST",
+"summary": "Dumps the effective rules in ACL file format.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(N). Where N is the number of configured users.",
+"syntax": "ACL LIST"
+},
+{
+"name": "ACL LOAD",
+"summary": "Reloads the rules from the configured ACL file.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(N). Where N is the number of configured users.",
+"syntax": "ACL LOAD"
+},
+{
+"name": "ACL LOG",
+"summary": "Lists recent security events generated due to ACL rules.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(N) with N being the number of entries shown.",
+"syntax": "ACL LOG [count | RESET]"
+},
+{
+"name": "ACL SAVE",
+"summary": "Saves the effective ACL rules in the configured ACL file.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(N). Where N is the number of configured users.",
+"syntax": "ACL SAVE"
+},
+{
+"name": "ACL SETUSER",
+"summary": "Creates and modifies an ACL user and its rules.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(N). Where N is the number of rules provided.",
+"syntax": "ACL SETUSER username [rule [rule ...]]"
+},
+{
+"name": "ACL USERS",
+"summary": "Lists all ACL users.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(N). Where N is the number of configured users.",
+"syntax": "ACL USERS"
+},
+{
+"name": "ACL WHOAMI",
+"summary": "Returns the authenticated username of the current connection.",
+"group": "Server Management",
+"since": "6.0.0",
+"complexity": "O(1)",
+"syntax": "ACL WHOAMI"
+},
+{
+"name": "APPEND",
+"summary": "Appends a string to the value of a key. Creates the key if it doesn't exist.",
+"group": "String",
+"since": "2.0.0",
+"complexity": "O(1). The amortized time complexity is O(1) assuming the appended value is small and the already present value is of any size, since the dynamic string library used by Redis will double the free space available on every reallocation.",
+"syntax": "APPEND key value"
+},
+{
+"name": "ASKING",
+"summary": "Signals that a cluster client is following an -ASK redirect.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "ASKING"
+},
+{
+"name": "AUTH",
+"summary": "Authenticates the connection.",
+"group": "Connection Management",
+"since": "1.0.0",
+"complexity": "O(N) where N is the number of passwords defined for the user",
+"syntax": "AUTH [username] password"
+},
+{
+"name": "BGREWRITEAOF",
+"summary": "Asynchronously rewrites the append-only file to disk.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "BGREWRITEAOF"
+},
+{
+"name": "BGSAVE",
+"summary": "Asynchronously saves the database(s) to disk.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "BGSAVE [SCHEDULE]"
+},
+{
+"name": "BITCOUNT",
+"summary": "Counts the number of set bits (population counting) in a string.",
+"group": "Bitmap",
+"since": "2.6.0",
+"complexity": "O(N)",
+"syntax": "BITCOUNT key [start end [BYTE | BIT]]"
+},
+{
+"name": "BITFIELD",
+"summary": "Performs arbitrary bitfield integer operations on strings.",
+"group": "Bitmap",
+"since": "3.2.0",
+"complexity": "O(1) for each subcommand specified",
+"syntax": "BITFIELD key [GET encoding offset | [OVERFLOW <WRAP | SAT | FAIL>] <SET encoding offset value | INCRBY encoding offset increment> [GET encoding offset | [OVERFLOW <WRAP | SAT | FAIL>] <SET encoding offset value | INCRBY encoding offset increment> ...]]"
+},
+{
+"name": "BITFIELD_RO",
+"summary": "Performs arbitrary read-only bitfield integer operations on strings.",
+"group": "Bitmap",
+"since": "6.0.0",
+"complexity": "O(1) for each subcommand specified",
+"syntax": "BITFIELD_RO key [GET encoding offset [GET encoding offset ...]]"
+},
+{
+"name": "BITOP",
+"summary": "Performs bitwise operations on multiple strings, and stores the result.",
+"group": "Bitmap",
+"since": "2.6.0",
+"complexity": "O(N)",
+"syntax": "BITOP <AND | OR | XOR | NOT> destkey key [key ...]"
+},
+{
+"name": "BITPOS",
+"summary": "Finds the first set (1) or clear (0) bit in a string.",
+"group": "Bitmap",
+"since": "2.8.7",
+"complexity": "O(N)",
+"syntax": "BITPOS key bit [start [end [BYTE | BIT]]]"
+},
+{
+"name": "BLMOVE",
+"summary": "Pops an element from a list, pushes it to another list and returns it. Blocks until an element is available otherwise. Deletes the list if the last element was moved.",
+"group": "List",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "BLMOVE source destination <LEFT | RIGHT> <LEFT | RIGHT> timeout"
+},
+{
+"name": "BLMPOP",
+"summary": "Pops the first element from one of multiple lists. Blocks until an element is available otherwise. Deletes the list if the last element was popped.",
+"group": "List",
+"since": "7.0.0",
+"complexity": "O(N+M) where N is the number of provided keys and M is the number of elements returned.",
+"syntax": "BLMPOP timeout numkeys key [key ...] <LEFT | RIGHT> [COUNT count]"
+},
+{
+"name": "BLPOP",
+"summary": "Removes and returns the first element in a list. Blocks until an element is available otherwise. Deletes the list if the last element was popped.",
+"group": "List",
+"since": "2.0.0",
+"complexity": "O(N) where N is the number of provided keys.",
+"syntax": "BLPOP key [key ...] timeout"
+},
+{
+"name": "BRPOP",
+"summary": "Removes and returns the last element in a list. Blocks until an element is available otherwise. Deletes the list if the last element was popped.",
+"group": "List",
+"since": "2.0.0",
+"complexity": "O(N) where N is the number of provided keys.",
+"syntax": "BRPOP key [key ...] timeout"
+},
+{
+"name": "BRPOPLPUSH",
+"summary": "Pops an element from a list, pushes it to another list and returns it. Block until an element is available otherwise. Deletes the list if the last element was popped.",
+"group": "List",
+"since": "2.2.0",
+"complexity": "O(1)",
+"syntax": "BRPOPLPUSH source destination timeout",
+"deprecated_since": "6.2.0",
+"replaced_by": "`BLMOVE` with the `RIGHT` and `LEFT` arguments"
+},
+{
+"name": "BZMPOP",
+"summary": "Removes and returns a member by score from one or more sorted sets. Blocks until a member is available otherwise. Deletes the sorted set if the last element was popped.",
+"group": "Sorted Set",
+"since": "7.0.0",
+"complexity": "O(K) + O(M*log(N)) where K is the number of provided keys, N being the number of elements in the sorted set, and M being the number of elements popped.",
+"syntax": "BZMPOP timeout numkeys key [key ...] <MIN | MAX> [COUNT count]"
+},
+{
+"name": "BZPOPMAX",
+"summary": "Removes and returns the member with the highest score from one or more sorted sets. Blocks until a member available otherwise.  Deletes the sorted set if the last element was popped.",
+"group": "Sorted Set",
+"since": "5.0.0",
+"complexity": "O(log(N)) with N being the number of elements in the sorted set.",
+"syntax": "BZPOPMAX key [key ...] timeout"
+},
+{
+"name": "BZPOPMIN",
+"summary": "Removes and returns the member with the lowest score from one or more sorted sets. Blocks until a member is available otherwise. Deletes the sorted set if the last element was popped.",
+"group": "Sorted Set",
+"since": "5.0.0",
+"complexity": "O(log(N)) with N being the number of elements in the sorted set.",
+"syntax": "BZPOPMIN key [key ...] timeout"
+},
+{
+"name": "CLIENT",
+"summary": "A container for client connection commands.",
+"group": "Connection Management",
+"since": "2.4.0",
+"complexity": "Depends on subcommand.",
+"syntax": "CLIENT"
+},
+{
+"name": "CLIENT CACHING",
+"summary": "Instructs the server whether to track the keys in the next request.",
+"group": "Connection Management",
+"since": "6.0.0",
+"complexity": "O(1)",
+"syntax": "CLIENT CACHING <YES | NO>"
+},
+{
+"name": "CLIENT GETNAME",
+"summary": "Returns the name of the connection.",
+"group": "Connection Management",
+"since": "2.6.9",
+"complexity": "O(1)",
+"syntax": "CLIENT GETNAME"
+},
+{
+"name": "CLIENT GETREDIR",
+"summary": "Returns the client ID to which the connection's tracking notifications are redirected.",
+"group": "Connection Management",
+"since": "6.0.0",
+"complexity": "O(1)",
+"syntax": "CLIENT GETREDIR"
+},
+{
+"name": "CLIENT HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Connection Management",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "CLIENT HELP"
+},
+{
+"name": "CLIENT ID",
+"summary": "Returns the unique client ID of the connection.",
+"group": "Connection Management",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "CLIENT ID"
+},
+{
+"name": "CLIENT INFO",
+"summary": "Returns information about the connection.",
+"group": "Connection Management",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "CLIENT INFO"
+},
+{
+"name": "CLIENT KILL",
+"summary": "Terminates open connections.",
+"group": "Connection Management",
+"since": "2.4.0",
+"complexity": "O(N) where N is the number of client connections",
+"syntax": "CLIENT KILL <old-format | <[ID client-id] | [TYPE <NORMAL | MASTER | SLAVE | REPLICA | PUBSUB>] | [USER username] | [ADDR addr] | [LADDR laddr] | [SKIPME <YES | NO>]> [<[ID client-id] | [TYPE <NORMAL | MASTER | SLAVE | REPLICA | PUBSUB>] | [USER username] | [ADDR addr] | [LADDR laddr] | [SKIPME <YES | NO>]> ...]>"
+},
+{
+"name": "CLIENT LIST",
+"summary": "Lists open connections.",
+"group": "Connection Management",
+"since": "2.4.0",
+"complexity": "O(N) where N is the number of client connections",
+"syntax": "CLIENT LIST [TYPE <NORMAL | MASTER | REPLICA | PUBSUB>] [ID client-id [client-id ...]]"
+},
+{
+"name": "CLIENT NO-EVICT",
+"summary": "Sets the client eviction mode of the connection.",
+"group": "Connection Management",
+"since": "7.0.0",
+"complexity": "O(1)",
+"syntax": "CLIENT NO-EVICT <ON | OFF>"
+},
+{
+"name": "CLIENT NO-TOUCH",
+"summary": "Controls whether commands sent by the client affect the LRU/LFU of accessed keys.",
+"group": "Connection Management",
+"since": "7.2.0",
+"complexity": "O(1)",
+"syntax": "CLIENT NO-TOUCH <ON | OFF>"
+},
+{
+"name": "CLIENT PAUSE",
+"summary": "Suspends commands processing.",
+"group": "Connection Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLIENT PAUSE timeout [WRITE | ALL]"
+},
+{
+"name": "CLIENT REPLY",
+"summary": "Instructs the server whether to reply to commands.",
+"group": "Connection Management",
+"since": "3.2.0",
+"complexity": "O(1)",
+"syntax": "CLIENT REPLY <ON | OFF | SKIP>"
+},
+{
+"name": "CLIENT SETINFO",
+"summary": "Sets information specific to the client or connection.",
+"group": "Connection Management",
+"since": "7.2.0",
+"complexity": "O(1)",
+"syntax": "CLIENT SETINFO <LIB-NAME libname | LIB-VER libver>"
+},
+{
+"name": "CLIENT SETNAME",
+"summary": "Sets the connection name.",
+"group": "Connection Management",
+"since": "2.6.9",
+"complexity": "O(1)",
+"syntax": "CLIENT SETNAME connection-name"
+},
+{
+"name": "CLIENT TRACKING",
+"summary": "Controls server-assisted client-side caching for the connection.",
+"group": "Connection Management",
+"since": "6.0.0",
+"complexity": "O(1). Some options may introduce additional complexity.",
+"syntax": "CLIENT TRACKING <ON | OFF> [REDIRECT client-id] [PREFIX prefix [PREFIX prefix ...]] [BCAST] [OPTIN] [OPTOUT] [NOLOOP]"
+},
+{
+"name": "CLIENT TRACKINGINFO",
+"summary": "Returns information about server-assisted client-side caching for the connection.",
+"group": "Connection Management",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "CLIENT TRACKINGINFO"
+},
+{
+"name": "CLIENT UNBLOCK",
+"summary": "Unblocks a client blocked by a blocking command from a different connection.",
+"group": "Connection Management",
+"since": "5.0.0",
+"complexity": "O(log N) where N is the number of client connections",
+"syntax": "CLIENT UNBLOCK client-id [TIMEOUT | ERROR]"
+},
+{
+"name": "CLIENT UNPAUSE",
+"summary": "Resumes processing commands from paused clients.",
+"group": "Connection Management",
+"since": "6.2.0",
+"complexity": "O(N) Where N is the number of paused clients",
+"syntax": "CLIENT UNPAUSE"
+},
+{
+"name": "CLUSTER",
+"summary": "A container for Redis Cluster commands.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "Depends on subcommand.",
+"syntax": "CLUSTER"
+},
+{
+"name": "CLUSTER ADDSLOTS",
+"summary": "Assigns new hash slots to a node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(N) where N is the total number of hash slot arguments",
+"syntax": "CLUSTER ADDSLOTS slot [slot ...]"
+},
+{
+"name": "CLUSTER ADDSLOTSRANGE",
+"summary": "Assigns new hash slot ranges to a node.",
+"group": "Cluster Management",
+"since": "7.0.0",
+"complexity": "O(N) where N is the total number of the slots between the start slot and end slot arguments.",
+"syntax": "CLUSTER ADDSLOTSRANGE start-slot end-slot [start-slot end-slot ...]"
+},
+{
+"name": "CLUSTER BUMPEPOCH",
+"summary": "Advances the cluster config epoch.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER BUMPEPOCH"
+},
+{
+"name": "CLUSTER COUNT-FAILURE-REPORTS",
+"summary": "Returns the number of active failure reports active for a node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(N) where N is the number of failure reports",
+"syntax": "CLUSTER COUNT-FAILURE-REPORTS node-id"
+},
+{
+"name": "CLUSTER COUNTKEYSINSLOT",
+"summary": "Returns the number of keys in a hash slot.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER COUNTKEYSINSLOT slot"
+},
+{
+"name": "CLUSTER DELSLOTS",
+"summary": "Sets hash slots as unbound for a node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(N) where N is the total number of hash slot arguments",
+"syntax": "CLUSTER DELSLOTS slot [slot ...]"
+},
+{
+"name": "CLUSTER DELSLOTSRANGE",
+"summary": "Sets hash slot ranges as unbound for a node.",
+"group": "Cluster Management",
+"since": "7.0.0",
+"complexity": "O(N) where N is the total number of the slots between the start slot and end slot arguments.",
+"syntax": "CLUSTER DELSLOTSRANGE start-slot end-slot [start-slot end-slot ...]"
+},
+{
+"name": "CLUSTER FAILOVER",
+"summary": "Forces a replica to perform a manual failover of its master.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER FAILOVER [FORCE | TAKEOVER]"
+},
+{
+"name": "CLUSTER FLUSHSLOTS",
+"summary": "Deletes all slots information from a node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER FLUSHSLOTS"
+},
+{
+"name": "CLUSTER FORGET",
+"summary": "Removes a node from the nodes table.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER FORGET node-id"
+},
+{
+"name": "CLUSTER GETKEYSINSLOT",
+"summary": "Returns the key names in a hash slot.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(N) where N is the number of requested keys",
+"syntax": "CLUSTER GETKEYSINSLOT slot count"
+},
+{
+"name": "CLUSTER HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Cluster Management",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER HELP"
+},
+{
+"name": "CLUSTER INFO",
+"summary": "Returns information about the state of a node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER INFO"
+},
+{
+"name": "CLUSTER KEYSLOT",
+"summary": "Returns the hash slot for a key.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(N) where N is the number of bytes in the key",
+"syntax": "CLUSTER KEYSLOT key"
+},
+{
+"name": "CLUSTER LINKS",
+"summary": "Returns a list of all TCP links to and from peer nodes.",
+"group": "Cluster Management",
+"since": "7.0.0",
+"complexity": "O(N) where N is the total number of Cluster nodes",
+"syntax": "CLUSTER LINKS"
+},
+{
+"name": "CLUSTER MEET",
+"summary": "Forces a node to handshake with another node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER MEET ip port [cluster-bus-port]"
+},
+{
+"name": "CLUSTER MYID",
+"summary": "Returns the ID of a node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER MYID"
+},
+{
+"name": "CLUSTER MYSHARDID",
+"summary": "Returns the shard ID of a node.",
+"group": "Cluster Management",
+"since": "7.2.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER MYSHARDID"
+},
+{
+"name": "CLUSTER NODES",
+"summary": "Returns the cluster configuration for a node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(N) where N is the total number of Cluster nodes",
+"syntax": "CLUSTER NODES"
+},
+{
+"name": "CLUSTER REPLICAS",
+"summary": "Lists the replica nodes of a master node.",
+"group": "Cluster Management",
+"since": "5.0.0",
+"complexity": "O(N) where N is the number of replicas.",
+"syntax": "CLUSTER REPLICAS node-id"
+},
+{
+"name": "CLUSTER REPLICATE",
+"summary": "Configure a node as replica of a master node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER REPLICATE node-id"
+},
+{
+"name": "CLUSTER RESET",
+"summary": "Resets a node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(N) where N is the number of known nodes. The command may execute a FLUSHALL as a side effect.",
+"syntax": "CLUSTER RESET [HARD | SOFT]"
+},
+{
+"name": "CLUSTER SAVECONFIG",
+"summary": "Forces a node to save the cluster configuration to disk.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER SAVECONFIG"
+},
+{
+"name": "CLUSTER SET-CONFIG-EPOCH",
+"summary": "Sets the configuration epoch for a new node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER SET-CONFIG-EPOCH config-epoch"
+},
+{
+"name": "CLUSTER SETSLOT",
+"summary": "Binds a hash slot to a node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "CLUSTER SETSLOT slot <IMPORTING importing | MIGRATING migrating | NODE node | STABLE>"
+},
+{
+"name": "CLUSTER SHARDS",
+"summary": "Returns the mapping of cluster slots to shards.",
+"group": "Cluster Management",
+"since": "7.0.0",
+"complexity": "O(N) where N is the total number of cluster nodes",
+"syntax": "CLUSTER SHARDS"
+},
+{
+"name": "CLUSTER SLAVES",
+"summary": "Lists the replica nodes of a master node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(N) where N is the number of replicas.",
+"syntax": "CLUSTER SLAVES node-id",
+"deprecated_since": "5.0.0",
+"replaced_by": "`CLUSTER REPLICAS`"
+},
+{
+"name": "CLUSTER SLOTS",
+"summary": "Returns the mapping of cluster slots to nodes.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(N) where N is the total number of Cluster nodes",
+"syntax": "CLUSTER SLOTS",
+"deprecated_since": "7.0.0",
+"replaced_by": "`CLUSTER SHARDS`"
+},
+{
+"name": "COMMAND",
+"summary": "Returns detailed information about all commands.",
+"group": "Server Management",
+"since": "2.8.13",
+"complexity": "O(N) where N is the total number of Redis commands",
+"syntax": "COMMAND"
+},
+{
+"name": "COMMAND COUNT",
+"summary": "Returns a count of commands.",
+"group": "Server Management",
+"since": "2.8.13",
+"complexity": "O(1)",
+"syntax": "COMMAND COUNT"
+},
+{
+"name": "COMMAND DOCS",
+"summary": "Returns documentary information about one, multiple or all commands.",
+"group": "Server Management",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of commands to look up",
+"syntax": "COMMAND DOCS [command-name [command-name ...]]"
+},
+{
+"name": "COMMAND GETKEYS",
+"summary": "Extracts the key names from an arbitrary command.",
+"group": "Server Management",
+"since": "2.8.13",
+"complexity": "O(N) where N is the number of arguments to the command",
+"syntax": "COMMAND GETKEYS command [arg [arg ...]]"
+},
+{
+"name": "COMMAND GETKEYSANDFLAGS",
+"summary": "Extracts the key names and access flags for an arbitrary command.",
+"group": "Server Management",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of arguments to the command",
+"syntax": "COMMAND GETKEYSANDFLAGS command [arg [arg ...]]"
+},
+{
+"name": "COMMAND HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Server Management",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "COMMAND HELP"
+},
+{
+"name": "COMMAND INFO",
+"summary": "Returns information about one, multiple or all commands.",
+"group": "Server Management",
+"since": "2.8.13",
+"complexity": "O(N) where N is the number of commands to look up",
+"syntax": "COMMAND INFO [command-name [command-name ...]]"
+},
+{
+"name": "COMMAND LIST",
+"summary": "Returns a list of command names.",
+"group": "Server Management",
+"since": "7.0.0",
+"complexity": "O(N) where N is the total number of Redis commands",
+"syntax": "COMMAND LIST [FILTERBY <MODULE module-name | ACLCAT category | PATTERN pattern>]"
+},
+{
+"name": "CONFIG",
+"summary": "A container for server configuration commands.",
+"group": "Server Management",
+"since": "2.0.0",
+"complexity": "Depends on subcommand.",
+"syntax": "CONFIG"
+},
+{
+"name": "CONFIG GET",
+"summary": "Returns the effective values of configuration parameters.",
+"group": "Server Management",
+"since": "2.0.0",
+"complexity": "O(N) when N is the number of configuration parameters provided",
+"syntax": "CONFIG GET parameter [parameter ...]"
+},
+{
+"name": "CONFIG HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Server Management",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "CONFIG HELP"
+},
+{
+"name": "CONFIG RESETSTAT",
+"summary": "Resets the server's statistics.",
+"group": "Server Management",
+"since": "2.0.0",
+"complexity": "O(1)",
+"syntax": "CONFIG RESETSTAT"
+},
+{
+"name": "CONFIG REWRITE",
+"summary": "Persists the effective configuration to file.",
+"group": "Server Management",
+"since": "2.8.0",
+"complexity": "O(1)",
+"syntax": "CONFIG REWRITE"
+},
+{
+"name": "CONFIG SET",
+"summary": "Sets configuration parameters in-flight.",
+"group": "Server Management",
+"since": "2.0.0",
+"complexity": "O(N) when N is the number of configuration parameters provided",
+"syntax": "CONFIG SET parameter value [parameter value ...]"
+},
+{
+"name": "COPY",
+"summary": "Copies the value of a key to a new key.",
+"group": "Keys",
+"since": "6.2.0",
+"complexity": "O(N) worst case for collections, where N is the number of nested items. O(1) for string values.",
+"syntax": "COPY source destination [DB destination-db] [REPLACE]"
+},
+{
+"name": "DBSIZE",
+"summary": "Returns the number of keys in the database.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "DBSIZE"
+},
+{
+"name": "DEBUG",
+"summary": "A container for debugging commands.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "Depends on subcommand.",
+"syntax": "DEBUG"
+},
+{
+"name": "DECR",
+"summary": "Decrements the integer value of a key by one. Uses 0 as initial value if the key doesn't exist.",
+"group": "String",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "DECR key"
+},
+{
+"name": "DECRBY",
+"summary": "Decrements a number from the integer value of a key. Uses 0 as initial value if the key doesn't exist.",
+"group": "String",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "DECRBY key decrement"
+},
+{
+"name": "DEL",
+"summary": "Deletes one or more keys.",
+"group": "Keys",
+"since": "1.0.0",
+"complexity": "O(N) where N is the number of keys that will be removed. When a key to remove holds a value other than a string, the individual complexity for this key is O(M) where M is the number of elements in the list, set, sorted set or hash. Removing a single key that holds a string value is O(1).",
+"syntax": "DEL key [key ...]"
+},
+{
+"name": "DISCARD",
+"summary": "Discards a transaction.",
+"group": "Transactions",
+"since": "2.0.0",
+"complexity": "O(N), when N is the number of queued commands",
+"syntax": "DISCARD"
+},
+{
+"name": "DUMP",
+"summary": "Returns a serialized representation of the value stored at a key.",
+"group": "Keys",
+"since": "2.6.0",
+"complexity": "O(1) to access the key and additional O(N*M) to serialize it, where N is the number of Redis objects composing the value and M their average size. For small string values the time complexity is thus O(1)+O(1*M) where M is small, so simply O(1).",
+"syntax": "DUMP key"
+},
+{
+"name": "ECHO",
+"summary": "Returns the given string.",
+"group": "Connection Management",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "ECHO message"
+},
+{
+"name": "EVAL",
+"summary": "Executes a server-side Lua script.",
+"group": "Scripting and Functions",
+"since": "2.6.0",
+"complexity": "Depends on the script that is executed.",
+"syntax": "EVAL script numkeys [key [key ...]] [arg [arg ...]]"
+},
+{
+"name": "EVALSHA",
+"summary": "Executes a server-side Lua script by SHA1 digest.",
+"group": "Scripting and Functions",
+"since": "2.6.0",
+"complexity": "Depends on the script that is executed.",
+"syntax": "EVALSHA sha1 numkeys [key [key ...]] [arg [arg ...]]"
+},
+{
+"name": "EVALSHA_RO",
+"summary": "Executes a read-only server-side Lua script by SHA1 digest.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "Depends on the script that is executed.",
+"syntax": "EVALSHA_RO sha1 numkeys [key [key ...]] [arg [arg ...]]"
+},
+{
+"name": "EVAL_RO",
+"summary": "Executes a read-only server-side Lua script.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "Depends on the script that is executed.",
+"syntax": "EVAL_RO script numkeys [key [key ...]] [arg [arg ...]]"
+},
+{
+"name": "EXEC",
+"summary": "Executes all commands in a transaction.",
+"group": "Transactions",
+"since": "1.2.0",
+"complexity": "Depends on commands in the transaction",
+"syntax": "EXEC"
+},
+{
+"name": "EXISTS",
+"summary": "Determines whether one or more keys exist.",
+"group": "Keys",
+"since": "1.0.0",
+"complexity": "O(N) where N is the number of keys to check.",
+"syntax": "EXISTS key [key ...]"
+},
+{
+"name": "EXPIRE",
+"summary": "Sets the expiration time of a key in seconds.",
+"group": "Keys",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "EXPIRE key seconds [NX | XX | GT | LT]"
+},
+{
+"name": "EXPIREAT",
+"summary": "Sets the expiration time of a key to a Unix timestamp.",
+"group": "Keys",
+"since": "1.2.0",
+"complexity": "O(1)",
+"syntax": "EXPIREAT key unix-time-seconds [NX | XX | GT | LT]"
+},
+{
+"name": "EXPIRETIME",
+"summary": "Returns the expiration time of a key as a Unix timestamp.",
+"group": "Keys",
+"since": "7.0.0",
+"complexity": "O(1)",
+"syntax": "EXPIRETIME key"
+},
+{
+"name": "FAILOVER",
+"summary": "Starts a coordinated failover from a server to one of its replicas.",
+"group": "Server Management",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "FAILOVER [TO host port [FORCE]] [ABORT] [TIMEOUT milliseconds]"
+},
+{
+"name": "FCALL",
+"summary": "Invokes a function.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "Depends on the function that is executed.",
+"syntax": "FCALL function numkeys [key [key ...]] [arg [arg ...]]"
+},
+{
+"name": "FCALL_RO",
+"summary": "Invokes a read-only function.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "Depends on the function that is executed.",
+"syntax": "FCALL_RO function numkeys [key [key ...]] [arg [arg ...]]"
+},
+{
+"name": "FLUSHALL",
+"summary": "Removes all keys from all databases.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "O(N) where N is the total number of keys in all databases",
+"syntax": "FLUSHALL [ASYNC | SYNC]"
+},
+{
+"name": "FLUSHDB",
+"summary": "Remove all keys from the current database.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "O(N) where N is the number of keys in the selected database",
+"syntax": "FLUSHDB [ASYNC | SYNC]"
+},
+{
+"name": "FUNCTION",
+"summary": "A container for function commands.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "Depends on subcommand.",
+"syntax": "FUNCTION"
+},
+{
+"name": "FUNCTION DELETE",
+"summary": "Deletes a library and its functions.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "O(1)",
+"syntax": "FUNCTION DELETE library-name"
+},
+{
+"name": "FUNCTION DUMP",
+"summary": "Dumps all libraries into a serialized binary payload.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of functions",
+"syntax": "FUNCTION DUMP"
+},
+{
+"name": "FUNCTION FLUSH",
+"summary": "Deletes all libraries and functions.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of functions deleted",
+"syntax": "FUNCTION FLUSH [ASYNC | SYNC]"
+},
+{
+"name": "FUNCTION HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "O(1)",
+"syntax": "FUNCTION HELP"
+},
+{
+"name": "FUNCTION KILL",
+"summary": "Terminates a function during execution.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "O(1)",
+"syntax": "FUNCTION KILL"
+},
+{
+"name": "FUNCTION LIST",
+"summary": "Returns information about all libraries.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of functions",
+"syntax": "FUNCTION LIST [LIBRARYNAME library-name-pattern] [WITHCODE]"
+},
+{
+"name": "FUNCTION LOAD",
+"summary": "Creates a library.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "O(1) (considering compilation time is redundant)",
+"syntax": "FUNCTION LOAD [REPLACE] function-code"
+},
+{
+"name": "FUNCTION RESTORE",
+"summary": "Restores all libraries from a payload.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of functions on the payload",
+"syntax": "FUNCTION RESTORE serialized-value [FLUSH | APPEND | REPLACE]"
+},
+{
+"name": "FUNCTION STATS",
+"summary": "Returns information about a function during execution.",
+"group": "Scripting and Functions",
+"since": "7.0.0",
+"complexity": "O(1)",
+"syntax": "FUNCTION STATS"
+},
+{
+"name": "GEOADD",
+"summary": "Adds one or more members to a geospatial index. The key is created if it doesn't exist.",
+"group": "Geospatial Indices",
+"since": "3.2.0",
+"complexity": "O(log(N)) for each item added, where N is the number of elements in the sorted set.",
+"syntax": "GEOADD key [NX | XX] [CH] longitude latitude member [longitude latitude member ...]"
+},
+{
+"name": "GEODIST",
+"summary": "Returns the distance between two members of a geospatial index.",
+"group": "Geospatial Indices",
+"since": "3.2.0",
+"complexity": "O(1)",
+"syntax": "GEODIST key member1 member2 [M | KM | FT | MI]"
+},
+{
+"name": "GEOHASH",
+"summary": "Returns members from a geospatial index as geohash strings.",
+"group": "Geospatial Indices",
+"since": "3.2.0",
+"complexity": "O(1) for each member requested.",
+"syntax": "GEOHASH key [member [member ...]]"
+},
+{
+"name": "GEOPOS",
+"summary": "Returns the longitude and latitude of members from a geospatial index.",
+"group": "Geospatial Indices",
+"since": "3.2.0",
+"complexity": "O(1) for each member requested.",
+"syntax": "GEOPOS key [member [member ...]]"
+},
+{
+"name": "GEORADIUS",
+"summary": "Queries a geospatial index for members within a distance from a coordinate, optionally stores the result.",
+"group": "Geospatial Indices",
+"since": "3.2.0",
+"complexity": "O(N+log(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
+"syntax": "GEORADIUS key longitude latitude radius <M | KM | FT | MI> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC] [STORE storekey | STOREDIST storedistkey]",
+"deprecated_since": "6.2.0",
+"replaced_by": "`GEOSEARCH` and `GEOSEARCHSTORE` with the `BYRADIUS` argument"
+},
+{
+"name": "GEORADIUSBYMEMBER",
+"summary": "Queries a geospatial index for members within a distance from a member, optionally stores the result.",
+"group": "Geospatial Indices",
+"since": "3.2.0",
+"complexity": "O(N+log(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
+"syntax": "GEORADIUSBYMEMBER key member radius <M | KM | FT | MI> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC] [STORE storekey | STOREDIST storedistkey]",
+"deprecated_since": "6.2.0",
+"replaced_by": "`GEOSEARCH` and `GEOSEARCHSTORE` with the `BYRADIUS` and `FROMMEMBER` arguments"
+},
+{
+"name": "GEORADIUSBYMEMBER_RO",
+"summary": "Returns members from a geospatial index that are within a distance from a member.",
+"group": "Geospatial Indices",
+"since": "3.2.10",
+"complexity": "O(N+log(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
+"syntax": "GEORADIUSBYMEMBER_RO key member radius <M | KM | FT | MI> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC]",
+"deprecated_since": "6.2.0",
+"replaced_by": "`GEOSEARCH` with the `BYRADIUS` and `FROMMEMBER` arguments"
+},
+{
+"name": "GEORADIUS_RO",
+"summary": "Returns members from a geospatial index that are within a distance from a coordinate.",
+"group": "Geospatial Indices",
+"since": "3.2.10",
+"complexity": "O(N+log(M)) where N is the number of elements inside the bounding box of the circular area delimited by center and radius and M is the number of items inside the index.",
+"syntax": "GEORADIUS_RO key longitude latitude radius <M | KM | FT | MI> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC]",
+"deprecated_since": "6.2.0",
+"replaced_by": "`GEOSEARCH` with the `BYRADIUS` argument"
+},
+{
+"name": "GEOSEARCH",
+"summary": "Queries a geospatial index for members inside an area of a box or a circle.",
+"group": "Geospatial Indices",
+"since": "6.2.0",
+"complexity": "O(N+log(M)) where N is the number of elements in the grid-aligned bounding box area around the shape provided as the filter and M is the number of items inside the shape",
+"syntax": "GEOSEARCH key <FROMMEMBER member | FROMLONLAT longitude latitude> <BYRADIUS radius <M | KM | FT | MI> | BYBOX width height <M | KM | FT | MI>> [ASC | DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]"
+},
+{
+"name": "GEOSEARCHSTORE",
+"summary": "Queries a geospatial index for members inside an area of a box or a circle, optionally stores the result.",
+"group": "Geospatial Indices",
+"since": "6.2.0",
+"complexity": "O(N+log(M)) where N is the number of elements in the grid-aligned bounding box area around the shape provided as the filter and M is the number of items inside the shape",
+"syntax": "GEOSEARCHSTORE destination source <FROMMEMBER member | FROMLONLAT longitude latitude> <BYRADIUS radius <M | KM | FT | MI> | BYBOX width height <M | KM | FT | MI>> [ASC | DESC] [COUNT count [ANY]] [STOREDIST]"
+},
+{
+"name": "GET",
+"summary": "Returns the string value of a key.",
+"group": "String",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "GET key"
+},
+{
+"name": "GETBIT",
+"summary": "Returns a bit value by offset.",
+"group": "Bitmap",
+"since": "2.2.0",
+"complexity": "O(1)",
+"syntax": "GETBIT key offset"
+},
+{
+"name": "GETDEL",
+"summary": "Returns the string value of a key after deleting the key.",
+"group": "String",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "GETDEL key"
+},
+{
+"name": "GETEX",
+"summary": "Returns the string value of a key after setting its expiration time.",
+"group": "String",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "GETEX key [EX seconds | PX milliseconds | EXAT unix-time-seconds | PXAT unix-time-milliseconds | PERSIST]"
+},
+{
+"name": "GETRANGE",
+"summary": "Returns a substring of the string stored at a key.",
+"group": "String",
+"since": "2.4.0",
+"complexity": "O(N) where N is the length of the returned string. The complexity is ultimately determined by the returned length, but because creating a substring from an existing string is very cheap, it can be considered O(1) for small strings.",
+"syntax": "GETRANGE key start end"
+},
+{
+"name": "GETSET",
+"summary": "Returns the previous string value of a key after setting it to a new value.",
+"group": "String",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "GETSET key value",
+"deprecated_since": "6.2.0",
+"replaced_by": "`SET` with the `!GET` argument"
+},
+{
+"name": "HDEL",
+"summary": "Deletes one or more fields and their values from a hash. Deletes the hash if no fields remain.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(N) where N is the number of fields to be removed.",
+"syntax": "HDEL key field [field ...]"
+},
+{
+"name": "HELLO",
+"summary": "Handshakes with the Redis server.",
+"group": "Connection Management",
+"since": "6.0.0",
+"complexity": "O(1)",
+"syntax": "HELLO [protover [AUTH username password] [SETNAME clientname]]"
+},
+{
+"name": "HEXISTS",
+"summary": "Determines whether a field exists in a hash.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(1)",
+"syntax": "HEXISTS key field"
+},
+{
+"name": "HGET",
+"summary": "Returns the value of a field in a hash.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(1)",
+"syntax": "HGET key field"
+},
+{
+"name": "HGETALL",
+"summary": "Returns all fields and values in a hash.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(N) where N is the size of the hash.",
+"syntax": "HGETALL key"
+},
+{
+"name": "HINCRBY",
+"summary": "Increments the integer value of a field in a hash by a number. Uses 0 as initial value if the field doesn't exist.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(1)",
+"syntax": "HINCRBY key field increment"
+},
+{
+"name": "HINCRBYFLOAT",
+"summary": "Increments the floating point value of a field by a number. Uses 0 as initial value if the field doesn't exist.",
+"group": "Hash",
+"since": "2.6.0",
+"complexity": "O(1)",
+"syntax": "HINCRBYFLOAT key field increment"
+},
+{
+"name": "HKEYS",
+"summary": "Returns all fields in a hash.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(N) where N is the size of the hash.",
+"syntax": "HKEYS key"
+},
+{
+"name": "HLEN",
+"summary": "Returns the number of fields in a hash.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(1)",
+"syntax": "HLEN key"
+},
+{
+"name": "HMGET",
+"summary": "Returns the values of all fields in a hash.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(N) where N is the number of fields being requested.",
+"syntax": "HMGET key field [field ...]"
+},
+{
+"name": "HMSET",
+"summary": "Sets the values of multiple fields.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(N) where N is the number of fields being set.",
+"syntax": "HMSET key field value [field value ...]",
+"deprecated_since": "4.0.0",
+"replaced_by": "`HSET` with multiple field-value pairs"
+},
+{
+"name": "HRANDFIELD",
+"summary": "Returns one or more random fields from a hash.",
+"group": "Hash",
+"since": "6.2.0",
+"complexity": "O(N) where N is the number of fields returned",
+"syntax": "HRANDFIELD key [count [WITHVALUES]]"
+},
+{
+"name": "HSCAN",
+"summary": "Iterates over fields and values of a hash.",
+"group": "Hash",
+"since": "2.8.0",
+"complexity": "O(1) for every call. O(N) for a complete iteration, including enough command calls for the cursor to return back to 0. N is the number of elements inside the collection.",
+"syntax": "HSCAN key cursor [MATCH pattern] [COUNT count]"
+},
+{
+"name": "HSET",
+"summary": "Creates or modifies the value of a field in a hash.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(1) for each field/value pair added, so O(N) to add N field/value pairs when the command is called with multiple field/value pairs.",
+"syntax": "HSET key field value [field value ...]"
+},
+{
+"name": "HSETNX",
+"summary": "Sets the value of a field in a hash only when the field doesn't exist.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(1)",
+"syntax": "HSETNX key field value"
+},
+{
+"name": "HSTRLEN",
+"summary": "Returns the length of the value of a field.",
+"group": "Hash",
+"since": "3.2.0",
+"complexity": "O(1)",
+"syntax": "HSTRLEN key field"
+},
+{
+"name": "HVALS",
+"summary": "Returns all values in a hash.",
+"group": "Hash",
+"since": "2.0.0",
+"complexity": "O(N) where N is the size of the hash.",
+"syntax": "HVALS key"
+},
+{
+"name": "INCR",
+"summary": "Increments the integer value of a key by one. Uses 0 as initial value if the key doesn't exist.",
+"group": "String",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "INCR key"
+},
+{
+"name": "INCRBY",
+"summary": "Increments the integer value of a key by a number. Uses 0 as initial value if the key doesn't exist.",
+"group": "String",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "INCRBY key increment"
+},
+{
+"name": "INCRBYFLOAT",
+"summary": "Increment the floating point value of a key by a number. Uses 0 as initial value if the key doesn't exist.",
+"group": "String",
+"since": "2.6.0",
+"complexity": "O(1)",
+"syntax": "INCRBYFLOAT key increment"
+},
+{
+"name": "INFO",
+"summary": "Returns information and statistics about the server.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "INFO [section [section ...]]"
+},
+{
+"name": "KEYS",
+"summary": "Returns all key names that match a pattern.",
+"group": "Keys",
+"since": "1.0.0",
+"complexity": "O(N) with N being the number of keys in the database, under the assumption that the key names in the database and the given pattern have limited length.",
+"syntax": "KEYS pattern"
+},
+{
+"name": "LASTSAVE",
+"summary": "Returns the Unix timestamp of the last successful save to disk.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "LASTSAVE"
+},
+{
+"name": "LATENCY",
+"summary": "A container for latency diagnostics commands.",
+"group": "Server Management",
+"since": "2.8.13",
+"complexity": "Depends on subcommand.",
+"syntax": "LATENCY"
+},
+{
+"name": "LATENCY DOCTOR",
+"summary": "Returns a human-readable latency analysis report.",
+"group": "Server Management",
+"since": "2.8.13",
+"complexity": "O(1)",
+"syntax": "LATENCY DOCTOR"
+},
+{
+"name": "LATENCY GRAPH",
+"summary": "Returns a latency graph for an event.",
+"group": "Server Management",
+"since": "2.8.13",
+"complexity": "O(1)",
+"syntax": "LATENCY GRAPH event"
+},
+{
+"name": "LATENCY HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Server Management",
+"since": "2.8.13",
+"complexity": "O(1)",
+"syntax": "LATENCY HELP"
+},
+{
+"name": "LATENCY HISTOGRAM",
+"summary": "Returns the cumulative distribution of latencies of a subset or all commands.",
+"group": "Server Management",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of commands with latency information being retrieved.",
+"syntax": "LATENCY HISTOGRAM [COMMAND [COMMAND ...]]"
+},
+{
+"name": "LATENCY HISTORY",
+"summary": "Returns timestamp-latency samples for an event.",
+"group": "Server Management",
+"since": "2.8.13",
+"complexity": "O(1)",
+"syntax": "LATENCY HISTORY event"
+},
+{
+"name": "LATENCY LATEST",
+"summary": "Returns the latest latency samples for all events.",
+"group": "Server Management",
+"since": "2.8.13",
+"complexity": "O(1)",
+"syntax": "LATENCY LATEST"
+},
+{
+"name": "LATENCY RESET",
+"summary": "Resets the latency data for one or more events.",
+"group": "Server Management",
+"since": "2.8.13",
+"complexity": "O(1)",
+"syntax": "LATENCY RESET [event [event ...]]"
+},
+{
+"name": "LCS",
+"summary": "Finds the longest common substring.",
+"group": "String",
+"since": "7.0.0",
+"complexity": "O(N*M) where N and M are the lengths of s1 and s2, respectively",
+"syntax": "LCS key1 key2 [LEN] [IDX] [MINMATCHLEN min-match-len] [WITHMATCHLEN]"
+},
+{
+"name": "LINDEX",
+"summary": "Returns an element from a list by its index.",
+"group": "List",
+"since": "1.0.0",
+"complexity": "O(N) where N is the number of elements to traverse to get to the element at index. This makes asking for the first or the last element of the list O(1).",
+"syntax": "LINDEX key index"
+},
+{
+"name": "LINSERT",
+"summary": "Inserts an element before or after another element in a list.",
+"group": "List",
+"since": "2.2.0",
+"complexity": "O(N) where N is the number of elements to traverse before seeing the value pivot. This means that inserting somewhere on the left end on the list (head) can be considered O(1) and inserting somewhere on the right end (tail) is O(N).",
+"syntax": "LINSERT key <BEFORE | AFTER> pivot element"
+},
+{
+"name": "LLEN",
+"summary": "Returns the length of a list.",
+"group": "List",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "LLEN key"
+},
+{
+"name": "LMOVE",
+"summary": "Returns an element after popping it from one list and pushing it to another. Deletes the list if the last element was moved.",
+"group": "List",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "LMOVE source destination <LEFT | RIGHT> <LEFT | RIGHT>"
+},
+{
+"name": "LMPOP",
+"summary": "Returns multiple elements from a list after removing them. Deletes the list if the last element was popped.",
+"group": "List",
+"since": "7.0.0",
+"complexity": "O(N+M) where N is the number of provided keys and M is the number of elements returned.",
+"syntax": "LMPOP numkeys key [key ...] <LEFT | RIGHT> [COUNT count]"
+},
+{
+"name": "LOLWUT",
+"summary": "Displays computer art and the Redis version",
+"group": "Server Management",
+"since": "5.0.0",
+"complexity": "",
+"syntax": "LOLWUT [VERSION version]"
+},
+{
+"name": "LPOP",
+"summary": "Returns the first elements in a list after removing it. Deletes the list if the last element was popped.",
+"group": "List",
+"since": "1.0.0",
+"complexity": "O(N) where N is the number of elements returned",
+"syntax": "LPOP key [count]"
+},
+{
+"name": "LPOS",
+"summary": "Returns the index of matching elements in a list.",
+"group": "List",
+"since": "6.0.6",
+"complexity": "O(N) where N is the number of elements in the list, for the average case. When searching for elements near the head or the tail of the list, or when the MAXLEN option is provided, the command may run in constant time.",
+"syntax": "LPOS key element [RANK rank] [COUNT num-matches] [MAXLEN len]"
+},
+{
+"name": "LPUSH",
+"summary": "Prepends one or more elements to a list. Creates the key if it doesn't exist.",
+"group": "List",
+"since": "1.0.0",
+"complexity": "O(1) for each element added, so O(N) to add N elements when the command is called with multiple arguments.",
+"syntax": "LPUSH key element [element ...]"
+},
+{
+"name": "LPUSHX",
+"summary": "Prepends one or more elements to a list only when the list exists.",
+"group": "List",
+"since": "2.2.0",
+"complexity": "O(1) for each element added, so O(N) to add N elements when the command is called with multiple arguments.",
+"syntax": "LPUSHX key element [element ...]"
+},
+{
+"name": "LRANGE",
+"summary": "Returns a range of elements from a list.",
+"group": "List",
+"since": "1.0.0",
+"complexity": "O(S+N) where S is the distance of start offset from HEAD for small lists, from nearest end (HEAD or TAIL) for large lists; and N is the number of elements in the specified range.",
+"syntax": "LRANGE key start stop"
+},
+{
+"name": "LREM",
+"summary": "Removes elements from a list. Deletes the list if the last element was removed.",
+"group": "List",
+"since": "1.0.0",
+"complexity": "O(N+M) where N is the length of the list and M is the number of elements removed.",
+"syntax": "LREM key count element"
+},
+{
+"name": "LSET",
+"summary": "Sets the value of an element in a list by its index.",
+"group": "List",
+"since": "1.0.0",
+"complexity": "O(N) where N is the length of the list. Setting either the first or the last element of the list is O(1).",
+"syntax": "LSET key index element"
+},
+{
+"name": "LTRIM",
+"summary": "Removes elements from both ends a list. Deletes the list if all elements were trimmed.",
+"group": "List",
+"since": "1.0.0",
+"complexity": "O(N) where N is the number of elements to be removed by the operation.",
+"syntax": "LTRIM key start stop"
+},
+{
+"name": "MEMORY",
+"summary": "A container for memory diagnostics commands.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "Depends on subcommand.",
+"syntax": "MEMORY"
+},
+{
+"name": "MEMORY DOCTOR",
+"summary": "Outputs a memory problems report.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "O(1)",
+"syntax": "MEMORY DOCTOR"
+},
+{
+"name": "MEMORY HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "O(1)",
+"syntax": "MEMORY HELP"
+},
+{
+"name": "MEMORY MALLOC-STATS",
+"summary": "Returns the allocator statistics.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "Depends on how much memory is allocated, could be slow",
+"syntax": "MEMORY MALLOC-STATS"
+},
+{
+"name": "MEMORY PURGE",
+"summary": "Asks the allocator to release memory.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "Depends on how much memory is allocated, could be slow",
+"syntax": "MEMORY PURGE"
+},
+{
+"name": "MEMORY STATS",
+"summary": "Returns details about memory usage.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "O(1)",
+"syntax": "MEMORY STATS"
+},
+{
+"name": "MEMORY USAGE",
+"summary": "Estimates the memory usage of a key.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "O(N) where N is the number of samples.",
+"syntax": "MEMORY USAGE key [SAMPLES count]"
+},
+{
+"name": "MGET",
+"summary": "Atomically returns the string values of one or more keys.",
+"group": "String",
+"since": "1.0.0",
+"complexity": "O(N) where N is the number of keys to retrieve.",
+"syntax": "MGET key [key ...]"
+},
+{
+"name": "MIGRATE",
+"summary": "Atomically transfers a key from one Redis instance to another.",
+"group": "Keys",
+"since": "2.6.0",
+"complexity": "This command actually executes a DUMP+DEL in the source instance, and a RESTORE in the target instance. See the pages of these commands for time complexity. Also an O(N) data transfer between the two instances is performed.",
+"syntax": "MIGRATE host port <key | \"\"> destination-db timeout [COPY] [REPLACE] [AUTH auth | AUTH2 username password] [KEYS keys [keys ...]]"
+},
+{
+"name": "MODULE",
+"summary": "A container for module commands.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "Depends on subcommand.",
+"syntax": "MODULE"
+},
+{
+"name": "MODULE HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Server Management",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "MODULE HELP"
+},
+{
+"name": "MODULE LIST",
+"summary": "Returns all loaded modules.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "O(N) where N is the number of loaded modules.",
+"syntax": "MODULE LIST"
+},
+{
+"name": "MODULE LOAD",
+"summary": "Loads a module.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "O(1)",
+"syntax": "MODULE LOAD path [arg [arg ...]]"
+},
+{
+"name": "MODULE LOADEX",
+"summary": "Loads a module using extended parameters.",
+"group": "Server Management",
+"since": "7.0.0",
+"complexity": "O(1)",
+"syntax": "MODULE LOADEX path [CONFIG name value [CONFIG name value ...]] [ARGS args [args ...]]"
+},
+{
+"name": "MODULE UNLOAD",
+"summary": "Unloads a module.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "O(1)",
+"syntax": "MODULE UNLOAD name"
+},
+{
+"name": "MONITOR",
+"summary": "Listens for all requests received by the server in real-time.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "",
+"syntax": "MONITOR"
+},
+{
+"name": "MOVE",
+"summary": "Moves a key to another database.",
+"group": "Keys",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "MOVE key db"
+},
+{
+"name": "MSET",
+"summary": "Atomically creates or modifies the string values of one or more keys.",
+"group": "String",
+"since": "1.0.1",
+"complexity": "O(N) where N is the number of keys to set.",
+"syntax": "MSET key value [key value ...]"
+},
+{
+"name": "MSETNX",
+"summary": "Atomically modifies the string values of one or more keys only when all keys don't exist.",
+"group": "String",
+"since": "1.0.1",
+"complexity": "O(N) where N is the number of keys to set.",
+"syntax": "MSETNX key value [key value ...]"
+},
+{
+"name": "MULTI",
+"summary": "Starts a transaction.",
+"group": "Transactions",
+"since": "1.2.0",
+"complexity": "O(1)",
+"syntax": "MULTI"
+},
+{
+"name": "OBJECT",
+"summary": "A container for object introspection commands.",
+"group": "Keys",
+"since": "2.2.3",
+"complexity": "Depends on subcommand.",
+"syntax": "OBJECT"
+},
+{
+"name": "OBJECT ENCODING",
+"summary": "Returns the internal encoding of a Redis object.",
+"group": "Keys",
+"since": "2.2.3",
+"complexity": "O(1)",
+"syntax": "OBJECT ENCODING key"
+},
+{
+"name": "OBJECT FREQ",
+"summary": "Returns the logarithmic access frequency counter of a Redis object.",
+"group": "Keys",
+"since": "4.0.0",
+"complexity": "O(1)",
+"syntax": "OBJECT FREQ key"
+},
+{
+"name": "OBJECT HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Keys",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "OBJECT HELP"
+},
+{
+"name": "OBJECT IDLETIME",
+"summary": "Returns the time since the last access to a Redis object.",
+"group": "Keys",
+"since": "2.2.3",
+"complexity": "O(1)",
+"syntax": "OBJECT IDLETIME key"
+},
+{
+"name": "OBJECT REFCOUNT",
+"summary": "Returns the reference count of a value of a key.",
+"group": "Keys",
+"since": "2.2.3",
+"complexity": "O(1)",
+"syntax": "OBJECT REFCOUNT key"
+},
+{
+"name": "PERSIST",
+"summary": "Removes the expiration time of a key.",
+"group": "Keys",
+"since": "2.2.0",
+"complexity": "O(1)",
+"syntax": "PERSIST key"
+},
+{
+"name": "PEXPIRE",
+"summary": "Sets the expiration time of a key in milliseconds.",
+"group": "Keys",
+"since": "2.6.0",
+"complexity": "O(1)",
+"syntax": "PEXPIRE key milliseconds [NX | XX | GT | LT]"
+},
+{
+"name": "PEXPIREAT",
+"summary": "Sets the expiration time of a key to a Unix milliseconds timestamp.",
+"group": "Keys",
+"since": "2.6.0",
+"complexity": "O(1)",
+"syntax": "PEXPIREAT key unix-time-milliseconds [NX | XX | GT | LT]"
+},
+{
+"name": "PEXPIRETIME",
+"summary": "Returns the expiration time of a key as a Unix milliseconds timestamp.",
+"group": "Keys",
+"since": "7.0.0",
+"complexity": "O(1)",
+"syntax": "PEXPIRETIME key"
+},
+{
+"name": "PFADD",
+"summary": "Adds elements to a HyperLogLog key. Creates the key if it doesn't exist.",
+"group": "HyperLogLog",
+"since": "2.8.9",
+"complexity": "O(1) to add every element.",
+"syntax": "PFADD key [element [element ...]]"
+},
+{
+"name": "PFCOUNT",
+"summary": "Returns the approximated cardinality of the set(s) observed by the HyperLogLog key(s).",
+"group": "HyperLogLog",
+"since": "2.8.9",
+"complexity": "O(1) with a very small average constant time when called with a single key. O(N) with N being the number of keys, and much bigger constant times, when called with multiple keys.",
+"syntax": "PFCOUNT key [key ...]"
+},
+{
+"name": "PFDEBUG",
+"summary": "Internal commands for debugging HyperLogLog values.",
+"group": "HyperLogLog",
+"since": "2.8.9",
+"complexity": "N/A",
+"syntax": "PFDEBUG subcommand key"
+},
+{
+"name": "PFMERGE",
+"summary": "Merges one or more HyperLogLog values into a single key.",
+"group": "HyperLogLog",
+"since": "2.8.9",
+"complexity": "O(N) to merge N HyperLogLogs, but with high constant times.",
+"syntax": "PFMERGE destkey [sourcekey [sourcekey ...]]"
+},
+{
+"name": "PFSELFTEST",
+"summary": "An internal command for testing HyperLogLog values.",
+"group": "HyperLogLog",
+"since": "2.8.9",
+"complexity": "N/A",
+"syntax": "PFSELFTEST"
+},
+{
+"name": "PING",
+"summary": "Returns the server's liveliness response.",
+"group": "Connection Management",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "PING [message]"
+},
+{
+"name": "PSETEX",
+"summary": "Sets both string value and expiration time in milliseconds of a key. The key is created if it doesn't exist.",
+"group": "String",
+"since": "2.6.0",
+"complexity": "O(1)",
+"syntax": "PSETEX key milliseconds value",
+"deprecated_since": "2.6.12",
+"replaced_by": "`SET` with the `PX` argument"
+},
+{
+"name": "PSUBSCRIBE",
+"summary": "Listens for messages published to channels that match one or more patterns.",
+"group": "Pub/Sub",
+"since": "2.0.0",
+"complexity": "O(N) where N is the number of patterns to subscribe to.",
+"syntax": "PSUBSCRIBE pattern [pattern ...]"
+},
+{
+"name": "PSYNC",
+"summary": "An internal command used in replication.",
+"group": "Server Management",
+"since": "2.8.0",
+"complexity": "",
+"syntax": "PSYNC replicationid offset"
+},
+{
+"name": "PTTL",
+"summary": "Returns the expiration time in milliseconds of a key.",
+"group": "Keys",
+"since": "2.6.0",
+"complexity": "O(1)",
+"syntax": "PTTL key"
+},
+{
+"name": "PUBLISH",
+"summary": "Posts a message to a channel.",
+"group": "Pub/Sub",
+"since": "2.0.0",
+"complexity": "O(N+M) where N is the number of clients subscribed to the receiving channel and M is the total number of subscribed patterns (by any client).",
+"syntax": "PUBLISH channel message"
+},
+{
+"name": "PUBSUB",
+"summary": "A container for Pub/Sub commands.",
+"group": "Pub/Sub",
+"since": "2.8.0",
+"complexity": "Depends on subcommand.",
+"syntax": "PUBSUB"
+},
+{
+"name": "PUBSUB CHANNELS",
+"summary": "Returns the active channels.",
+"group": "Pub/Sub",
+"since": "2.8.0",
+"complexity": "O(N) where N is the number of active channels, and assuming constant time pattern matching (relatively short channels and patterns)",
+"syntax": "PUBSUB CHANNELS [pattern]"
+},
+{
+"name": "PUBSUB HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Pub/Sub",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "PUBSUB HELP"
+},
+{
+"name": "PUBSUB NUMPAT",
+"summary": "Returns a count of unique pattern subscriptions.",
+"group": "Pub/Sub",
+"since": "2.8.0",
+"complexity": "O(1)",
+"syntax": "PUBSUB NUMPAT"
+},
+{
+"name": "PUBSUB NUMSUB",
+"summary": "Returns a count of subscribers to channels.",
+"group": "Pub/Sub",
+"since": "2.8.0",
+"complexity": "O(N) for the NUMSUB subcommand, where N is the number of requested channels",
+"syntax": "PUBSUB NUMSUB [channel [channel ...]]"
+},
+{
+"name": "PUBSUB SHARDCHANNELS",
+"summary": "Returns the active shard channels.",
+"group": "Pub/Sub",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of active shard channels, and assuming constant time pattern matching (relatively short shard channels).",
+"syntax": "PUBSUB SHARDCHANNELS [pattern]"
+},
+{
+"name": "PUBSUB SHARDNUMSUB",
+"summary": "Returns the count of subscribers of shard channels.",
+"group": "Pub/Sub",
+"since": "7.0.0",
+"complexity": "O(N) for the SHARDNUMSUB subcommand, where N is the number of requested shard channels",
+"syntax": "PUBSUB SHARDNUMSUB [shardchannel [shardchannel ...]]"
+},
+{
+"name": "PUNSUBSCRIBE",
+"summary": "Stops listening to messages published to channels that match one or more patterns.",
+"group": "Pub/Sub",
+"since": "2.0.0",
+"complexity": "O(N) where N is the number of patterns to unsubscribe.",
+"syntax": "PUNSUBSCRIBE [pattern [pattern ...]]"
+},
+{
+"name": "QUIT",
+"summary": "Closes the connection.",
+"group": "Connection Management",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "QUIT",
+"deprecated_since": "7.2.0",
+"replaced_by": "just closing the connection"
+},
+{
+"name": "RANDOMKEY",
+"summary": "Returns a random key name from the database.",
+"group": "Keys",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "RANDOMKEY"
+},
+{
+"name": "READONLY",
+"summary": "Enables read-only queries for a connection to a Redis Cluster replica node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "READONLY"
+},
+{
+"name": "READWRITE",
+"summary": "Enables read-write queries for a connection to a Reids Cluster replica node.",
+"group": "Cluster Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "READWRITE"
+},
+{
+"name": "RENAME",
+"summary": "Renames a key and overwrites the destination.",
+"group": "Keys",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "RENAME key newkey"
+},
+{
+"name": "RENAMENX",
+"summary": "Renames a key only when the target key name doesn't exist.",
+"group": "Keys",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "RENAMENX key newkey"
+},
+{
+"name": "REPLCONF",
+"summary": "An internal command for configuring the replication stream.",
+"group": "Server Management",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "REPLCONF"
+},
+{
+"name": "REPLICAOF",
+"summary": "Configures a server as replica of another, or promotes it to a master.",
+"group": "Server Management",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "REPLICAOF <host port | NO ONE>"
+},
+{
+"name": "RESET",
+"summary": "Resets the connection.",
+"group": "Connection Management",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "RESET"
+},
+{
+"name": "RESTORE",
+"summary": "Creates a key from the serialized representation of a value.",
+"group": "Keys",
+"since": "2.6.0",
+"complexity": "O(1) to create the new key and additional O(N*M) to reconstruct the serialized value, where N is the number of Redis objects composing the value and M their average size. For small string values the time complexity is thus O(1)+O(1*M) where M is small, so simply O(1). However for sorted set values the complexity is O(N*M*log(N)) because inserting values into sorted sets is O(log(N)).",
+"syntax": "RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]"
+},
+{
+"name": "RESTORE-ASKING",
+"summary": "An internal command for migrating keys in a cluster.",
+"group": "Server Management",
+"since": "3.0.0",
+"complexity": "O(1) to create the new key and additional O(N*M) to reconstruct the serialized value, where N is the number of Redis objects composing the value and M their average size. For small string values the time complexity is thus O(1)+O(1*M) where M is small, so simply O(1). However for sorted set values the complexity is O(N*M*log(N)) because inserting values into sorted sets is O(log(N)).",
+"syntax": "RESTORE-ASKING key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]"
+},
+{
+"name": "ROLE",
+"summary": "Returns the replication role.",
+"group": "Server Management",
+"since": "2.8.12",
+"complexity": "O(1)",
+"syntax": "ROLE"
+},
+{
+"name": "RPOP",
+"summary": "Returns and removes the last elements of a list. Deletes the list if the last element was popped.",
+"group": "List",
+"since": "1.0.0",
+"complexity": "O(N) where N is the number of elements returned",
+"syntax": "RPOP key [count]"
+},
+{
+"name": "RPOPLPUSH",
+"summary": "Returns the last element of a list after removing and pushing it to another list. Deletes the list if the last element was popped.",
+"group": "List",
+"since": "1.2.0",
+"complexity": "O(1)",
+"syntax": "RPOPLPUSH source destination",
+"deprecated_since": "6.2.0",
+"replaced_by": "`LMOVE` with the `RIGHT` and `LEFT` arguments"
+},
+{
+"name": "RPUSH",
+"summary": "Appends one or more elements to a list. Creates the key if it doesn't exist.",
+"group": "List",
+"since": "1.0.0",
+"complexity": "O(1) for each element added, so O(N) to add N elements when the command is called with multiple arguments.",
+"syntax": "RPUSH key element [element ...]"
+},
+{
+"name": "RPUSHX",
+"summary": "Appends an element to a list only when the list exists.",
+"group": "List",
+"since": "2.2.0",
+"complexity": "O(1) for each element added, so O(N) to add N elements when the command is called with multiple arguments.",
+"syntax": "RPUSHX key element [element ...]"
+},
+{
+"name": "SADD",
+"summary": "Adds one or more members to a set. Creates the key if it doesn't exist.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(1) for each element added, so O(N) to add N elements when the command is called with multiple arguments.",
+"syntax": "SADD key member [member ...]"
+},
+{
+"name": "SAVE",
+"summary": "Synchronously saves the database(s) to disk.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "O(N) where N is the total number of keys in all databases",
+"syntax": "SAVE"
+},
+{
+"name": "SCAN",
+"summary": "Iterates over the key names in the database.",
+"group": "Keys",
+"since": "2.8.0",
+"complexity": "O(1) for every call. O(N) for a complete iteration, including enough command calls for the cursor to return back to 0. N is the number of elements inside the collection.",
+"syntax": "SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]"
+},
+{
+"name": "SCARD",
+"summary": "Returns the number of members in a set.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "SCARD key"
+},
+{
+"name": "SCRIPT",
+"summary": "A container for Lua scripts management commands.",
+"group": "Scripting and Functions",
+"since": "2.6.0",
+"complexity": "Depends on subcommand.",
+"syntax": "SCRIPT"
+},
+{
+"name": "SCRIPT DEBUG",
+"summary": "Sets the debug mode of server-side Lua scripts.",
+"group": "Scripting and Functions",
+"since": "3.2.0",
+"complexity": "O(1)",
+"syntax": "SCRIPT DEBUG <YES | SYNC | NO>"
+},
+{
+"name": "SCRIPT EXISTS",
+"summary": "Determines whether server-side Lua scripts exist in the script cache.",
+"group": "Scripting and Functions",
+"since": "2.6.0",
+"complexity": "O(N) with N being the number of scripts to check (so checking a single script is an O(1) operation).",
+"syntax": "SCRIPT EXISTS sha1 [sha1 ...]"
+},
+{
+"name": "SCRIPT FLUSH",
+"summary": "Removes all server-side Lua scripts from the script cache.",
+"group": "Scripting and Functions",
+"since": "2.6.0",
+"complexity": "O(N) with N being the number of scripts in cache",
+"syntax": "SCRIPT FLUSH [ASYNC | SYNC]"
+},
+{
+"name": "SCRIPT HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Scripting and Functions",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "SCRIPT HELP"
+},
+{
+"name": "SCRIPT KILL",
+"summary": "Terminates a server-side Lua script during execution.",
+"group": "Scripting and Functions",
+"since": "2.6.0",
+"complexity": "O(1)",
+"syntax": "SCRIPT KILL"
+},
+{
+"name": "SCRIPT LOAD",
+"summary": "Loads a server-side Lua script to the script cache.",
+"group": "Scripting and Functions",
+"since": "2.6.0",
+"complexity": "O(N) with N being the length in bytes of the script body.",
+"syntax": "SCRIPT LOAD script"
+},
+{
+"name": "SDIFF",
+"summary": "Returns the difference of multiple sets.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(N) where N is the total number of elements in all given sets.",
+"syntax": "SDIFF key [key ...]"
+},
+{
+"name": "SDIFFSTORE",
+"summary": "Stores the difference of multiple sets in a key.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(N) where N is the total number of elements in all given sets.",
+"syntax": "SDIFFSTORE destination key [key ...]"
+},
+{
+"name": "SELECT",
+"summary": "Changes the selected database.",
+"group": "Connection Management",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "SELECT index"
+},
+{
+"name": "SENTINEL",
+"summary": "A container for Redis Sentinel commands.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "Depends on subcommand.",
+"syntax": "SENTINEL"
+},
+{
+"name": "SENTINEL CKQUORUM",
+"summary": "Checks for a Redis Sentinel quorum.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "",
+"syntax": "SENTINEL CKQUORUM master-name"
+},
+{
+"name": "SENTINEL CONFIG",
+"summary": "Configures Redis Sentinel.",
+"group": "Sentinel",
+"since": "6.2.0",
+"complexity": "O(N) when N is the number of configuration parameters provided",
+"syntax": "SENTINEL CONFIG <SET parameter value [parameter value ...] | GET parameter [parameter ...]>"
+},
+{
+"name": "SENTINEL DEBUG",
+"summary": "Lists or updates the current configurable parameters of Redis Sentinel.",
+"group": "Sentinel",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of configurable parameters",
+"syntax": "SENTINEL DEBUG [parameter value [parameter value ...]]"
+},
+{
+"name": "SENTINEL FAILOVER",
+"summary": "Forces a Redis Sentinel failover.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "",
+"syntax": "SENTINEL FAILOVER master-name"
+},
+{
+"name": "SENTINEL FLUSHCONFIG",
+"summary": "Rewrites the Redis Sentinel configuration file.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "O(1)",
+"syntax": "SENTINEL FLUSHCONFIG"
+},
+{
+"name": "SENTINEL GET-MASTER-ADDR-BY-NAME",
+"summary": "Returns the port and address of a master Redis instance.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "O(1)",
+"syntax": "SENTINEL GET-MASTER-ADDR-BY-NAME master-name"
+},
+{
+"name": "SENTINEL HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Sentinel",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "SENTINEL HELP"
+},
+{
+"name": "SENTINEL INFO-CACHE",
+"summary": "Returns the cached `INFO` replies from the deployment's instances.",
+"group": "Sentinel",
+"since": "3.2.0",
+"complexity": "O(N) where N is the number of instances",
+"syntax": "SENTINEL INFO-CACHE nodename [nodename ...]"
+},
+{
+"name": "SENTINEL IS-MASTER-DOWN-BY-ADDR",
+"summary": "Determines whether a master Redis instance is down.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "O(1)",
+"syntax": "SENTINEL IS-MASTER-DOWN-BY-ADDR ip port current-epoch runid"
+},
+{
+"name": "SENTINEL MASTER",
+"summary": "Returns the state of a master Redis instance.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "O(1)",
+"syntax": "SENTINEL MASTER master-name"
+},
+{
+"name": "SENTINEL MASTERS",
+"summary": "Returns a list of monitored Redis masters.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "O(N) where N is the number of masters",
+"syntax": "SENTINEL MASTERS"
+},
+{
+"name": "SENTINEL MONITOR",
+"summary": "Starts monitoring.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "O(1)",
+"syntax": "SENTINEL MONITOR name ip port quorum"
+},
+{
+"name": "SENTINEL MYID",
+"summary": "Returns the Redis Sentinel instance ID.",
+"group": "Sentinel",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "SENTINEL MYID"
+},
+{
+"name": "SENTINEL PENDING-SCRIPTS",
+"summary": "Returns information about pending scripts for Redis Sentinel.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "",
+"syntax": "SENTINEL PENDING-SCRIPTS"
+},
+{
+"name": "SENTINEL REMOVE",
+"summary": "Stops monitoring.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "O(1)",
+"syntax": "SENTINEL REMOVE master-name"
+},
+{
+"name": "SENTINEL REPLICAS",
+"summary": "Returns a list of the monitored Redis replicas.",
+"group": "Sentinel",
+"since": "5.0.0",
+"complexity": "O(N) where N is the number of replicas",
+"syntax": "SENTINEL REPLICAS master-name"
+},
+{
+"name": "SENTINEL RESET",
+"summary": "Resets Redis masters by name matching a pattern.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "O(N) where N is the number of monitored masters",
+"syntax": "SENTINEL RESET pattern"
+},
+{
+"name": "SENTINEL SENTINELS",
+"summary": "Returns a list of Sentinel instances.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "O(N) where N is the number of Sentinels",
+"syntax": "SENTINEL SENTINELS master-name"
+},
+{
+"name": "SENTINEL SET",
+"summary": "Changes the configuration of a monitored Redis master.",
+"group": "Sentinel",
+"since": "2.8.4",
+"complexity": "O(1)",
+"syntax": "SENTINEL SET master-name option value [option value ...]"
+},
+{
+"name": "SENTINEL SIMULATE-FAILURE",
+"summary": "Simulates failover scenarios.",
+"group": "Sentinel",
+"since": "3.2.0",
+"complexity": "",
+"syntax": "SENTINEL SIMULATE-FAILURE [CRASH-AFTER-ELECTION | CRASH-AFTER-PROMOTION | HELP [CRASH-AFTER-ELECTION | CRASH-AFTER-PROMOTION | HELP ...]]"
+},
+{
+"name": "SENTINEL SLAVES",
+"summary": "Returns a list of the monitored replicas.",
+"group": "Sentinel",
+"since": "2.8.0",
+"complexity": "O(N) where N is the number of replicas.",
+"syntax": "SENTINEL SLAVES master-name",
+"deprecated_since": "5.0.0",
+"replaced_by": "`SENTINEL REPLICAS`"
+},
+{
+"name": "SET",
+"summary": "Sets the string value of a key, ignoring its type. The key is created if it doesn't exist.",
+"group": "String",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "SET key value [NX | XX] [GET] [EX seconds | PX milliseconds | EXAT unix-time-seconds | PXAT unix-time-milliseconds | KEEPTTL]"
+},
+{
+"name": "SETBIT",
+"summary": "Sets or clears the bit at offset of the string value. Creates the key if it doesn't exist.",
+"group": "Bitmap",
+"since": "2.2.0",
+"complexity": "O(1)",
+"syntax": "SETBIT key offset value"
+},
+{
+"name": "SETEX",
+"summary": "Sets the string value and expiration time of a key. Creates the key if it doesn't exist.",
+"group": "String",
+"since": "2.0.0",
+"complexity": "O(1)",
+"syntax": "SETEX key seconds value",
+"deprecated_since": "2.6.12",
+"replaced_by": "`SET` with the `EX` argument"
+},
+{
+"name": "SETNX",
+"summary": "Set the string value of a key only when the key doesn't exist.",
+"group": "String",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "SETNX key value",
+"deprecated_since": "2.6.12",
+"replaced_by": "`SET` with the `NX` argument"
+},
+{
+"name": "SETRANGE",
+"summary": "Overwrites a part of a string value with another by an offset. Creates the key if it doesn't exist.",
+"group": "String",
+"since": "2.2.0",
+"complexity": "O(1), not counting the time taken to copy the new string in place. Usually, this string is very small so the amortized complexity is O(1). Otherwise, complexity is O(M) with M being the length of the value argument.",
+"syntax": "SETRANGE key offset value"
+},
+{
+"name": "SHUTDOWN",
+"summary": "Synchronously saves the database(s) to disk and shuts down the Redis server.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "O(N) when saving, where N is the total number of keys in all databases when saving data, otherwise O(1)",
+"syntax": "SHUTDOWN [NOSAVE | SAVE] [NOW] [FORCE] [ABORT]"
+},
+{
+"name": "SINTER",
+"summary": "Returns the intersect of multiple sets.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(N*M) worst case where N is the cardinality of the smallest set and M is the number of sets.",
+"syntax": "SINTER key [key ...]"
+},
+{
+"name": "SINTERCARD",
+"summary": "Returns the number of members of the intersect of multiple sets.",
+"group": "Set",
+"since": "7.0.0",
+"complexity": "O(N*M) worst case where N is the cardinality of the smallest set and M is the number of sets.",
+"syntax": "SINTERCARD numkeys key [key ...] [LIMIT limit]"
+},
+{
+"name": "SINTERSTORE",
+"summary": "Stores the intersect of multiple sets in a key.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(N*M) worst case where N is the cardinality of the smallest set and M is the number of sets.",
+"syntax": "SINTERSTORE destination key [key ...]"
+},
+{
+"name": "SISMEMBER",
+"summary": "Determines whether a member belongs to a set.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "SISMEMBER key member"
+},
+{
+"name": "SLAVEOF",
+"summary": "Sets a Redis server as a replica of another, or promotes it to being a master.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "SLAVEOF <host port | NO ONE>",
+"deprecated_since": "5.0.0",
+"replaced_by": "`REPLICAOF`"
+},
+{
+"name": "SLOWLOG",
+"summary": "A container for slow log commands.",
+"group": "Server Management",
+"since": "2.2.12",
+"complexity": "Depends on subcommand.",
+"syntax": "SLOWLOG"
+},
+{
+"name": "SLOWLOG GET",
+"summary": "Returns the slow log's entries.",
+"group": "Server Management",
+"since": "2.2.12",
+"complexity": "O(N) where N is the number of entries returned",
+"syntax": "SLOWLOG GET [count]"
+},
+{
+"name": "SLOWLOG HELP",
+"summary": "Show helpful text about the different subcommands",
+"group": "Server Management",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "SLOWLOG HELP"
+},
+{
+"name": "SLOWLOG LEN",
+"summary": "Returns the number of entries in the slow log.",
+"group": "Server Management",
+"since": "2.2.12",
+"complexity": "O(1)",
+"syntax": "SLOWLOG LEN"
+},
+{
+"name": "SLOWLOG RESET",
+"summary": "Clears all entries from the slow log.",
+"group": "Server Management",
+"since": "2.2.12",
+"complexity": "O(N) where N is the number of entries in the slowlog",
+"syntax": "SLOWLOG RESET"
+},
+{
+"name": "SMEMBERS",
+"summary": "Returns all members of a set.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(N) where N is the set cardinality.",
+"syntax": "SMEMBERS key"
+},
+{
+"name": "SMISMEMBER",
+"summary": "Determines whether multiple members belong to a set.",
+"group": "Set",
+"since": "6.2.0",
+"complexity": "O(N) where N is the number of elements being checked for membership",
+"syntax": "SMISMEMBER key member [member ...]"
+},
+{
+"name": "SMOVE",
+"summary": "Moves a member from one set to another.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "SMOVE source destination member"
+},
+{
+"name": "SORT",
+"summary": "Sorts the elements in a list, a set, or a sorted set, optionally storing the result.",
+"group": "Keys",
+"since": "1.0.0",
+"complexity": "O(N+M*log(M)) where N is the number of elements in the list or set to sort, and M the number of returned elements. When the elements are not sorted, complexity is O(N).",
+"syntax": "SORT key [BY by-pattern] [LIMIT offset count] [GET get-pattern [GET get-pattern ...]] [ASC | DESC] [ALPHA] [STORE destination]"
+},
+{
+"name": "SORT_RO",
+"summary": "Returns the sorted elements of a list, a set, or a sorted set.",
+"group": "Keys",
+"since": "7.0.0",
+"complexity": "O(N+M*log(M)) where N is the number of elements in the list or set to sort, and M the number of returned elements. When the elements are not sorted, complexity is O(N).",
+"syntax": "SORT_RO key [BY by-pattern] [LIMIT offset count] [GET get-pattern [GET get-pattern ...]] [ASC | DESC] [ALPHA]"
+},
+{
+"name": "SPOP",
+"summary": "Returns one or more random members from a set after removing them. Deletes the set if the last member was popped.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "Without the count argument O(1), otherwise O(N) where N is the value of the passed count.",
+"syntax": "SPOP key [count]"
+},
+{
+"name": "SPUBLISH",
+"summary": "Post a message to a shard channel",
+"group": "Pub/Sub",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of clients subscribed to the receiving shard channel.",
+"syntax": "SPUBLISH shardchannel message"
+},
+{
+"name": "SRANDMEMBER",
+"summary": "Get one or multiple random members from a set",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "Without the count argument O(1), otherwise O(N) where N is the absolute value of the passed count.",
+"syntax": "SRANDMEMBER key [count]"
+},
+{
+"name": "SREM",
+"summary": "Removes one or more members from a set. Deletes the set if the last member was removed.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(N) where N is the number of members to be removed.",
+"syntax": "SREM key member [member ...]"
+},
+{
+"name": "SSCAN",
+"summary": "Iterates over members of a set.",
+"group": "Set",
+"since": "2.8.0",
+"complexity": "O(1) for every call. O(N) for a complete iteration, including enough command calls for the cursor to return back to 0. N is the number of elements inside the collection.",
+"syntax": "SSCAN key cursor [MATCH pattern] [COUNT count]"
+},
+{
+"name": "SSUBSCRIBE",
+"summary": "Listens for messages published to shard channels.",
+"group": "Pub/Sub",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of shard channels to subscribe to.",
+"syntax": "SSUBSCRIBE shardchannel [shardchannel ...]"
+},
+{
+"name": "STRLEN",
+"summary": "Returns the length of a string value.",
+"group": "String",
+"since": "2.2.0",
+"complexity": "O(1)",
+"syntax": "STRLEN key"
+},
+{
+"name": "SUBSCRIBE",
+"summary": "Listens for messages published to channels.",
+"group": "Pub/Sub",
+"since": "2.0.0",
+"complexity": "O(N) where N is the number of channels to subscribe to.",
+"syntax": "SUBSCRIBE channel [channel ...]"
+},
+{
+"name": "SUBSTR",
+"summary": "Returns a substring from a string value.",
+"group": "String",
+"since": "1.0.0",
+"complexity": "O(N) where N is the length of the returned string. The complexity is ultimately determined by the returned length, but because creating a substring from an existing string is very cheap, it can be considered O(1) for small strings.",
+"syntax": "SUBSTR key start end",
+"deprecated_since": "2.0.0",
+"replaced_by": "`GETRANGE`"
+},
+{
+"name": "SUNION",
+"summary": "Returns the union of multiple sets.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(N) where N is the total number of elements in all given sets.",
+"syntax": "SUNION key [key ...]"
+},
+{
+"name": "SUNIONSTORE",
+"summary": "Stores the union of multiple sets in a key.",
+"group": "Set",
+"since": "1.0.0",
+"complexity": "O(N) where N is the total number of elements in all given sets.",
+"syntax": "SUNIONSTORE destination key [key ...]"
+},
+{
+"name": "SUNSUBSCRIBE",
+"summary": "Stops listening to messages posted to shard channels.",
+"group": "Pub/Sub",
+"since": "7.0.0",
+"complexity": "O(N) where N is the number of shard channels to unsubscribe.",
+"syntax": "SUNSUBSCRIBE [shardchannel [shardchannel ...]]"
+},
+{
+"name": "SWAPDB",
+"summary": "Swaps two Redis databases.",
+"group": "Server Management",
+"since": "4.0.0",
+"complexity": "O(N) where N is the count of clients watching or blocking on keys from both databases.",
+"syntax": "SWAPDB index1 index2"
+},
+{
+"name": "SYNC",
+"summary": "An internal command used in replication.",
+"group": "Server Management",
+"since": "1.0.0",
+"complexity": "",
+"syntax": "SYNC"
+},
+{
+"name": "TIME",
+"summary": "Returns the server time.",
+"group": "Server Management",
+"since": "2.6.0",
+"complexity": "O(1)",
+"syntax": "TIME"
+},
+{
+"name": "TOUCH",
+"summary": "Returns the number of existing keys out of those specified after updating the time they were last accessed.",
+"group": "Keys",
+"since": "3.2.1",
+"complexity": "O(N) where N is the number of keys that will be touched.",
+"syntax": "TOUCH key [key ...]"
+},
+{
+"name": "TTL",
+"summary": "Returns the expiration time in seconds of a key.",
+"group": "Keys",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "TTL key"
+},
+{
+"name": "TYPE",
+"summary": "Determines the type of value stored at a key.",
+"group": "Keys",
+"since": "1.0.0",
+"complexity": "O(1)",
+"syntax": "TYPE key"
+},
+{
+"name": "UNLINK",
+"summary": "Asynchronously deletes one or more keys.",
+"group": "Keys",
+"since": "4.0.0",
+"complexity": "O(1) for each key removed regardless of its size. Then the command does O(N) work in a different thread in order to reclaim memory, where N is the number of allocations the deleted objects where composed of.",
+"syntax": "UNLINK key [key ...]"
+},
+{
+"name": "UNSUBSCRIBE",
+"summary": "Stops listening to messages posted to channels.",
+"group": "Pub/Sub",
+"since": "2.0.0",
+"complexity": "O(N) where N is the number of channels to unsubscribe.",
+"syntax": "UNSUBSCRIBE [channel [channel ...]]"
+},
+{
+"name": "UNWATCH",
+"summary": "Forgets about watched keys of a transaction.",
+"group": "Transactions",
+"since": "2.2.0",
+"complexity": "O(1)",
+"syntax": "UNWATCH"
+},
+{
+"name": "WAIT",
+"summary": "Blocks until the asynchronous replication of all preceding write commands sent by the connection is completed.",
+"group": "Keys",
+"since": "3.0.0",
+"complexity": "O(1)",
+"syntax": "WAIT numreplicas timeout"
+},
+{
+"name": "WAITAOF",
+"summary": "Blocks until all of the preceding write commands sent by the connection are written to the append-only file of the master and/or replicas.",
+"group": "Keys",
+"since": "7.2.0",
+"complexity": "O(1)",
+"syntax": "WAITAOF numlocal numreplicas timeout"
+},
+{
+"name": "WATCH",
+"summary": "Monitors changes to keys to determine the execution of a transaction.",
+"group": "Transactions",
+"since": "2.2.0",
+"complexity": "O(1) for every key.",
+"syntax": "WATCH key [key ...]"
+},
+{
+"name": "XACK",
+"summary": "Returns the number of messages that were successfully acknowledged by the consumer group member of a stream.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1) for each message ID processed.",
+"syntax": "XACK key group ID [ID ...]"
+},
+{
+"name": "XADD",
+"summary": "Appends a new message to a stream. Creates the key if it doesn't exist.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1) when adding a new entry, O(N) when trimming where N being the number of entries evicted.",
+"syntax": "XADD key [NOMKSTREAM] [<MAXLEN | MINID> [= | ~] threshold [LIMIT count]] <* | id> field value [field value ...]"
+},
+{
+"name": "XAUTOCLAIM",
+"summary": "Changes, or acquires, ownership of messages in a consumer group, as if the messages were delivered to as consumer group member.",
+"group": "Stream",
+"since": "6.2.0",
+"complexity": "O(1) if COUNT is small.",
+"syntax": "XAUTOCLAIM key group consumer min-idle-time start [COUNT count] [JUSTID]"
+},
+{
+"name": "XCLAIM",
+"summary": "Changes, or acquires, ownership of a message in a consumer group, as if the message was delivered a consumer group member.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(log N) with N being the number of messages in the PEL of the consumer group.",
+"syntax": "XCLAIM key group consumer min-idle-time ID [ID ...] [IDLE ms] [TIME unix-time-milliseconds] [RETRYCOUNT count] [FORCE] [JUSTID] [LASTID lastid]"
+},
+{
+"name": "XDEL",
+"summary": "Returns the number of messages after removing them from a stream.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1) for each single item to delete in the stream, regardless of the stream size.",
+"syntax": "XDEL key ID [ID ...]"
+},
+{
+"name": "XGROUP",
+"summary": "A container for consumer groups commands.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "Depends on subcommand.",
+"syntax": "XGROUP"
+},
+{
+"name": "XGROUP CREATE",
+"summary": "Creates a consumer group.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "XGROUP CREATE key group <id | $> [MKSTREAM] [ENTRIESREAD entries-read]"
+},
+{
+"name": "XGROUP CREATECONSUMER",
+"summary": "Creates a consumer in a consumer group.",
+"group": "Stream",
+"since": "6.2.0",
+"complexity": "O(1)",
+"syntax": "XGROUP CREATECONSUMER key group consumer"
+},
+{
+"name": "XGROUP DELCONSUMER",
+"summary": "Deletes a consumer from a consumer group.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "XGROUP DELCONSUMER key group consumer"
+},
+{
+"name": "XGROUP DESTROY",
+"summary": "Destroys a consumer group.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(N) where N is the number of entries in the group's pending entries list (PEL).",
+"syntax": "XGROUP DESTROY key group"
+},
+{
+"name": "XGROUP HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "XGROUP HELP"
+},
+{
+"name": "XGROUP SETID",
+"summary": "Sets the last-delivered ID of a consumer group.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "XGROUP SETID key group <id | $> [ENTRIESREAD entriesread]"
+},
+{
+"name": "XINFO",
+"summary": "A container for stream introspection commands.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "Depends on subcommand.",
+"syntax": "XINFO"
+},
+{
+"name": "XINFO CONSUMERS",
+"summary": "Returns a list of the consumers in a consumer group.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "XINFO CONSUMERS key group"
+},
+{
+"name": "XINFO GROUPS",
+"summary": "Returns a list of the consumer groups of a stream.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "XINFO GROUPS key"
+},
+{
+"name": "XINFO HELP",
+"summary": "Returns helpful text about the different subcommands.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "XINFO HELP"
+},
+{
+"name": "XINFO STREAM",
+"summary": "Returns information about a stream.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "XINFO STREAM key [FULL [COUNT count]]"
+},
+{
+"name": "XLEN",
+"summary": "Return the number of messages in a stream.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "XLEN key"
+},
+{
+"name": "XPENDING",
+"summary": "Returns the information and entries from a stream consumer group's pending entries list.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(N) with N being the number of elements returned, so asking for a small fixed number of entries per call is O(1). O(M), where M is the total number of entries scanned when used with the IDLE filter. When the command returns just the summary and the list of consumers is small, it runs in O(1) time; otherwise, an additional O(N) time for iterating every consumer.",
+"syntax": "XPENDING key group [[IDLE min-idle-time] start end count [consumer]]"
+},
+{
+"name": "XRANGE",
+"summary": "Returns the messages from a stream within a range of IDs.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(N) with N being the number of elements being returned. If N is constant (e.g. always asking for the first 10 elements with COUNT), you can consider it O(1).",
+"syntax": "XRANGE key start end [COUNT count]"
+},
+{
+"name": "XREAD",
+"summary": "Returns messages from multiple streams with IDs greater than the ones requested. Blocks until a message is available otherwise.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "",
+"syntax": "XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] ID [ID ...]"
+},
+{
+"name": "XREADGROUP",
+"summary": "Returns new or historical messages from a stream for a consumer in a group. Blocks until a message is available otherwise.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "For each stream mentioned: O(M) with M being the number of elements returned. If M is constant (e.g. always asking for the first 10 elements with COUNT), you can consider it O(1). On the other side when XREADGROUP blocks, XADD will pay the O(N) time in order to serve the N clients blocked on the stream getting new data.",
+"syntax": "XREADGROUP GROUP group consumer [COUNT count] [BLOCK milliseconds] [NOACK] STREAMS key [key ...] ID [ID ...]"
+},
+{
+"name": "XREVRANGE",
+"summary": "Returns the messages from a stream within a range of IDs in reverse order.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(N) with N being the number of elements returned. If N is constant (e.g. always asking for the first 10 elements with COUNT), you can consider it O(1).",
+"syntax": "XREVRANGE key end start [COUNT count]"
+},
+{
+"name": "XSETID",
+"summary": "An internal command for replicating stream values.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(1)",
+"syntax": "XSETID key last-id [ENTRIESADDED entries-added] [MAXDELETEDID max-deleted-id]"
+},
+{
+"name": "XTRIM",
+"summary": "Deletes messages from the beginning of a stream.",
+"group": "Stream",
+"since": "5.0.0",
+"complexity": "O(N), with N being the number of evicted entries. Constant times are very small however, since entries are organized in macro nodes containing multiple entries that can be released with a single deallocation.",
+"syntax": "XTRIM key <MAXLEN | MINID> [= | ~] threshold [LIMIT count]"
+},
+{
+"name": "ZADD",
+"summary": "Adds one or more members to a sorted set, or updates their scores. Creates the key if it doesn't exist.",
+"group": "Sorted Set",
+"since": "1.2.0",
+"complexity": "O(log(N)) for each item added, where N is the number of elements in the sorted set.",
+"syntax": "ZADD key [NX | XX] [GT | LT] [CH] [INCR] score member [score member ...]"
+},
+{
+"name": "ZCARD",
+"summary": "Returns the number of members in a sorted set.",
+"group": "Sorted Set",
+"since": "1.2.0",
+"complexity": "O(1)",
+"syntax": "ZCARD key"
+},
+{
+"name": "ZCOUNT",
+"summary": "Returns the count of members in a sorted set that have scores within a range.",
+"group": "Sorted Set",
+"since": "2.0.0",
+"complexity": "O(log(N)) with N being the number of elements in the sorted set.",
+"syntax": "ZCOUNT key min max"
+},
+{
+"name": "ZDIFF",
+"summary": "Returns the difference between multiple sorted sets.",
+"group": "Sorted Set",
+"since": "6.2.0",
+"complexity": "O(L + (N-K)log(N)) worst case where L is the total number of elements in all the sets, N is the size of the first set, and K is the size of the result set.",
+"syntax": "ZDIFF numkeys key [key ...] [WITHSCORES]"
+},
+{
+"name": "ZDIFFSTORE",
+"summary": "Stores the difference of multiple sorted sets in a key.",
+"group": "Sorted Set",
+"since": "6.2.0",
+"complexity": "O(L + (N-K)log(N)) worst case where L is the total number of elements in all the sets, N is the size of the first set, and K is the size of the result set.",
+"syntax": "ZDIFFSTORE destination numkeys key [key ...]"
+},
+{
+"name": "ZINCRBY",
+"summary": "Increments the score of a member in a sorted set.",
+"group": "Sorted Set",
+"since": "1.2.0",
+"complexity": "O(log(N)) where N is the number of elements in the sorted set.",
+"syntax": "ZINCRBY key increment member"
+},
+{
+"name": "ZINTER",
+"summary": "Returns the intersect of multiple sorted sets.",
+"group": "Sorted Set",
+"since": "6.2.0",
+"complexity": "O(N*K)+O(M*log(M)) worst case with N being the smallest input sorted set, K being the number of input sorted sets and M being the number of elements in the resulting sorted set.",
+"syntax": "ZINTER numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE <SUM | MIN | MAX>] [WITHSCORES]"
+},
+{
+"name": "ZINTERCARD",
+"summary": "Returns the number of members of the intersect of multiple sorted sets.",
+"group": "Sorted Set",
+"since": "7.0.0",
+"complexity": "O(N*K) worst case with N being the smallest input sorted set, K being the number of input sorted sets.",
+"syntax": "ZINTERCARD numkeys key [key ...] [LIMIT limit]"
+},
+{
+"name": "ZINTERSTORE",
+"summary": "Stores the intersect of multiple sorted sets in a key.",
+"group": "Sorted Set",
+"since": "2.0.0",
+"complexity": "O(N*K)+O(M*log(M)) worst case with N being the smallest input sorted set, K being the number of input sorted sets and M being the number of elements in the resulting sorted set.",
+"syntax": "ZINTERSTORE destination numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE <SUM | MIN | MAX>]"
+},
+{
+"name": "ZLEXCOUNT",
+"summary": "Returns the number of members in a sorted set within a lexicographical range.",
+"group": "Sorted Set",
+"since": "2.8.9",
+"complexity": "O(log(N)) with N being the number of elements in the sorted set.",
+"syntax": "ZLEXCOUNT key min max"
+},
+{
+"name": "ZMPOP",
+"summary": "Returns the highest- or lowest-scoring members from one or more sorted sets after removing them. Deletes the sorted set if the last member was popped.",
+"group": "Sorted Set",
+"since": "7.0.0",
+"complexity": "O(K) + O(M*log(N)) where K is the number of provided keys, N being the number of elements in the sorted set, and M being the number of elements popped.",
+"syntax": "ZMPOP numkeys key [key ...] <MIN | MAX> [COUNT count]"
+},
+{
+"name": "ZMSCORE",
+"summary": "Returns the score of one or more members in a sorted set.",
+"group": "Sorted Set",
+"since": "6.2.0",
+"complexity": "O(N) where N is the number of members being requested.",
+"syntax": "ZMSCORE key member [member ...]"
+},
+{
+"name": "ZPOPMAX",
+"summary": "Returns the highest-scoring members from a sorted set after removing them. Deletes the sorted set if the last member was popped.",
+"group": "Sorted Set",
+"since": "5.0.0",
+"complexity": "O(log(N)*M) with N being the number of elements in the sorted set, and M being the number of elements popped.",
+"syntax": "ZPOPMAX key [count]"
+},
+{
+"name": "ZPOPMIN",
+"summary": "Returns the lowest-scoring members from a sorted set after removing them. Deletes the sorted set if the last member was popped.",
+"group": "Sorted Set",
+"since": "5.0.0",
+"complexity": "O(log(N)*M) with N being the number of elements in the sorted set, and M being the number of elements popped.",
+"syntax": "ZPOPMIN key [count]"
+},
+{
+"name": "ZRANDMEMBER",
+"summary": "Returns one or more random members from a sorted set.",
+"group": "Sorted Set",
+"since": "6.2.0",
+"complexity": "O(N) where N is the number of members returned",
+"syntax": "ZRANDMEMBER key [count [WITHSCORES]]"
+},
+{
+"name": "ZRANGE",
+"summary": "Returns members in a sorted set within a range of indexes.",
+"group": "Sorted Set",
+"since": "1.2.0",
+"complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements returned.",
+"syntax": "ZRANGE key start stop [BYSCORE | BYLEX] [REV] [LIMIT offset count] [WITHSCORES]"
+},
+{
+"name": "ZRANGEBYLEX",
+"summary": "Returns members in a sorted set within a lexicographical range.",
+"group": "Sorted Set",
+"since": "2.8.9",
+"complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements being returned. If M is constant (e.g. always asking for the first 10 elements with LIMIT), you can consider it O(log(N)).",
+"syntax": "ZRANGEBYLEX key min max [LIMIT offset count]",
+"deprecated_since": "6.2.0",
+"replaced_by": "`ZRANGE` with the `BYLEX` argument"
+},
+{
+"name": "ZRANGEBYSCORE",
+"summary": "Returns members in a sorted set within a range of scores.",
+"group": "Sorted Set",
+"since": "1.0.5",
+"complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements being returned. If M is constant (e.g. always asking for the first 10 elements with LIMIT), you can consider it O(log(N)).",
+"syntax": "ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]",
+"deprecated_since": "6.2.0",
+"replaced_by": "`ZRANGE` with the `BYSCORE` argument"
+},
+{
+"name": "ZRANGESTORE",
+"summary": "Stores a range of members from sorted set in a key.",
+"group": "Sorted Set",
+"since": "6.2.0",
+"complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements stored into the destination key.",
+"syntax": "ZRANGESTORE dst src min max [BYSCORE | BYLEX] [REV] [LIMIT offset count]"
+},
+{
+"name": "ZRANK",
+"summary": "Returns the index of a member in a sorted set ordered by ascending scores.",
+"group": "Sorted Set",
+"since": "2.0.0",
+"complexity": "O(log(N))",
+"syntax": "ZRANK key member [WITHSCORE]"
+},
+{
+"name": "ZREM",
+"summary": "Removes one or more members from a sorted set. Deletes the sorted set if all members were removed.",
+"group": "Sorted Set",
+"since": "1.2.0",
+"complexity": "O(M*log(N)) with N being the number of elements in the sorted set and M the number of elements to be removed.",
+"syntax": "ZREM key member [member ...]"
+},
+{
+"name": "ZREMRANGEBYLEX",
+"summary": "Removes members in a sorted set within a lexicographical range. Deletes the sorted set if all members were removed.",
+"group": "Sorted Set",
+"since": "2.8.9",
+"complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements removed by the operation.",
+"syntax": "ZREMRANGEBYLEX key min max"
+},
+{
+"name": "ZREMRANGEBYRANK",
+"summary": "Removes members in a sorted set within a range of indexes. Deletes the sorted set if all members were removed.",
+"group": "Sorted Set",
+"since": "2.0.0",
+"complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements removed by the operation.",
+"syntax": "ZREMRANGEBYRANK key start stop"
+},
+{
+"name": "ZREMRANGEBYSCORE",
+"summary": "Removes members in a sorted set within a range of scores. Deletes the sorted set if all members were removed.",
+"group": "Sorted Set",
+"since": "1.2.0",
+"complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements removed by the operation.",
+"syntax": "ZREMRANGEBYSCORE key min max"
+},
+{
+"name": "ZREVRANGE",
+"summary": "Returns members in a sorted set within a range of indexes in reverse order.",
+"group": "Sorted Set",
+"since": "1.2.0",
+"complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements returned.",
+"syntax": "ZREVRANGE key start stop [WITHSCORES]",
+"deprecated_since": "6.2.0",
+"replaced_by": "`ZRANGE` with the `REV` argument"
+},
+{
+"name": "ZREVRANGEBYLEX",
+"summary": "Returns members in a sorted set within a lexicographical range in reverse order.",
+"group": "Sorted Set",
+"since": "2.8.9",
+"complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements being returned. If M is constant (e.g. always asking for the first 10 elements with LIMIT), you can consider it O(log(N)).",
+"syntax": "ZREVRANGEBYLEX key max min [LIMIT offset count]",
+"deprecated_since": "6.2.0",
+"replaced_by": "`ZRANGE` with the `REV` and `BYLEX` arguments"
+},
+{
+"name": "ZREVRANGEBYSCORE",
+"summary": "Returns members in a sorted set within a range of scores in reverse order.",
+"group": "Sorted Set",
+"since": "2.2.0",
+"complexity": "O(log(N)+M) with N being the number of elements in the sorted set and M the number of elements being returned. If M is constant (e.g. always asking for the first 10 elements with LIMIT), you can consider it O(log(N)).",
+"syntax": "ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]",
+"deprecated_since": "6.2.0",
+"replaced_by": "`ZRANGE` with the `REV` and `BYSCORE` arguments"
+},
+{
+"name": "ZREVRANK",
+"summary": "Returns the index of a member in a sorted set ordered by descending scores.",
+"group": "Sorted Set",
+"since": "2.0.0",
+"complexity": "O(log(N))",
+"syntax": "ZREVRANK key member [WITHSCORE]"
+},
+{
+"name": "ZSCAN",
+"summary": "Iterates over members and scores of a sorted set.",
+"group": "Sorted Set",
+"since": "2.8.0",
+"complexity": "O(1) for every call. O(N) for a complete iteration, including enough command calls for the cursor to return back to 0. N is the number of elements inside the collection.",
+"syntax": "ZSCAN key cursor [MATCH pattern] [COUNT count]"
+},
+{
+"name": "ZSCORE",
+"summary": "Returns the score of a member in a sorted set.",
+"group": "Sorted Set",
+"since": "1.2.0",
+"complexity": "O(1)",
+"syntax": "ZSCORE key member"
+},
+{
+"name": "ZUNION",
+"summary": "Returns the union of multiple sorted sets.",
+"group": "Sorted Set",
+"since": "6.2.0",
+"complexity": "O(N)+O(M*log(M)) with N being the sum of the sizes of the input sorted sets, and M being the number of elements in the resulting sorted set.",
+"syntax": "ZUNION numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE <SUM | MIN | MAX>] [WITHSCORES]"
+},
+{
+"name": "ZUNIONSTORE",
+"summary": "Stores the union of multiple sorted sets in a key.",
+"group": "Sorted Set",
+"since": "2.0.0",
+"complexity": "O(N)+O(M log(M)) with N being the sum of the sizes of the input sorted sets, and M being the number of elements in the resulting sorted set.",
+"syntax": "ZUNIONSTORE destination numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE <SUM | MIN | MAX>]"
+}
+]

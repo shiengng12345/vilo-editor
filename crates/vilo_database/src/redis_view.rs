@@ -18,6 +18,7 @@ use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, pre
 use vilo_database_core::redis::{
     Bytes, ClusterNode, KeyInfo, ScanNode, StreamEntry, format_reply, quote_bytes, split_command,
 };
+use vilo_database_core::redis_docs::{self, CommandDoc};
 
 use crate::{Connection, DatabaseView, Fetch, fetched, render_lines, run};
 use util::ResultExt as _;
@@ -197,6 +198,11 @@ pub(crate) struct RedisState {
     detail_search: Option<(Bytes, Option<Bytes>, Option<String>)>,
     format: Format,
     cli_open: bool,
+    helper_open: bool,
+    helper_group: Option<&'static str>,
+    /// The command picked from the helper's list; with none, the helper follows what is typed.
+    helper_selected: Option<&'static CommandDoc>,
+    helper_scroll: UniformListScrollHandle,
     workbench: Vec<(String, Result<Vec<String>, String>)>,
     info: Option<Fetch<String>>,
     topology: Option<Fetch<Topology>>,
@@ -231,6 +237,10 @@ impl RedisState {
         self.switching.is_some()
     }
 
+    pub(crate) fn clear_helper_pick(&mut self) {
+        self.helper_selected = None;
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             tab: RedisTab::Browse,
@@ -257,6 +267,10 @@ impl RedisState {
             detail_search: None,
             format: Format::Unicode,
             cli_open: false,
+            helper_open: false,
+            helper_group: None,
+            helper_selected: None,
+            helper_scroll: UniformListScrollHandle::new(),
             workbench: Vec::new(),
             info: None,
             topology: None,
@@ -2418,6 +2432,234 @@ impl DatabaseView {
             .into_any_element()
     }
 
+    /// Offline command documentation, as RedisInsight's Command Helper: search by name or
+    /// summary, filter by group, and with nothing searched it shows the command being typed.
+    fn render_command_helper(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let view = cx.entity().downgrade();
+        let query = self.helper_search.read(cx).text(cx);
+        let browsing = query.trim().is_empty() && state.helper_group.is_none();
+        let shown = state.helper_selected.or_else(|| {
+            browsing
+                .then(|| redis_docs::command_for_line(&self.workbench_input.read(cx).text(cx)))
+                .flatten()
+        });
+        let group_menu = PopoverMenu::new("database-redis-helper-group")
+            .trigger(
+                Button::new(
+                    "database-redis-helper-group-button",
+                    state.helper_group.unwrap_or("All groups"),
+                )
+                .label_size(LabelSize::Small)
+                .style(ButtonStyle::Subtle)
+                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+            )
+            .menu({
+                let view = view.clone();
+                move |window, cx| {
+                    let view = view.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for group in std::iter::once(None)
+                            .chain(redis_docs::command_groups().into_iter().map(Some))
+                        {
+                            let view = view.clone();
+                            menu = menu.entry(group.unwrap_or("All groups"), None, move |_, cx| {
+                                view.update(cx, |this, cx| {
+                                    if let Some(state) = this.redis_state() {
+                                        state.helper_group = group;
+                                        state.helper_selected = None;
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
+                            });
+                        }
+                        menu
+                    }))
+                }
+            });
+        let body = match (redis_docs::command_docs(), shown) {
+            (Err(problem), _) => Label::new(problem)
+                .size(LabelSize::Small)
+                .color(Color::Error)
+                .into_any_element(),
+            (Ok(_), Some(doc)) => {
+                Self::render_command_doc(doc, state.helper_selected.is_some(), view, cx)
+            }
+            (Ok(_), None) if browsing => Label::new(
+                "Search for a command, pick a group, or type a command in the CLI to see its documentation.",
+            )
+            .size(LabelSize::Small)
+            .color(Color::Muted)
+            .into_any_element(),
+            (Ok(_), None) => {
+                let found = redis_docs::search_commands(&query, state.helper_group);
+                if found.is_empty() {
+                    Label::new("No command matches.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .into_any_element()
+                } else {
+                    uniform_list("database-redis-helper-list", found.len(), move |range, _, cx| {
+                        range
+                            .filter_map(|index| found.get(index).map(|doc| (index, *doc)))
+                            .map(|(index, doc)| {
+                                let view = view.clone();
+                                h_flex()
+                                    .id(("database-redis-helper-row", index))
+                                    .w_full()
+                                    .h(px(ROW_HEIGHT))
+                                    .px_2()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(colors.element_hover))
+                                    .on_click(move |_, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            if let Some(state) = this.redis_state() {
+                                                state.helper_selected = Some(doc);
+                                            }
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    })
+                                    .child(
+                                        Label::new(doc.name.clone())
+                                            .size(LabelSize::Small)
+                                            .buffer_font(cx)
+                                            .color(Color::Accent),
+                                    )
+                                    .child(
+                                        div().flex_1().min_w_0().child(
+                                            Label::new(doc.summary.clone())
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .single_line()
+                                                .truncate(),
+                                        ),
+                                    )
+                            })
+                            .collect()
+                    })
+                    .track_scroll(&state.helper_scroll)
+                    .flex_1()
+                    .into_any_element()
+                }
+            }
+        };
+        v_flex()
+            .size_full()
+            .p_2()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(crate::boxed(self.helper_search.clone(), cx)),
+                    )
+                    .child(group_menu),
+            )
+            .child(v_flex().flex_1().min_h_0().child(body))
+            .into_any_element()
+    }
+
+    fn render_command_doc(
+        doc: &'static CommandDoc,
+        picked: bool,
+        view: gpui::WeakEntity<Self>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let words = doc
+            .name
+            .split_whitespace()
+            .map(|word| Bytes::from(word.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let runs = vilo_database_core::redis::classify_words(&words)
+            == vilo_database_core::redis::CommandKind::Read;
+        let link = format!(
+            "https://redis.io/docs/latest/commands/{}/",
+            doc.name.to_lowercase().replace(' ', "-")
+        );
+        let facts = [
+            ("Group", doc.group.as_str()),
+            ("Since", doc.since.as_str()),
+            ("Complexity", doc.complexity.as_str()),
+        ];
+        v_flex()
+            .id("database-redis-helper-doc")
+            .size_full()
+            .gap_2()
+            .overflow_y_scroll()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .when(picked, |this| {
+                        this.child(
+                            IconButton::new("database-redis-helper-back", IconName::ArrowLeft)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Back to the list"))
+                                .on_click(move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        if let Some(state) = this.redis_state() {
+                                            state.helper_selected = None;
+                                        }
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                }),
+                        )
+                    })
+                    .child(Label::new(doc.name.clone()).buffer_font(cx).color(Color::Accent))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("database-redis-helper-link", "Read more")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Subtle)
+                            .end_icon(Icon::new(IconName::ArrowUpRight).size(IconSize::XSmall))
+                            .on_click(move |_, _, cx| cx.open_url(&link)),
+                    ),
+            )
+            .child(Label::new(doc.syntax.clone()).size(LabelSize::Small).buffer_font(cx))
+            .child(Label::new(doc.summary.clone()).size(LabelSize::Small))
+            .when_some(doc.deprecated_since.as_ref(), |this, since| {
+                let replaced = doc
+                    .replaced_by
+                    .as_deref()
+                    .filter(|replaced| !replaced.is_empty())
+                    .map(|replaced| format!("; use {replaced} instead"))
+                    .unwrap_or_default();
+                this.child(
+                    Label::new(format!("Deprecated since {since}{replaced}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+            })
+            .children(facts.into_iter().filter(|(_, value)| !value.is_empty()).map(
+                |(name, value)| {
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Label::new(name)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(value.to_string()).size(LabelSize::Small))
+                },
+            ))
+            // The docs cover every command; this says whether Vilo itself would send it.
+            .child(
+                Label::new(if runs {
+                    "Vilo's CLI and Workbench run this read command."
+                } else {
+                    "Documentation only: Vilo's CLI and Workbench refuse this command (it writes or is risky)."
+                })
+                .size(LabelSize::Small)
+                .color(if runs { Color::Success } else { Color::Muted }),
+            )
+            .into_any_element()
+    }
+
     /// Value search and copying for the open key.
     fn render_value_tools(&self, detail: &Detail, cx: &mut Context<Self>) -> AnyElement {
         let searchable = matches!(detail.info.kind.as_str(), "hash" | "set" | "zset" | "list");
@@ -3174,23 +3416,43 @@ impl DatabaseView {
                 )
             })
             .child(div().flex_1().min_h_0().child(body))
-            .when(state.cli_open, |this| {
+            .when(state.cli_open || state.helper_open, |this| {
                 this.child(
-                    v_flex()
+                    h_flex()
                         .h(px(220.))
-                        .p_2()
-                        .gap_2()
                         .border_t_1()
                         .border_color(colors.border)
-                        .child(if cli_lines.is_empty() {
-                            Label::new("Read-only CLI. Try INFO server or HGETALL user:1.")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .into_any_element()
-                        } else {
-                            render_lines("database-redis-cli", cli_lines, &state.cli_scroll, cx)
+                        .when(state.cli_open, |this| {
+                            this.child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .p_2()
+                                    .gap_2()
+                                    .child(if cli_lines.is_empty() {
+                                        Label::new("Read-only CLI. Try INFO server or HGETALL user:1.")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .into_any_element()
+                                    } else {
+                                        render_lines("database-redis-cli", cli_lines, &state.cli_scroll, cx)
+                                    })
+                                    .child(self.render_command_input(cx)),
+                            )
                         })
-                        .child(self.render_command_input(cx)),
+                        .when(state.helper_open, |this| {
+                            this.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .when(state.cli_open, |this| {
+                                        this.border_l_1().border_color(colors.border)
+                                    })
+                                    .child(self.render_command_helper(state, cx)),
+                            )
+                        }),
                 )
             })
             .child(
@@ -3220,7 +3482,17 @@ impl DatabaseView {
                         Button::new("database-redis-helper", "Command Helper")
                             .label_size(LabelSize::Small)
                             .start_icon(Icon::new(IconName::FileCode).size(IconSize::XSmall))
-                            .disabled(true),
+                            .style(if state.helper_open {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.redis_state() {
+                                    state.helper_open = !state.helper_open;
+                                }
+                                cx.notify();
+                            })),
                     )
                     .child(
                         Button::new("database-redis-profiler", "Profiler")

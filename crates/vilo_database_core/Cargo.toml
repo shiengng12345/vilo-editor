@@ -18,6 +18,7 @@ base64.workspace = true
 futures.workspace = true
 mongodb = "3.3"
 fred = { version = "10.1", default-features = false, features = ["i-std", "i-memory", "i-cluster"] }
+serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tokio.workspace = true
