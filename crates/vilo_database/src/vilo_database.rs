@@ -362,6 +362,9 @@ pub struct DatabaseView {
     /// Writes of this run whose result line could not be saved. Kept apart from the list read
     /// back from the log, because a line can be readable even though saving it failed.
     unlogged_writes: Vec<(String, String)>,
+    /// Operation ids in `unlogged_writes` that are administration writes; until they are checked
+    /// no new administration write starts.
+    admin_to_check: collections::HashSet<String>,
     /// Why the write log could not be read or updated, shown until it works again.
     audit_problem: Option<SharedString>,
     /// While a page is open the site, environment and connection columns fold away; hovering the
@@ -494,6 +497,7 @@ impl DatabaseView {
             write_notice: None,
             dangling_writes: Vec::new(),
             unlogged_writes: Vec::new(),
+            admin_to_check: Default::default(),
             audit_problem: None,
             rail_peek: false,
             query_language: None,

@@ -258,6 +258,18 @@ impl DatabaseView {
         cx: &mut Context<Self>,
     ) {
         if self
+            .unlogged_writes
+            .iter()
+            .any(|(operation, _)| self.admin_to_check.contains(operation))
+        {
+            self.write_notice = Some(
+                "An earlier slow log change has an outcome to check. Check it, then mark it checked above."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        if self
             .redis_state
             .as_ref()
             .is_some_and(|state| state.switching_database())
@@ -326,6 +338,13 @@ impl DatabaseView {
             cx.notify();
             return;
         }
+        let nodes = session.scan_nodes();
+        if nodes.is_empty() {
+            form.message = Some("No Redis node is known yet; refresh and try again.".into());
+            cx.notify();
+            return;
+        }
+        let node_count = nodes.len();
         form.sending = true;
         form.sent = true;
         form.message = Some("Sending…".into());
@@ -334,7 +353,7 @@ impl DatabaseView {
             let mut outcomes = Vec::new();
             // One node at a time, each logged before it is sent. A node whose intent cannot be
             // logged, or whose outcome is unknown, stops the rest so nothing more is sent blind.
-            for node in session.scan_nodes() {
+            for node in nodes {
                 let operation = uuid::Uuid::new_v4().simple().to_string();
                 let intent = serde_json::json!({
                     "time": chrono::Utc::now().to_rfc3339(),
@@ -368,15 +387,20 @@ impl DatabaseView {
                     serde_json::json!({ "operation": operation, "phase": "result", "result": result }),
                 );
                 let unknown = matches!(outcome, Err(WriteError::Unknown(_)));
+                // An unknown outcome is something to check even though its result line is logged.
+                let to_check = match (&outcome, logged) {
+                    (_, Err(error)) => Some(format!(
+                        "{summary} · its result is not in the log: {error:#}"
+                    )),
+                    (Err(WriteError::Unknown(message)), Ok(())) => {
+                        Some(format!("{summary} · outcome unknown: {message}"))
+                    }
+                    _ => None,
+                };
                 outcomes.push(NodeOutcome {
                     node: node.label.clone(),
                     result: outcome.map_err(|error| error.to_string()),
-                    unlogged: logged.err().map(|error| {
-                        (
-                            operation,
-                            format!("{summary} · its result is not in the log: {error:#}"),
-                        )
-                    }),
+                    unlogged: to_check.map(|reason| (operation, reason)),
                 });
                 if unknown {
                     break;
@@ -391,14 +415,12 @@ impl DatabaseView {
                 if let Ok(outcomes) = &result {
                     for outcome in outcomes {
                         if let Some(entry) = outcome.unlogged.clone() {
+                            this.admin_to_check.insert(entry.0.clone());
                             this.unlogged_writes.push(entry);
                         }
                     }
                 }
                 let same_session = this.generation == generation;
-                let nodes = this
-                    .redis()
-                    .map_or(0, |session| session.scan_nodes().len());
                 let Some(form) = &mut this.admin_write else {
                     cx.notify();
                     return;
@@ -406,7 +428,7 @@ impl DatabaseView {
                 form.sending = false;
                 match result {
                     Ok(outcomes) => {
-                        let all_ok = outcomes.len() == nodes
+                        let all_ok = outcomes.len() == node_count
                             && outcomes.iter().all(|outcome| outcome.result.is_ok());
                         form.message = Some(
                             if all_ok {
@@ -420,7 +442,8 @@ impl DatabaseView {
                             .into_iter()
                             .map(|outcome| (outcome.node, outcome.result))
                             .collect();
-                        if all_ok && same_session {
+                        // Any node may have changed, so the shown settings are read again.
+                        if same_session {
                             this.load_slowlog(cx);
                         }
                     }
