@@ -525,6 +525,7 @@ impl Php<'_> {
         let Some(length) = self.bytes[start..].iter().position(|byte| *byte == end) else {
             return self.error(&format!("missing '{}'", end as char));
         };
+        self.arena.fits(length)?;
         self.at = start + length + 1;
         Ok(&self.bytes[start..start + length])
     }
@@ -757,6 +758,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             else {
                 return fail(at, "a line without its end");
             };
+            arena.fits(length)?;
             let text = String::from_utf8_lossy(&bytes[at..at + length]).to_string();
             at += length + 1;
             text
