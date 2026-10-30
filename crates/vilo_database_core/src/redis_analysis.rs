@@ -686,6 +686,16 @@ mod tests {
             analysis.nodes.iter().map(|node| node.scanned).sum::<u64>() >= 30,
             "keys on every primary are counted once"
         );
+        assert_eq!(
+            analysis.memory_unknown, 0,
+            "MEMORY USAGE reaches each key's own node"
+        );
+        assert!(
+            analysis
+                .nodes
+                .iter()
+                .all(|node| node.first_detail_error.is_none())
+        );
         for key in keys {
             session.call("DEL", vec![key.into()]).await.unwrap();
         }

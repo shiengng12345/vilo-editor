@@ -625,6 +625,20 @@ pub fn search_pattern(text: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// How a Cluster routes a command. fred hashes the first argument by default, which for
+/// MEMORY USAGE, OBJECT ENCODING or XINFO GROUPS is the subcommand, not the key, so every such
+/// call would go to one node and be redirected until it gives up. fred honours only an explicit
+/// slot for custom commands (not an argument offset), so the key's slot is given.
+fn cluster_hash(name: &str, args: &[Value]) -> fred::types::ClusterHash {
+    let subcommand_first = ["MEMORY", "OBJECT", "XINFO"]
+        .iter()
+        .any(|command| command.eq_ignore_ascii_case(name));
+    match args.get(1).and_then(|key| key.as_bytes()) {
+        Some(key) if subcommand_first => fred::types::ClusterHash::from(key),
+        _ => fred::types::ClusterHash::FirstKey,
+    }
+}
+
 pub(crate) fn bytes_arg(bytes: &[u8]) -> Value {
     Value::Bytes(bytes.to_vec().into())
 }
@@ -773,7 +787,13 @@ impl RedisSession {
     }
 
     pub(crate) async fn call(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
-        Ok(self.client.custom(cmd!(name), args).await?)
+        Ok(self
+            .client
+            .custom(
+                fred::types::CustomCommand::new(name, cluster_hash(name, &args), false),
+                args,
+            )
+            .await?)
     }
 
     /// One SCAN call on one node. COUNT is a hint, so a page may hold more or fewer keys, or none, and keys may repeat.
@@ -1258,15 +1278,10 @@ impl RedisSession {
                 "{name} is blocked: it can stop the server, wipe data, change configuration or stream every command."
             ),
         }
-        let command =
-            fred::types::CustomCommand::new(name, fred::types::ClusterHash::FirstKey, false);
-        Ok(self
-            .client
-            .custom(
-                command,
-                args.iter().map(|arg| bytes_arg(arg)).collect::<Vec<_>>(),
-            )
-            .await?)
+        let args = args.iter().map(|arg| bytes_arg(arg)).collect::<Vec<_>>();
+        let hash = cluster_hash(&name, &args);
+        let command = fred::types::CustomCommand::new(name, hash, false);
+        Ok(self.client.custom(command, args).await?)
     }
 
     pub async fn quit(&self) -> Result<()> {
@@ -1611,7 +1626,10 @@ impl RedisSession {
     ) -> Result<Value, fred::error::Error> {
         let mut all = vec![Value::from(script), Value::from(1_i64), bytes_arg(key)];
         all.extend(args);
-        self.client.custom(cmd!("EVAL"), all).await
+        // Routed by the key's slot, not by the script text that comes first.
+        let command =
+            fred::types::CustomCommand::new("EVAL", fred::types::ClusterHash::from(key), false);
+        self.client.custom(command, all).await
     }
 
     /// Sends one write once. `Ok(false)` means nothing changed: a guard found a different value,
@@ -1818,6 +1836,41 @@ impl RedisSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cluster_hash_uses_the_key() {
+        use fred::types::ClusterHash;
+        let args = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| bytes_arg(word.as_bytes()))
+                .collect::<Vec<_>>()
+        };
+        let slot = |hash: ClusterHash| match hash {
+            ClusterHash::Custom(slot) => Some(slot),
+            _ => None,
+        };
+        let key = ClusterHash::from("user:1".as_bytes());
+        assert_eq!(
+            slot(cluster_hash("MEMORY", &args(&["USAGE", "user:1"]))),
+            slot(key)
+        );
+        assert_eq!(
+            slot(cluster_hash("xinfo", &args(&["GROUPS", "user:1"]))),
+            slot(ClusterHash::from("user:1".as_bytes()))
+        );
+        assert!(
+            matches!(
+                cluster_hash("MEMORY", &args(&["STATS"])),
+                ClusterHash::FirstKey
+            ),
+            "no key"
+        );
+        assert!(matches!(
+            cluster_hash("GET", &args(&["user:1"])),
+            ClusterHash::FirstKey
+        ));
+    }
 
     #[test]
     fn test_commands_are_split_and_classified() {
