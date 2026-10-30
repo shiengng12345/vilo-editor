@@ -1688,8 +1688,8 @@ impl DatabaseView {
             .update(cx, |editor, cx| editor.set_text("", window, cx));
         use vilo_database_core::redis_workbench::{Planned, plan};
         let planned = split_command(&line).and_then(plan);
-        // Only commands the Workbench would run are kept, so Up never recalls a refused one.
-        if planned.is_ok() {
+        // Only reads are kept: history is saved to disk, and a write's values may be secrets.
+        if matches!(planned, Ok(Planned::Read(_))) {
             self.remember_command(&line, cx);
         }
         match planned {

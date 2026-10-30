@@ -30,83 +30,85 @@ enum Keys {
     Pairs,
 }
 
-/// The reviewed write commands. Left out on purpose: COPY (can write another database), SORT
+/// The reviewed write commands with their arity as Redis counts it (the name included; negative
+/// means at least that many), from `COMMAND INFO` on Redis 7.4 and, for RedisJSON, which does not
+/// declare one, from its documented syntax. Left out on purpose: COPY (can write another database), SORT
 /// (STORE), MOVE, blocking commands, XACK/XCLAIM/XGROUP (consumer state, from the group panel),
 /// and anything that runs code or changes the server or the connection.
-const WRITE_COMMANDS: &[(&str, Keys)] = &[
-    ("SET", Keys::First),
-    ("SETNX", Keys::First),
-    ("SETEX", Keys::First),
-    ("PSETEX", Keys::First),
-    ("GETSET", Keys::First),
-    ("GETDEL", Keys::First),
-    ("GETEX", Keys::First),
-    ("APPEND", Keys::First),
-    ("INCR", Keys::First),
-    ("DECR", Keys::First),
-    ("INCRBY", Keys::First),
-    ("DECRBY", Keys::First),
-    ("INCRBYFLOAT", Keys::First),
-    ("SETRANGE", Keys::First),
-    ("SETBIT", Keys::First),
-    ("MSET", Keys::Pairs),
-    ("MSETNX", Keys::Pairs),
-    ("DEL", Keys::All),
-    ("UNLINK", Keys::All),
-    ("EXPIRE", Keys::First),
-    ("PEXPIRE", Keys::First),
-    ("EXPIREAT", Keys::First),
-    ("PEXPIREAT", Keys::First),
-    ("PERSIST", Keys::First),
-    ("RENAME", Keys::FirstTwo),
-    ("RENAMENX", Keys::FirstTwo),
-    ("HSET", Keys::First),
-    ("HSETNX", Keys::First),
-    ("HMSET", Keys::First),
-    ("HDEL", Keys::First),
-    ("HINCRBY", Keys::First),
-    ("HINCRBYFLOAT", Keys::First),
-    ("LPUSH", Keys::First),
-    ("RPUSH", Keys::First),
-    ("LPUSHX", Keys::First),
-    ("RPUSHX", Keys::First),
-    ("LPOP", Keys::First),
-    ("RPOP", Keys::First),
-    ("LSET", Keys::First),
-    ("LREM", Keys::First),
-    ("LTRIM", Keys::First),
-    ("LINSERT", Keys::First),
-    ("LMOVE", Keys::FirstTwo),
-    ("RPOPLPUSH", Keys::FirstTwo),
-    ("SADD", Keys::First),
-    ("SREM", Keys::First),
-    ("SPOP", Keys::First),
-    ("SMOVE", Keys::FirstTwo),
-    ("ZADD", Keys::First),
-    ("ZREM", Keys::First),
-    ("ZINCRBY", Keys::First),
-    ("ZPOPMIN", Keys::First),
-    ("ZPOPMAX", Keys::First),
-    ("ZREMRANGEBYSCORE", Keys::First),
-    ("ZREMRANGEBYRANK", Keys::First),
-    ("ZREMRANGEBYLEX", Keys::First),
-    ("XADD", Keys::First),
-    ("XDEL", Keys::First),
-    ("XTRIM", Keys::First),
-    ("PFADD", Keys::First),
-    ("GEOADD", Keys::First),
-    ("JSON.SET", Keys::First),
-    ("JSON.DEL", Keys::First),
-    ("JSON.FORGET", Keys::First),
-    ("JSON.MERGE", Keys::First),
-    ("JSON.CLEAR", Keys::First),
-    ("JSON.TOGGLE", Keys::First),
-    ("JSON.NUMINCRBY", Keys::First),
-    ("JSON.STRAPPEND", Keys::First),
-    ("JSON.ARRAPPEND", Keys::First),
-    ("JSON.ARRINSERT", Keys::First),
-    ("JSON.ARRPOP", Keys::First),
-    ("JSON.ARRTRIM", Keys::First),
+const WRITE_COMMANDS: &[(&str, Keys, i32)] = &[
+    ("SET", Keys::First, -3),
+    ("SETNX", Keys::First, 3),
+    ("SETEX", Keys::First, 4),
+    ("PSETEX", Keys::First, 4),
+    ("GETSET", Keys::First, 3),
+    ("GETDEL", Keys::First, 2),
+    ("GETEX", Keys::First, -2),
+    ("APPEND", Keys::First, 3),
+    ("INCR", Keys::First, 2),
+    ("DECR", Keys::First, 2),
+    ("INCRBY", Keys::First, 3),
+    ("DECRBY", Keys::First, 3),
+    ("INCRBYFLOAT", Keys::First, 3),
+    ("SETRANGE", Keys::First, 4),
+    ("SETBIT", Keys::First, 4),
+    ("MSET", Keys::Pairs, -3),
+    ("MSETNX", Keys::Pairs, -3),
+    ("DEL", Keys::All, -2),
+    ("UNLINK", Keys::All, -2),
+    ("EXPIRE", Keys::First, -3),
+    ("PEXPIRE", Keys::First, -3),
+    ("EXPIREAT", Keys::First, -3),
+    ("PEXPIREAT", Keys::First, -3),
+    ("PERSIST", Keys::First, 2),
+    ("RENAME", Keys::FirstTwo, 3),
+    ("RENAMENX", Keys::FirstTwo, 3),
+    ("HSET", Keys::First, -4),
+    ("HSETNX", Keys::First, 4),
+    ("HMSET", Keys::First, -4),
+    ("HDEL", Keys::First, -3),
+    ("HINCRBY", Keys::First, 4),
+    ("HINCRBYFLOAT", Keys::First, 4),
+    ("LPUSH", Keys::First, -3),
+    ("RPUSH", Keys::First, -3),
+    ("LPUSHX", Keys::First, -3),
+    ("RPUSHX", Keys::First, -3),
+    ("LPOP", Keys::First, -2),
+    ("RPOP", Keys::First, -2),
+    ("LSET", Keys::First, 4),
+    ("LREM", Keys::First, 4),
+    ("LTRIM", Keys::First, 4),
+    ("LINSERT", Keys::First, 5),
+    ("LMOVE", Keys::FirstTwo, 5),
+    ("RPOPLPUSH", Keys::FirstTwo, 3),
+    ("SADD", Keys::First, -3),
+    ("SREM", Keys::First, -3),
+    ("SPOP", Keys::First, -2),
+    ("SMOVE", Keys::FirstTwo, 4),
+    ("ZADD", Keys::First, -4),
+    ("ZREM", Keys::First, -3),
+    ("ZINCRBY", Keys::First, 4),
+    ("ZPOPMIN", Keys::First, -2),
+    ("ZPOPMAX", Keys::First, -2),
+    ("ZREMRANGEBYSCORE", Keys::First, 4),
+    ("ZREMRANGEBYRANK", Keys::First, 4),
+    ("ZREMRANGEBYLEX", Keys::First, 4),
+    ("XADD", Keys::First, -5),
+    ("XDEL", Keys::First, -3),
+    ("XTRIM", Keys::First, -4),
+    ("PFADD", Keys::First, -2),
+    ("GEOADD", Keys::First, -5),
+    ("JSON.SET", Keys::First, -4),
+    ("JSON.DEL", Keys::First, -2),
+    ("JSON.FORGET", Keys::First, -2),
+    ("JSON.MERGE", Keys::First, 4),
+    ("JSON.CLEAR", Keys::First, -2),
+    ("JSON.TOGGLE", Keys::First, 3),
+    ("JSON.NUMINCRBY", Keys::First, 4),
+    ("JSON.STRAPPEND", Keys::First, -3),
+    ("JSON.ARRAPPEND", Keys::First, -3),
+    ("JSON.ARRINSERT", Keys::First, -5),
+    ("JSON.ARRPOP", Keys::First, -2),
+    ("JSON.ARRTRIM", Keys::First, 5),
 ];
 
 /// Commands that run code; refused with that reason rather than as merely unlisted.
@@ -152,9 +154,24 @@ pub fn plan(words: Vec<Bytes>) -> Result<Planned> {
         ),
         CommandKind::Write => {}
     }
-    let Some((_, keys)) = WRITE_COMMANDS.iter().find(|(known, _)| *known == name) else {
+    let Some((_, keys, arity)) = WRITE_COMMANDS.iter().find(|(known, ..)| *known == name) else {
         bail!("{name} is not on Vilo's list of reviewed write commands, so it is not run.");
     };
+    // Checked here, so a file whose later line is short is refused before any line runs.
+    let count = i64::try_from(words.len()).unwrap_or(i64::MAX);
+    let arity = i64::from(*arity);
+    if (arity > 0 && count != arity) || (arity < 0 && count < -arity) {
+        bail!(
+            "{name} takes {} argument{}; this line has {}.",
+            if arity > 0 {
+                format!("{}", arity - 1)
+            } else {
+                format!("at least {}", -arity - 1)
+            },
+            if arity.abs() == 2 { "" } else { "s" },
+            count - 1
+        );
+    }
     let args = words.get(1..).unwrap_or_default();
     let keys = match keys {
         Keys::First => args.first().into_iter().cloned().collect::<Vec<_>>(),
@@ -182,6 +199,10 @@ pub fn plan(words: Vec<Bytes>) -> Result<Planned> {
 /// starting with `#` are skipped. Every line is planned first, so a file with one line Vilo would
 /// refuse runs nothing. Returns each command with its line number.
 pub fn parse_command_file(text: &str) -> Result<Vec<(usize, String, Planned)>> {
+    anyhow::ensure!(
+        text.len() as u64 <= MAX_FILE_BYTES,
+        "The file is larger than {MAX_FILE_BYTES} bytes."
+    );
     let mut commands = Vec::new();
     let mut problems = Vec::new();
     for (index, line) in text.lines().enumerate() {
@@ -279,9 +300,14 @@ mod tests {
             ("XACK s g 1-1", "not on Vilo's list"),
             ("SOMETHING.NEW a", "not on Vilo's list"),
             ("MSET a 1 b", "in pairs"),
-            ("RENAME a", "source and a destination"),
-            ("DEL", "needs a key"),
-            ("SET", "needs a key"),
+            ("RENAME a", "takes 2 arguments"),
+            ("DEL", "at least 1 argument"),
+            ("SET", "at least 2 arguments"),
+            ("SET b", "this line has 1"),
+            ("HSET h f", "at least 3 arguments"),
+            ("INCR a b", "takes 1 argument; this line has 2"),
+            ("LINSERT l BEFORE x", "takes 4 arguments"),
+            ("JSON.SET doc $", "at least 3 arguments"),
         ] {
             let error = format!("{:#}", plan(words(line)).unwrap_err());
             assert!(error.contains(reason), "{line}: {error}");
@@ -305,6 +331,12 @@ mod tests {
             error.starts_with("Nothing was run. 3 lines cannot be run"),
             "{error}"
         );
+        let short = format!("{:#}", parse_command_file("SET a 1\nSET b\n").unwrap_err());
+        assert!(
+            short.contains("line 2"),
+            "a short later line refuses the file: {short}"
+        );
+        assert!(parse_command_file(&"#".repeat(MAX_FILE_BYTES as usize + 1)).is_err());
         assert!(error.contains("line 2") && error.contains("line 3") && error.contains("line 4"));
         assert!(parse_command_file("# only a comment\n").is_err());
         let too_many = "PING\n".repeat(MAX_FILE_COMMANDS + 1);

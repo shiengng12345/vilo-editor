@@ -53,6 +53,17 @@ impl DatabaseView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Checked for the session in place; a switch in progress would replace it.
+        if let Some(state) = self.redis_state.as_mut()
+            && state.switching_database()
+        {
+            state.workbench.push((
+                format!("Run commands from {source}"),
+                Err("A database switch is in progress; try again when it finishes.".into()),
+            ));
+            cx.notify();
+            return;
+        }
         let typed = single_line("Type the connection name", "", false, window, cx);
         self.workbench_run = Some(WorkbenchRun {
             generation: self.generation,
@@ -90,13 +101,18 @@ impl DatabaseView {
                 .unwrap_or_else(|| path.display().to_string());
             let parsed = cx
                 .background_spawn(async move {
-                    let size = std::fs::metadata(&path)?.len();
+                    use std::io::Read as _;
+                    // Read with a cap, so a file that grows after it was picked is still bounded.
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(&path)?
+                        .take(MAX_FILE_BYTES + 1)
+                        .read_to_end(&mut bytes)?;
                     anyhow::ensure!(
-                        size <= MAX_FILE_BYTES,
-                        "The file is {size} bytes; Vilo runs files of at most {MAX_FILE_BYTES} bytes."
+                        bytes.len() as u64 <= MAX_FILE_BYTES,
+                        "The file is larger than {MAX_FILE_BYTES} bytes; Vilo runs files of at most that size."
                     );
-                    let text = std::fs::read_to_string(&path)
-                        .map_err(|error| anyhow::anyhow!("The file could not be read as text: {error}"))?;
+                    let text = String::from_utf8(bytes)
+                        .map_err(|error| anyhow::anyhow!("The file is not UTF-8 text: {error}"))?;
                     parse_command_file(&text)
                 })
                 .await;
@@ -181,6 +197,17 @@ impl DatabaseView {
         cx.spawn(async move |this, cx| {
             let mut ended = None;
             for (index, (number, line, planned)) in commands.into_iter().enumerate() {
+                // Checked before every command: the batch was confirmed for this session only.
+                let same_session = this
+                    .update(cx, |this, _| this.generation == generation)
+                    .unwrap_or(false);
+                if !same_session {
+                    ended = Some((
+                        format!("Stopped: the connection changed after {index} of {total} commands; the rest did not run."),
+                        Color::Error,
+                    ));
+                    break;
+                }
                 if stop.load(Ordering::Relaxed) {
                     ended = Some((
                         format!("Stopped: {index} of {total} commands ran; the rest did not."),
@@ -218,12 +245,12 @@ impl DatabaseView {
                         // A key whose last write has an unknown outcome is checked before it is written again.
                         let locked = this
                             .update(cx, |this, _| {
-                                this.active.as_ref().is_some_and(|connection| {
-                                    write.keys.iter().any(|key| {
-                                        this.unknown_writes.contains(&crate::redis_write::lock_key(
-                                            connection, database, key,
-                                        ))
-                                    })
+                                write.keys.iter().any(|key| {
+                                    this.unknown_writes.contains(&crate::redis_write::lock_key(
+                                        &connection.id,
+                                        database,
+                                        key,
+                                    ))
                                 })
                             })
                             .unwrap_or(true);
@@ -302,12 +329,13 @@ impl DatabaseView {
                                     ));
                                 }
                                 if let Ok((Err(WriteError::Unknown(message)), _)) = &result {
-                                    if let Some(connection) = this.active.clone() {
-                                        for key in &write.keys {
-                                            this.unknown_writes.insert(
-                                                crate::redis_write::lock_key(&connection, database, key),
-                                            );
-                                        }
+                                    // The connection it was sent on, whatever is active now.
+                                    for key in &write.keys {
+                                        this.unknown_writes.insert(crate::redis_write::lock_key(
+                                            &connection.id,
+                                            database,
+                                            key,
+                                        ));
                                     }
                                     this.write_notice = Some(
                                         format!("The outcome of {summary} is unknown ({message}). Refresh its keys to check them before writing again.")
