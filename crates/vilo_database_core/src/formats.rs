@@ -24,6 +24,9 @@ const MAX_OUTPUT: usize = 1_000_000;
 /// Entries all containers of one input may hold together, references included, so a few memo
 /// references cannot stand for unbounded work.
 const MAX_ENTRIES: usize = 1_000_000;
+/// Bytes a pickle global's name may have; names are built by joining others, so unbounded
+/// joining could grow a tiny input into a huge allocation.
+const MAX_NAME: usize = 4096;
 /// Values visited while showing one input; a value shared many times is shown each time, so
 /// this bounds the work, not just the text.
 const MAX_VISITS: usize = 1_000_000;
@@ -724,12 +727,15 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             _ => Err(format!("not a pickle: nothing to change at byte {at}")),
         }
     };
-    let name_of = |arena: &Arena, id: Id| -> String {
-        match arena.nodes.get(id) {
-            Some(Node::Name(name)) => name.clone(),
-            Some(Node::Text(text)) => text.clone(),
-            _ => "<callable>".to_string(),
+    let name_of = |arena: &Arena, id: Id| -> Result<String, String> {
+        let name = match arena.nodes.get(id) {
+            Some(Node::Name(name)) | Some(Node::Text(name)) => name.as_str(),
+            _ => "<callable>",
+        };
+        if name.len() > MAX_NAME {
+            return Err(format!("not a pickle: a name longer than {MAX_NAME} bytes"));
         }
+        Ok(name.to_string())
     };
     let small = |bytes: &[u8]| -> String {
         // Little-endian two's complement of any length.
@@ -786,11 +792,16 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             }
             b'L' => {
                 let text = line!();
-                push(
-                    arena,
-                    &mut stack,
-                    Node::Int(text.trim_end_matches('L').to_string()),
-                )?
+                let digits = text.trim_end_matches('L');
+                if digits.is_empty()
+                    || digits
+                        .trim_start_matches('-')
+                        .bytes()
+                        .any(|byte| !byte.is_ascii_digit())
+                {
+                    return fail(at, "a LONG that is not a number");
+                }
+                push(arena, &mut stack, Node::Int(digits.to_string()))?
             }
             b'J' => {
                 let value = i32::from_le_bytes(take!(4).try_into().map_err(|_| "ends early")?);
@@ -976,12 +987,15 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             b'c' => {
                 let module = line!();
                 let name = line!();
+                if module.len() + name.len() > MAX_NAME {
+                    return fail(at, "a global name too long");
+                }
                 push(arena, &mut stack, Node::Name(format!("{module}.{name}")))?
             }
             0x93 => {
                 let name = pop(&mut stack, at)?;
                 let module = pop(&mut stack, at)?;
-                let name = format!("{}.{}", name_of(arena, module), name_of(arena, name));
+                let name = format!("{}.{}", name_of(arena, module)?, name_of(arena, name)?);
                 push(arena, &mut stack, Node::Name(name))?
             }
             b'R' | 0x81 | 0x92 => {
@@ -996,7 +1010,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 if let Some(keywords) = keywords {
                     fields.push(("keywords".to_string(), keywords));
                 }
-                let class = name_of(arena, callable);
+                let class = name_of(arena, callable)?;
                 push(arena, &mut stack, Node::Object { class, fields })?
             }
             b'i' => {
@@ -1021,7 +1035,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 }
                 let callable = items.remove(0);
                 let arguments = arena.add(Node::Tuple(items))?;
-                let class = name_of(arena, callable);
+                let class = name_of(arena, callable)?;
                 push(
                     arena,
                     &mut stack,
@@ -1116,6 +1130,8 @@ enum Handle {
 
 struct ClassDesc {
     name: String,
+    /// Classes above this one, which bounds the hierarchy however it was reached.
+    ancestors: usize,
     flags: u8,
     /// Type code and name of each serialized field.
     fields: Vec<(u8, String)>,
@@ -1226,8 +1242,10 @@ impl Java<'_> {
                 }
                 self.annotations(depth + 1)?;
                 let parent = self.class_desc(depth + 1)?;
+                let ancestors = self.ancestors(&parent)?;
                 let class = std::rc::Rc::new(ClassDesc {
                     name,
+                    ancestors,
                     flags,
                     fields,
                     parent,
@@ -1249,8 +1267,10 @@ impl Java<'_> {
                 }
                 self.annotations(depth + 1)?;
                 let parent = self.class_desc(depth + 1)?;
+                let ancestors = self.ancestors(&parent)?;
                 let class = std::rc::Rc::new(ClassDesc {
                     name: format!("proxy for {}", names.join(", ")),
+                    ancestors,
                     flags: SC_SERIALIZABLE,
                     fields: Vec::new(),
                     parent,
@@ -1294,6 +1314,14 @@ impl Java<'_> {
             b'Z' => Node::Bool(self.u8()? != 0),
             other => return self.error(&format!("unknown field type '{}'", other as char)),
         })
+    }
+
+    fn ancestors(&self, parent: &Option<std::rc::Rc<ClassDesc>>) -> Result<usize, String> {
+        let ancestors = parent.as_ref().map_or(0, |parent| parent.ancestors + 1);
+        if ancestors > MAX_DEPTH {
+            return self.error("a class hierarchy too deep");
+        }
+        Ok(ancestors)
     }
 
     /// The values of a class's serialized fields, in their declared order.
@@ -1429,14 +1457,32 @@ impl Java<'_> {
                         fields.extend(self.default_fields(class, depth)?);
                         continue;
                     }
-                    // A class with its own writeObject usually writes its fields first
-                    // (defaultWriteObject), but need not; if fields and data do not read
-                    // together, everything it wrote is read as its own data instead.
+                    // A class with its own writeObject may or may not have written its fields
+                    // first (defaultWriteObject). Java writes primitive fields first, and an
+                    // object field never starts with a block marker; so when the first field is
+                    // primitive and the data starts with one, either reading could be right, and
+                    // the data is shown as recorded with a note instead of guessed field values.
+                    let first_primitive = class
+                        .fields
+                        .first()
+                        .is_some_and(|(code, _)| *code != b'L' && *code != b'[');
+                    let starts_with_block =
+                        matches!(self.bytes.get(self.at), Some(0x77 | 0x7A | 0x78));
+                    if first_primitive && starts_with_block {
+                        let note = self.arena.add(Node::Name(
+                            "<not read: the class wrote its own data, which may or may not hold them>"
+                                .into(),
+                        ))?;
+                        fields.push((format!("{} fields", class.name), note));
+                    }
                     let saved = (self.at, self.handles.len(), self.arena.nodes.len());
-                    let (defaults, items) = match self
-                        .default_fields(class, depth)
-                        .and_then(|defaults| Ok((defaults, self.annotations(depth + 1)?)))
-                    {
+                    let attempt = if first_primitive && starts_with_block {
+                        Err(String::new())
+                    } else {
+                        self.default_fields(class, depth)
+                            .and_then(|defaults| Ok((defaults, self.annotations(depth + 1)?)))
+                    };
+                    let (defaults, items) = match attempt {
                         Ok(read) => read,
                         Err(_) => {
                             self.at = saved.0;
@@ -1791,6 +1837,8 @@ mod tests {
             "a dict key without a value"
         );
         assert!(decode(Decoder::Pickle, b"Fnot-a-float\n.").is_err());
+        assert!(decode(Decoder::Pickle, b"L\n.").is_err(), "an empty LONG");
+        assert_eq!(decode(Decoder::Pickle, b"L-12L\n.").unwrap(), "-12");
         // Successive lists that each hold the previous one twice grow exponentially when shown;
         // the work stops at the visit limit.
         let mut doubling = b"\x80\x04]\x94".to_vec();
@@ -1846,6 +1894,47 @@ mod tests {
         assert!(text.contains("Own$Counter custom data"), "{text}");
         assert!(text.contains(r#"\x00\x00\x00*\x00\x02hi"#), "{text}");
         assert!(!text.contains("x: "), "no made-up field value: {text}");
+    }
+
+    #[test]
+    fn test_names_and_hierarchies_are_bounded() {
+        let mut names = b"Vx\n".to_vec();
+        for _ in 0..30 {
+            names.extend_from_slice(b"2\x93");
+        }
+        names.push(b'.');
+        assert!(
+            decode(Decoder::Pickle, &names).is_err(),
+            "names stop at the limit"
+        );
+        // Class descriptions each naming the previous one as superclass, reached by reference.
+        let mut classes = b"\xac\xed\x00\x05".to_vec();
+        for index in 0..100_u32 {
+            classes.extend_from_slice(&[0x72, 0x00, 0x01, b'C']);
+            classes.extend_from_slice(&[0; 8]);
+            classes.extend_from_slice(&[0x02, 0x00, 0x00, 0x78]);
+            if index == 0 {
+                classes.push(0x70);
+            } else {
+                classes.push(0x71);
+                classes.extend_from_slice(&(0x7E_0000 + index - 1).to_be_bytes());
+            }
+        }
+        assert!(
+            decode(Decoder::Java, &classes).is_err(),
+            "hierarchy deeper than the limit"
+        );
+        // int x, writeObject writing only writeShort(42) and writeObject(null): ambiguous, so no
+        // value is made up for x.
+        let ambiguous = hex(
+            "aced00057372000b4f776e24436f756e746572873d94ab468ea0190300014900017878707702002a7078",
+        );
+        let text = decode(Decoder::Java, &ambiguous).unwrap();
+        assert!(!text.contains("x: "), "{text}");
+        assert!(
+            text.contains("may or may not hold them") && text.contains(r#"\x00*"#),
+            "{text}"
+        );
     }
 
     #[test]
