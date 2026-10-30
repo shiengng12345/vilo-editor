@@ -1466,30 +1466,19 @@ impl DatabaseView {
                 .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
                 .child(boxed(editor.clone(), cx))
         };
-        let kind_button = |id: &'static str, kind: Kind, cx: &mut Context<Self>| {
-            Button::new(id, kind.label())
-                .label_size(LabelSize::Small)
-                .style(if form.kind == kind {
-                    ButtonStyle::Filled
-                } else {
-                    ButtonStyle::Subtle
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(form) = &mut this.form {
-                        form.kind = kind;
-                    }
-                    cx.notify();
-                }))
-        };
         let editing = form.editing.clone();
         v_flex()
             .id("database-form")
             .gap_3()
             .child(Headline::new(if form.editing.is_some() { "Edit connection" } else { "Add a connection" }).size(HeadlineSize::Small))
-            .child(h_flex().gap_1().child(kind_button("database-kind-mongo", Kind::MongoDb, cx)).child(kind_button("database-kind-redis", Kind::Redis, cx)))
             .child(input("Name", &form.name, cx))
             .child(
-                Label::new(format!("Site {} · Environment {}", form.site, form.environment))
+                Label::new(format!(
+                    "{} · Site {} · Environment {}",
+                    form.kind.label(),
+                    form.site,
+                    form.environment
+                ))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
