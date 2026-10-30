@@ -32,7 +32,7 @@ enum Keys {
 
 /// The reviewed write commands with their arity as Redis counts it (the name included; negative
 /// means at least that many), from `COMMAND INFO` on Redis 7.4 and, for RedisJSON, which does not
-/// declare one, from its documented syntax. Left out on purpose: COPY (can write another database), SORT
+/// declare one, probed on RedisJSON 2.8 (it ignores extra arguments, so Vilo refuses them itself). Left out on purpose: COPY (can write another database), SORT
 /// (STORE), MOVE, blocking commands, XACK/XCLAIM/XGROUP (consumer state, from the group panel),
 /// and anything that runs code or changes the server or the connection.
 const WRITE_COMMANDS: &[(&str, Keys, i32)] = &[
@@ -105,7 +105,7 @@ const WRITE_COMMANDS: &[(&str, Keys, i32)] = &[
     ("JSON.TOGGLE", Keys::First, 3),
     ("JSON.NUMINCRBY", Keys::First, 4),
     ("JSON.STRAPPEND", Keys::First, -3),
-    ("JSON.ARRAPPEND", Keys::First, -3),
+    ("JSON.ARRAPPEND", Keys::First, -4),
     ("JSON.ARRINSERT", Keys::First, -5),
     ("JSON.ARRPOP", Keys::First, -2),
     ("JSON.ARRTRIM", Keys::First, 5),
@@ -412,7 +412,10 @@ mod tests {
             ("ZADD z 1 a 2", "scores and members in pairs"),
             ("GEOADD g 1 2 m 3", "in threes"),
             ("XADD s * f v g", "pairs after the id"),
-            ("XADD s NOMKSTREAM NOMKSTREAM MAXLEN", "threshold after MAXLEN"),
+            (
+                "XADD s NOMKSTREAM NOMKSTREAM MAXLEN",
+                "threshold after MAXLEN",
+            ),
             ("XADD s MAXLEN ~ 10 LIMIT", "count after LIMIT"),
         ] {
             let error = format!("{:#}", plan(words(line)).unwrap_err());
@@ -458,6 +461,11 @@ mod tests {
             parse_command_file("SET a 1\nHSET h field value orphan\n").unwrap_err()
         );
         assert!(grouped.contains("line 2"), "{grouped}");
+        let json = format!(
+            "{:#}",
+            parse_command_file("SET a 1\nJSON.ARRAPPEND doc $\n").unwrap_err()
+        );
+        assert!(json.contains("line 2"), "{json}");
         assert!(parse_command_file(&"#".repeat(MAX_FILE_BYTES as usize + 1)).is_err());
         assert!(error.contains("line 2") && error.contains("line 3") && error.contains("line 4"));
         assert!(parse_command_file("# only a comment\n").is_err());
