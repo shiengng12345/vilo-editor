@@ -341,6 +341,8 @@ pub struct DatabaseView {
     /// Documents whose last write has an unknown outcome; writing to them waits for a refresh.
     unknown_writes: collections::HashSet<String>,
     write_notice: Option<SharedString>,
+    /// Writes from earlier runs whose result never reached the write log.
+    dangling_writes: Vec<(String, String)>,
     /// While a page is open the site, environment and connection columns fold away; hovering the
     /// kind icons shows them over the page.
     rail_peek: bool,
@@ -468,6 +470,7 @@ impl DatabaseView {
             session_writes: Default::default(),
             unknown_writes: Default::default(),
             write_notice: None,
+            dangling_writes: Vec::new(),
             rail_peek: false,
             query_language: None,
             hover_pick: None,
@@ -475,6 +478,15 @@ impl DatabaseView {
             tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
+        let read = cx.background_spawn(async { mongo_write::read_dangling_writes() });
+        cx.spawn(async move |this, cx| {
+            let dangling = read.await?;
+            this.update(cx, |this, cx| {
+                this.dangling_writes = dangling;
+                cx.notify();
+            })
+        })
+        .detach_and_log_err(cx);
         let workspace = view.workspace.clone();
         cx.spawn(async move |this, cx| {
             let language = workspace
@@ -1849,6 +1861,57 @@ impl DatabaseView {
     }
 }
 
+impl DatabaseView {
+    fn render_dangling_writes(&self, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.dangling_writes.len();
+        v_flex()
+            .m_2()
+            .p_2()
+            .gap_1()
+            .rounded_md()
+            .bg(cx.theme().status().warning_background)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Icon::new(IconName::Warning).size(IconSize::Small).color(Color::Warning))
+                    .child(
+                        Label::new(format!(
+                            "{count} earlier write{} may or may not have happened: the write log has no result for {}. Check {} before writing there again.",
+                            if count == 1 { "" } else { "s" },
+                            if count == 1 { "it" } else { "them" },
+                            if count == 1 { "its target" } else { "their targets" },
+                        ))
+                        .size(LabelSize::Small),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("database-dangling-checked", "I checked them")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let operations = this
+                                    .dangling_writes
+                                    .drain(..)
+                                    .map(|(operation, _)| operation)
+                                    .collect::<Vec<_>>();
+                                cx.background_spawn(async move {
+                                    mongo_write::acknowledge_writes(&operations)
+                                })
+                                .detach_and_log_err(cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .children(self.dangling_writes.iter().take(5).map(|(_, summary)| {
+                Label::new(summary.clone())
+                    .size(LabelSize::XSmall)
+                    .buffer_font(cx)
+                    .color(Color::Muted)
+            }))
+            .into_any_element()
+    }
+}
+
 impl Render for DatabaseView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The open connection shows only under its own kind and site; switching keeps it connected.
@@ -1932,6 +1995,9 @@ impl Render for DatabaseView {
                     .min_w_0()
                     .h_full()
                     .when(!full_bleed, |this| this.p_4())
+                    .when(!self.dangling_writes.is_empty(), |this| {
+                        this.child(self.render_dangling_writes(cx))
+                    })
                     // The peek closes when the pointer reaches the page, not when it leaves the
                     // peek: right-click menus and dialogs sit outside it and must keep it open.
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {

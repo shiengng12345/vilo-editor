@@ -367,15 +367,17 @@ impl DatabaseView {
                     Err(WriteError::Refused(_)) => "refused",
                     Err(WriteError::Unknown(_)) => "unknown",
                 };
-                mongo_write::audit(
-                    serde_json::json!({ "operation": operation, "phase": "result", "result": result }),
-                )
-                .ok();
-                Ok(outcome)
+                let logged = mongo_write::audit(serde_json::json!({ "operation": operation, "phase": "result", "result": result }))
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                Ok((outcome, logged))
             }
         });
         form._task = Some(cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let (result, logged) = match task.await {
+                Ok((outcome, logged)) => (Ok(outcome), logged),
+                Err(error) => (Err(error), None),
+            };
             this.update(cx, |this, cx| {
                 if this.generation != generation {
                     return;
@@ -420,6 +422,13 @@ impl DatabaseView {
                         form.message = Some(format!("Not written: {message}").into());
                     }
                     Err(error) => form.message = Some(format!("Not sent: {error:#}").into()),
+                }
+                if let Some(error) = logged {
+                    let note = format!("The write log has its intent but not its result ({error}).");
+                    this.write_notice = Some(match this.write_notice.take() {
+                        Some(existing) => format!("{existing} {note}").into(),
+                        None => note.into(),
+                    });
                 }
                 cx.notify();
             })

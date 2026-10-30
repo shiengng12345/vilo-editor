@@ -96,8 +96,75 @@ fn target_key(connection: &str, database: &str, collection: &str, id: &Bson) -> 
 }
 
 /// Appends one line to the write log; a write is not sent if its intent cannot be logged.
+fn audit_path() -> std::path::PathBuf {
+    paths::config_dir().join("database_audit.log")
+}
+
+/// Writes whose intent is in the log with no result or acknowledgement after it: each may or
+/// may not have reached the server. Returns (operation id, what and where), oldest first.
+pub(crate) fn dangling_writes(log: &str) -> Vec<(String, String)> {
+    let mut open: Vec<(String, String)> = Vec::new();
+    for line in log.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(operation) = entry.get("operation").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let text = |name: &str| {
+            entry
+                .get(name)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+        };
+        match text("phase") {
+            "intent" => {
+                let target = if text("target").is_empty() {
+                    text("key")
+                } else {
+                    text("target")
+                };
+                open.push((
+                    operation.to_string(),
+                    format!(
+                        "{} {} on {} ({}, {})",
+                        text("time"),
+                        text("kind"),
+                        target,
+                        text("name"),
+                        text("environment")
+                    ),
+                ));
+            }
+            _ => open.retain(|(known, _)| known != operation),
+        }
+    }
+    open
+}
+
+/// Reads the write log for dangling writes; a missing log has none.
+pub(crate) fn read_dangling_writes() -> Result<Vec<(String, String)>> {
+    match std::fs::read_to_string(audit_path()) {
+        Ok(log) => Ok(dangling_writes(&log)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).context("Vilo could not read the write log"),
+    }
+}
+
+/// Marks dangling writes as checked by the user, so they are not reported again.
+pub(crate) fn acknowledge_writes(operations: &[String]) -> Result<()> {
+    for operation in operations {
+        audit(serde_json::json!({
+            "time": chrono::Utc::now().to_rfc3339(),
+            "operation": operation,
+            "phase": "acknowledged",
+        }))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn audit(line: serde_json::Value) -> Result<()> {
-    let path = paths::config_dir().join("database_audit.log");
+    let path = audit_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -378,14 +445,18 @@ impl DatabaseView {
                 Err(WriteError::Refused(_)) => "refused".into(),
                 Err(WriteError::Unknown(_)) => "unknown".into(),
             };
-            audit(
+            let logged = audit(
                 serde_json::json!({ "operation": operation, "phase": "result", "result": result }),
             )
-            .ok();
-            Ok(outcome)
+            .err()
+            .map(|error| format!("{error:#}"));
+            Ok((outcome, logged))
         });
         write._task = Some(cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let (result, logged) = match task.await {
+                Ok((outcome, logged)) => (Ok(outcome), logged),
+                Err(error) => (Err(error), None),
+            };
             this.update(cx, |this, cx| {
                 if this.generation != generation {
                     return;
@@ -422,6 +493,13 @@ impl DatabaseView {
                         write.message = Some(format!("Not written: {message}").into());
                     }
                     Err(error) => write.message = Some(format!("Not sent: {error:#}").into()),
+                }
+                if let Some(error) = logged {
+                    let note = format!("The write log has its intent but not its result ({error}).");
+                    this.write_notice = Some(match this.write_notice.take() {
+                        Some(existing) => format!("{existing} {note}").into(),
+                        None => note.into(),
+                    });
                 }
                 cx.notify();
             })
@@ -576,5 +654,33 @@ impl DatabaseView {
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dangling_writes() {
+        let log = [
+            r#"{"operation":"a","phase":"intent","kind":"updateOne","target":"db.c","time":"t1","name":"QAT","environment":"QAT"}"#,
+            r#"{"operation":"a","phase":"result","result":"ok"}"#,
+            r#"{"operation":"b","phase":"intent","kind":"UNLINK","key":"\"k\"","time":"t2","name":"R","environment":"UAT"}"#,
+            "not json",
+            r#"{"operation":"c","phase":"intent","kind":"deleteOne","target":"db.c","time":"t3","name":"QAT","environment":"QAT"}"#,
+            r#"{"operation":"c","phase":"acknowledged"}"#,
+            r#"{"operation":"d","phase":"intent","kind":"insertOne","target":"db.d","time":"t4","name":"QAT","environment":"QAT"}"#,
+        ]
+        .join("\n");
+        let dangling = dangling_writes(&log);
+        assert_eq!(
+            dangling
+                .iter()
+                .map(|(operation, _)| operation.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "d"]
+        );
+        assert!(dangling[0].1.contains("UNLINK on \"k\" (R, UAT)"));
     }
 }
