@@ -137,7 +137,7 @@ struct Stats {
 }
 
 /// The tree or list built for one set of keys, reused until the keys, view or opened folders change.
-type RowsKey = (usize, u64, String, bool);
+type RowsKey = (usize, usize, &'static str, u64, String, bool);
 
 pub(crate) struct RedisState {
     tab: RedisTab,
@@ -150,7 +150,13 @@ pub(crate) struct RedisState {
     total: Option<u64>,
     keys: Vec<Bytes>,
     seen: HashSet<Bytes>,
-    meta: HashMap<Bytes, KeyMeta>,
+    /// Shared so drawing the list does not copy it.
+    meta: Arc<HashMap<Bytes, KeyMeta>>,
+    /// The type filter the current list was scanned with; "" means every type, which lets the
+    /// filter change on the client without scanning again.
+    listed_kind: &'static str,
+    /// The previous list stays on screen until a new scan returns its first keys.
+    stale: bool,
     expanded: HashSet<Bytes>,
     expanded_version: u64,
     rows: RefCell<Option<(RowsKey, Arc<Vec<KeyRow>>)>>,
@@ -185,7 +191,9 @@ impl RedisState {
             total: None,
             keys: Vec::new(),
             seen: HashSet::default(),
-            meta: HashMap::default(),
+            meta: Arc::default(),
+            listed_kind: "",
+            stale: false,
             expanded: HashSet::default(),
             expanded_version: 0,
             rows: RefCell::new(None),
@@ -216,9 +224,35 @@ impl RedisState {
         }
     }
 
+    /// Keys the list shows: the scanned keys, narrowed by type here when the scan took every type.
+    fn visible_keys(&self) -> Vec<Bytes> {
+        if self.kind_filter.is_empty() || !self.listed_kind.is_empty() {
+            return self.keys.clone();
+        }
+        self.keys
+            .iter()
+            .filter(|key| {
+                self.meta
+                    .get(*key)
+                    .is_some_and(|meta| meta.kind == self.kind_filter)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether every key of every type is listed with its type, so a type filter needs no scan.
+    fn can_filter_locally(&self) -> bool {
+        self.listed_kind.is_empty()
+            && !self.stale
+            && self.nodes.iter().all(|node| node.cursor.is_none())
+            && self.keys.iter().all(|key| self.meta.contains_key(key))
+    }
+
     fn rows(&self) -> Arc<Vec<KeyRow>> {
         let key = (
             self.keys.len(),
+            self.meta.len(),
+            self.kind_filter,
             self.expanded_version,
             self.delimiter.clone(),
             self.key_view == KeyView::Tree,
@@ -228,10 +262,11 @@ impl RedisState {
         {
             return rows.clone();
         }
+        let keys = self.visible_keys();
         let rows = Arc::new(match self.key_view {
-            KeyView::Tree => tree_rows(&self.keys, self.delimiter.as_bytes(), &self.expanded),
+            KeyView::Tree => tree_rows(&keys, self.delimiter.as_bytes(), &self.expanded),
             KeyView::List => {
-                let mut keys = self.keys.clone();
+                let mut keys = keys;
                 keys.sort();
                 keys.into_iter()
                     .map(|key| KeyRow::Key {
@@ -326,7 +361,11 @@ fn type_badge(kind: &str) -> (&'static str, Hsla) {
     (label, rgb(color).into())
 }
 
-fn badge(kind: &str) -> impl IntoElement {
+fn badge(kind: &str) -> AnyElement {
+    // Until its type arrives a key shows no badge rather than an empty one.
+    if kind.is_empty() {
+        return div().w(px(58.)).flex_none().into_any_element();
+    }
     let (label, color) = type_badge(kind);
     // One width for every type, so the key names line up.
     h_flex()
@@ -343,6 +382,7 @@ fn badge(kind: &str) -> impl IntoElement {
                 .weight(gpui::FontWeight::SEMIBOLD)
                 .color(Color::Custom(color)),
         )
+        .into_any_element()
 }
 
 /// A value in the chosen format; JSON pretty-prints only when the bytes are valid JSON.
@@ -563,9 +603,10 @@ impl DatabaseView {
         };
         if restart {
             state.generation += 1;
-            state.keys.clear();
+            // Types do not change with the filter, so known ones are kept.
             state.seen.clear();
-            state.meta.clear();
+            state.stale = true;
+            state.listed_kind = state.kind_filter;
             state.scanned = 0;
             state.nodes = session
                 .scan_nodes()
@@ -631,6 +672,10 @@ impl DatabaseView {
                     let mut new_keys = Vec::new();
                     match result {
                         Ok((found, cursors, walked)) => {
+                            if state.stale {
+                                state.keys.clear();
+                                state.stale = false;
+                            }
                             state.scanned += walked;
                             for (node, (_, cursor)) in state.nodes.iter_mut().zip(cursors) {
                                 node.cursor = cursor;
@@ -679,8 +724,9 @@ impl DatabaseView {
                         if state.generation != generation {
                             return false;
                         }
+                        let known = Arc::make_mut(&mut state.meta);
                         for (key, (info, size)) in meta {
-                            state.meta.insert(
+                            known.insert(
                                 key,
                                 KeyMeta {
                                     kind: info.kind,
@@ -986,7 +1032,7 @@ impl DatabaseView {
 
     fn render_key_list(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
         let rows = state.rows();
-        let meta = Arc::new(state.meta.clone());
+        let meta = state.meta.clone();
         let selected = state.selected.clone();
         let view = cx.entity().downgrade();
         let colors = cx.theme().colors().clone();
@@ -1479,10 +1525,16 @@ impl DatabaseView {
                         let view = view.clone();
                         menu = menu.entry(label, None, move |_, cx| {
                             view.update(cx, |this, cx| {
-                                if let Some(state) = this.redis_state() {
-                                    state.kind_filter = kind;
+                                let Some(state) = this.redis_state() else {
+                                    return;
+                                };
+                                let local = state.can_filter_locally();
+                                state.kind_filter = kind;
+                                if local {
+                                    cx.notify();
+                                } else {
+                                    this.scan(true, cx);
                                 }
-                                this.scan(true, cx);
                             })
                             .ok();
                         });
@@ -1612,7 +1664,7 @@ impl DatabaseView {
                                     .gap_3()
                                     .border_b_1()
                                     .border_color(colors.border)
-                                    .child(Label::new(format!("Results: {}. Scanned {} / {total}", group_thousands(state.keys.len() as u64), group_thousands(state.scanned))).size(LabelSize::Small))
+                                    .child(Label::new(format!("Results: {}. Scanned {} / {total}", group_thousands(state.visible_keys().len() as u64), group_thousands(state.scanned))).size(LabelSize::Small))
                                     .when(!done, |this| {
                                         this.child(
                                             Button::new("database-redis-scan-more", if state.scanning { "Scanning…" } else { "Scan more" })
