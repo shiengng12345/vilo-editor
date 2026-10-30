@@ -176,6 +176,11 @@ struct NameEdit {
     editor: Entity<Editor>,
 }
 
+/// Present when the site, environment and connection columns are pinned open.
+fn rail_pin_path() -> PathBuf {
+    paths::config_dir().join("database_rail_pinned")
+}
+
 fn write_names(level: Level, names: Vec<String>, cx: &mut App) {
     cx.background_spawn(async move {
         let path = level.path();
@@ -370,7 +375,7 @@ impl DatabaseView {
             ),
             redis_state: None,
             rail_peek: false,
-            rail_pinned: false,
+            rail_pinned: rail_pin_path().exists(),
             tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -998,6 +1003,20 @@ impl DatabaseView {
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.rail_pinned = !this.rail_pinned;
                     this.rail_peek = false;
+                    let pinned = this.rail_pinned;
+                    cx.background_spawn(async move {
+                        let path = rail_pin_path();
+                        if pinned {
+                            if let Some(parent) = path.parent() {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            std::fs::write(&path, b"")?;
+                        } else if path.exists() {
+                            std::fs::remove_file(&path)?;
+                        }
+                        anyhow::Ok(())
+                    })
+                    .detach_and_log_err(cx);
                     cx.notify();
                 })),
             ),
@@ -1611,6 +1630,9 @@ impl Render for DatabaseView {
         let folded = !self.rail_pinned
             && full_bleed
             && (self.tab().is_some() || matches!(self.session, Some(Session::Redis(_))));
+        if !folded {
+            self.rail_peek = false;
+        }
         let colors = cx.theme().colors().clone();
         h_flex()
             .track_focus(&self.focus_handle)
@@ -1637,10 +1659,19 @@ impl Render for DatabaseView {
             // Mongo and Redis pages run edge to edge like Compass and RedisInsight.
             .child(
                 v_flex()
+                    .id("database-page")
                     .flex_1()
                     .min_w_0()
                     .h_full()
                     .when(!full_bleed, |this| this.p_4())
+                    // The peek closes when the pointer reaches the page, not when it leaves the
+                    // peek: right-click menus and dialogs sit outside it and must keep it open.
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if *hovered && this.rail_peek {
+                            this.rail_peek = false;
+                            cx.notify();
+                        }
+                    }))
                     .child(main),
             )
             .when(folded && self.rail_peek, |this| {
@@ -1652,12 +1683,8 @@ impl Render for DatabaseView {
                         .left(px(48.))
                         .h_full()
                         .shadow_lg()
-                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                            if !*hovered {
-                                this.rail_peek = false;
-                                cx.notify();
-                            }
-                        }))
+                        // Its gaps must not count as hovering the page underneath, which closes it.
+                        .occlude()
                         .child(self.render_names(Level::Site, cx))
                         .child(self.render_names(Level::Environment, cx))
                         .child(self.render_sidebar(cx)),
