@@ -2436,6 +2436,7 @@ impl DatabaseView {
                 (command, searched, more)
             },
         );
+        let filtered = detail.local_filter.is_some();
         let note = match (&detail.pattern, &detail.local_filter) {
             (Some(pattern), _) => Some(format!(
                 "Matching {} across the whole key",
@@ -2489,6 +2490,10 @@ impl DatabaseView {
                     (false, true) => (
                         "Copy as command (loaded part only)",
                         "Only the items loaded so far are in the command; load the rest first for the whole key",
+                    ),
+                    (false, false) if filtered => (
+                        "Copy as command (whole key, filter ignored)",
+                        "The filter only hides rows; every item of the key is in the command",
                     ),
                     (false, false) => ("Copy as command", "Commands that recreate this key, for redis-cli"),
                 };
