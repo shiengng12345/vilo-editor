@@ -305,9 +305,17 @@ impl DatabaseView {
                             Err(WriteError::Refused(_)) => "refused",
                             Err(WriteError::Unknown(_)) => "unknown",
                         };
-                        let logged = mongo_write::audit(serde_json::json!({ "operation": operation, "phase": "result", "result": result }))
-                            .err()
-                            .map(|error| format!("{error:#}"));
+                        let logged = match mongo_write::audit(serde_json::json!({ "operation": operation, "phase": "result", "result": result })) {
+                            Ok(()) => None,
+                            // The line may be in the log despite the error (written, then the sync
+                            // failed); what the log holds decides, as it will after a restart.
+                            Err(error) => {
+                                let open = mongo_write::read_dangling_writes().map_or(true, |open| {
+                                    open.iter().any(|(known, ..)| *known == operation)
+                                });
+                                Some((format!("{error:#}"), open))
+                            }
+                        };
                         Ok(Ok((outcome, logged)))
                     }
                 }));
@@ -327,7 +335,7 @@ impl DatabaseView {
                         ));
                     }
                     // The log still shows this batch as unsettled, so it stays locked until checked.
-                    Ok((Ok(_), Some(error))) => {
+                    Ok((Ok(_), Some((error, true)))) => {
                         unknown = Some((
                             operation.clone(),
                             summary.clone(),
@@ -338,7 +346,7 @@ impl DatabaseView {
                 }
                 let alive = this
                     .update(cx, |this, cx| {
-                        if let Ok((_, Some(error))) = &result {
+                        if let Ok((_, Some((error, true)))) = &result {
                             this.unlogged_writes.push((
                                 operation.clone(),
                                 format!("{summary} · its result is not in the log: {error}"),
@@ -355,9 +363,13 @@ impl DatabaseView {
                     .is_ok();
                 match result {
                     Ok((Ok(_), None)) => {}
-                    Ok((Ok(_), Some(error))) => {
+                    Ok((Ok(_), Some((error, open)))) => {
                         ended = Some((
-                            format!("Batch {} was deleted but its result could not be logged ({error}); the rest were not sent. Once the write log works, press I checked it.", index + 1),
+                            if open {
+                                format!("Batch {} was deleted but its result could not be logged ({error}); the rest were not sent. Once the write log works, press I checked it.", index + 1)
+                            } else {
+                                format!("Batch {} was deleted; the write log reported an error ({error}) but holds its result. The rest were not sent.", index + 1)
+                            },
                             Color::Error,
                         ));
                         break;
