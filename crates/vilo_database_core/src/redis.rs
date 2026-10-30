@@ -1417,9 +1417,14 @@ const ZSET_SCORE_GUARDED: &str = "if redis.call('EXISTS', KEYS[1]) == 0 then ret
      if ARGV[3] == '1' then if not s or tonumber(s) ~= tonumber(ARGV[2]) then return 0 end \
      elseif s then return 0 end \
      redis.call('ZADD', KEYS[1], ARGV[4], ARGV[1]) return 1";
+/// A script that changes data in two steps returns this, having changed nothing, when the user's
+/// ACL denies a later step: scripts do not roll back, so every step is checked first (Redis 7).
+const NOT_PERMITTED: i64 = -2;
 /// ARGV: command, TTL seconds ('0' for none), then the command's arguments. Never touches an
 /// existing key.
 const ADD_KEY: &str = "if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end \
+     if redis.acl_check_cmd and (not redis.acl_check_cmd(ARGV[1], KEYS[1], unpack(ARGV, 3)) \
+       or (ARGV[2] ~= '0' and not redis.acl_check_cmd('EXPIRE', KEYS[1], ARGV[2]))) then return -2 end \
      redis.call(ARGV[1], KEYS[1], unpack(ARGV, 3)) \
      if ARGV[2] ~= '0' then redis.call('EXPIRE', KEYS[1], ARGV[2]) end return 1";
 /// ARGV: index, expected, new value.
@@ -1430,6 +1435,8 @@ const LIST_SET_AT: &str = "if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] 
 /// left alone (LPOS needs Redis 6.0.6).
 const LIST_REMOVE_AT: &str = "if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end \
      if redis.call('LPOS', KEYS[1], ARGV[3]) then return 0 end \
+     if redis.acl_check_cmd and not (redis.acl_check_cmd('LSET', KEYS[1], ARGV[1], ARGV[3]) \
+       and redis.acl_check_cmd('LREM', KEYS[1], 1, ARGV[3])) then return -2 end \
      redis.call('LSET', KEYS[1], ARGV[1], ARGV[3]) \
      return redis.call('LREM', KEYS[1], 1, ARGV[3])";
 const SET_ADD_EXISTING: &str = "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end \
@@ -1611,6 +1618,11 @@ impl RedisSession {
     /// the key is gone, or (for rename) the new name is taken.
     pub async fn write(&self, write: &RedisWrite) -> Result<bool, crate::mongo::WriteError> {
         let flag = |present: bool| Value::from(if present { "1" } else { "0" });
+        // These change data in two steps; an error between them may leave the first applied.
+        let two_steps = matches!(
+            write,
+            RedisWrite::AddKey { .. } | RedisWrite::ListRemoveAt { .. }
+        );
         let reply = match write {
             RedisWrite::SetString {
                 key,
@@ -1785,8 +1797,21 @@ impl RedisSession {
                 .await
             }
         }
-        .map_err(classify_redis)?;
-        Ok(reply.as_i64().unwrap_or(0) > 0)
+        .map_err(|error| match classify_redis(error) {
+            crate::mongo::WriteError::Refused(message) if two_steps => {
+                crate::mongo::WriteError::Unknown(format!(
+                    "{message} (part of it may have been applied)"
+                ))
+            }
+            other => other,
+        })?;
+        match reply.as_i64() {
+            Some(NOT_PERMITTED) => Err(crate::mongo::WriteError::Refused(
+                "This connection's ACL does not allow every step of this write; nothing was changed."
+                    .into(),
+            )),
+            reply => Ok(reply.unwrap_or(0) > 0),
+        }
     }
 }
 
@@ -2173,6 +2198,94 @@ broken line";
             .unwrap();
     }
 
+    async fn steps_denied_by_acl_change_nothing(admin: &RedisSession, url: &str) {
+        let user = "vilo_test_limited";
+        admin
+            .call(
+                "ACL",
+                [
+                    "SETUSER",
+                    user,
+                    "reset",
+                    "on",
+                    ">vilo-test",
+                    "~vilo_test:*",
+                    "+@all",
+                    "-expire",
+                    "-lrem",
+                ]
+                .into_iter()
+                .map(Value::from)
+                .collect(),
+            )
+            .await
+            .unwrap();
+        admin
+            .call(
+                "DEL",
+                vec!["vilo_test:acl_new".into(), "vilo_test:acl_list".into()],
+            )
+            .await
+            .unwrap();
+        let limited = RedisSession::connect(&url.replacen(
+            "redis://",
+            &format!("redis://{user}:vilo-test@"),
+            1,
+        ))
+        .await
+        .unwrap();
+        let add = RedisWrite::AddKey {
+            key: b"vilo_test:acl_new".to_vec(),
+            value: NewValue::Set(vec![b"m".to_vec()]),
+            ttl_seconds: Some(60),
+        };
+        assert!(matches!(
+            limited.write(&add).await,
+            Err(crate::mongo::WriteError::Refused(_))
+        ));
+        assert_eq!(
+            admin.key_info(b"vilo_test:acl_new").await.unwrap().kind,
+            "none",
+            "denied EXPIRE: the key is not created either"
+        );
+        limited
+            .call(
+                "RPUSH",
+                vec!["vilo_test:acl_list".into(), "a".into(), "b".into()],
+            )
+            .await
+            .unwrap();
+        let remove = RedisWrite::ListRemoveAt {
+            key: b"vilo_test:acl_list".to_vec(),
+            index: 0,
+            expected: b"a".to_vec(),
+        };
+        assert!(matches!(
+            limited.write(&remove).await,
+            Err(crate::mongo::WriteError::Refused(_))
+        ));
+        assert_eq!(
+            admin
+                .list_range(b"vilo_test:acl_list", 0, -1)
+                .await
+                .unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec()],
+            "denied LREM: the item is not replaced by the marker"
+        );
+        limited.quit().await.unwrap();
+        admin
+            .call(
+                "DEL",
+                vec!["vilo_test:acl_new".into(), "vilo_test:acl_list".into()],
+            )
+            .await
+            .unwrap();
+        admin
+            .call("ACL", vec!["DELUSER".into(), user.into()])
+            .await
+            .unwrap();
+    }
+
     async fn values_can_be_searched(session: &RedisSession) {
         let (hash, set, zset) = (b"vilo_test:sh", b"vilo_test:ss", b"vilo_test:sz");
         session
@@ -2409,6 +2522,7 @@ broken line";
         let session = RedisSession::connect(&url).await.unwrap();
         writes_are_guarded(&session).await;
         new_keys_and_list_rows(&session).await;
+        steps_denied_by_acl_change_nothing(&session, &url).await;
         values_can_be_searched(&session).await;
         databases_are_separate(&url).await;
         slowlog_and_clients(&url).await;
