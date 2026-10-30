@@ -2,15 +2,25 @@
 //! Resetting the slow log and changing its threshold are administration writes and go through
 //! the same switch, confirmation and write log as key writes.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use editor::Editor;
 use gpui::{Entity, Window, prelude::*};
-use ui::{Button, ButtonStyle, Tooltip, prelude::*};
+use ui::{Button, ButtonStyle, ContextMenu, PopoverMenu, Tooltip, prelude::*};
 use vilo_database_core::{
     mongo::WriteError,
     redis::{AdminWrite, ClientInfo, NodeReport, SlowEntry, quote_bytes},
+    redis_analysis::{Analysis, Bucket, KEYS_PER_NODE_CHOICES, KeyStat, TIME_LIMIT},
 };
 
-use crate::{DatabaseView, Fetch, boxed, editor as single_line, mongo_write, run};
+use crate::{
+    DatabaseView, Fetch, boxed, editor as single_line, mongo_write,
+    redis_view::{badge, describe_size, describe_ttl, escape_bytes},
+    run,
+};
 
 /// Slow log entries asked of each node unless the user picks another number.
 const SLOWLOG_COUNT: u32 = 128;
@@ -20,6 +30,17 @@ pub(crate) enum AnalyzeTab {
     #[default]
     SlowLog,
     Clients,
+    Database,
+}
+
+/// Tells a running analysis to stop scanning once its report is replaced or dropped; the scan
+/// runs on the Tokio runtime, which dropping the GPUI task alone does not stop.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Default)]
@@ -46,6 +67,12 @@ pub(crate) struct AnalyzeState {
     clients: Option<Fetch<NodeReport<ClientInfo>>>,
     client_filter: Option<Entity<Editor>>,
     client_sort: ClientSort,
+    analysis: Option<Fetch<Analysis>>,
+    /// Keys sampled per node; 0 until picked, meaning the middle choice.
+    analysis_sample: u64,
+    analysis_confirm: Option<Entity<Editor>>,
+    analysis_message: Option<SharedString>,
+    _analysis: Option<(StopOnDrop, gpui::Task<()>)>,
 }
 
 struct NodeOutcome {
@@ -170,6 +197,167 @@ pub(crate) fn filter_clients(
     matching
 }
 
+/// One report section as rows of bars, scaled to the section's largest memory (or key count when
+/// memory is unknown).
+fn bars(title: &str, buckets: &[Bucket], colors: &theme::ThemeColors) -> AnyElement {
+    let by_memory = buckets.iter().any(|bucket| bucket.memory > 0);
+    let measure = |bucket: &Bucket| {
+        if by_memory {
+            bucket.memory
+        } else {
+            bucket.keys
+        }
+    };
+    let widest = buckets.iter().map(measure).max().unwrap_or(0).max(1);
+    v_flex()
+        .gap_1()
+        .child(
+            Label::new(title.to_string())
+                .size(LabelSize::Small)
+                .weight(gpui::FontWeight::SEMIBOLD),
+        )
+        .children(buckets.iter().map(|bucket| {
+            h_flex()
+                .gap_2()
+                .child(
+                    div().w(px(160.)).flex_none().child(
+                        Label::new(bucket.name.clone())
+                            .size(LabelSize::Small)
+                            .single_line()
+                            .truncate(),
+                    ),
+                )
+                .child(
+                    div().w(px(240.)).flex_none().child(
+                        div()
+                            .h(px(10.))
+                            .rounded_sm()
+                            .bg(colors.text_accent)
+                            .w(px(240. * measure(bucket) as f32 / widest as f32)),
+                    ),
+                )
+                .child(
+                    Label::new(format!(
+                        "{} keys · {}",
+                        bucket.keys,
+                        describe_size(bucket.memory)
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+        }))
+        .into_any_element()
+}
+
+fn top_keys(title: &str, keys: &[KeyStat], cx: &App) -> AnyElement {
+    v_flex()
+        .gap_1()
+        .child(
+            Label::new(title.to_string())
+                .size(LabelSize::Small)
+                .weight(gpui::FontWeight::SEMIBOLD),
+        )
+        .children(keys.iter().map(|stat| {
+            h_flex()
+                .gap_3()
+                .child(h_flex().w(px(64.)).flex_none().child(badge(&stat.kind)))
+                .child(
+                    div().flex_1().min_w_0().child(
+                        Label::new(escape_bytes(&stat.key))
+                            .size(LabelSize::Small)
+                            .buffer_font(cx)
+                            .single_line()
+                            .truncate(),
+                    ),
+                )
+                .child(
+                    div().w(px(90.)).flex_none().child(
+                        Label::new(stat.memory.map_or("?".to_string(), describe_size))
+                            .size(LabelSize::Small),
+                    ),
+                )
+                .child(
+                    div().w(px(90.)).flex_none().child(
+                        Label::new(
+                            stat.length
+                                .map_or("?".to_string(), |length| format!("{length} items")),
+                        )
+                        .size(LabelSize::Small),
+                    ),
+                )
+                .child(
+                    div().w(px(90.)).flex_none().child(
+                        Label::new(describe_ttl(stat.ttl_ms))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+        }))
+        .into_any_element()
+}
+
+fn render_report(analysis: &Analysis, colors: &theme::ThemeColors, cx: &App) -> AnyElement {
+    let coverage = analysis.nodes.iter().map(|node| {
+        let total = node
+            .total
+            .map_or("?".to_string(), |total| total.to_string());
+        let share = node
+            .total
+            .filter(|total| *total > 0)
+            .map(|total| format!(" ({}%)", node.scanned * 100 / total))
+            .unwrap_or_default();
+        let (text, color) = match &node.error {
+            Some(error) => (format!("{}: stopped, {error}", node.label), Color::Error),
+            None if node.finished => (
+                format!(
+                    "{}: every key visited, {} of {total}",
+                    node.label, node.scanned
+                ),
+                Color::Muted,
+            ),
+            None => (
+                format!("{}: sampled {} of {total}{share}", node.label, node.scanned),
+                Color::Muted,
+            ),
+        };
+        Label::new(text).size(LabelSize::Small).color(color)
+    });
+    v_flex()
+        .gap_4()
+        .child(
+            v_flex()
+                .gap_1()
+                .child(Label::new(format!(
+                    "{} keys sampled · {} · {:.1} s",
+                    analysis.sampled,
+                    describe_size(analysis.memory),
+                    analysis.elapsed.as_secs_f32()
+                )))
+                .children(coverage)
+                .when_some(analysis.stopped.clone(), |this, stopped| {
+                    this.child(Label::new(stopped).size(LabelSize::Small).color(Color::Warning))
+                })
+                .when(analysis.memory_unknown > 0, |this| {
+                    this.child(
+                        Label::new(format!(
+                            "Memory is unknown for {} keys (MEMORY USAGE not answered); memory figures leave them out.",
+                            analysis.memory_unknown
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                    )
+                }),
+        )
+        .child(bars("Summary per data type", &analysis.by_type, colors))
+        .child(bars("Memory likely to be freed over time", &analysis.by_ttl, colors))
+        .when(!analysis.namespaces.is_empty(), |this| {
+            this.child(bars("Top namespaces in the sample", &analysis.namespaces, colors))
+        })
+        .child(top_keys("Largest keys in the sample, by memory", &analysis.top_memory, cx))
+        .child(top_keys("Largest keys in the sample, by length", &analysis.top_length, cx))
+        .into_any_element()
+}
+
 impl DatabaseView {
     fn analyze(&mut self) -> Option<&mut AnalyzeState> {
         self.redis_state.as_mut().map(|state| &mut state.analyze)
@@ -219,6 +407,83 @@ impl DatabaseView {
         cx.notify();
     }
 
+    fn analysis_sample(analyze: &AnalyzeState) -> u64 {
+        if analyze.analysis_sample == 0 {
+            KEYS_PER_NODE_CHOICES[1]
+        } else {
+            analyze.analysis_sample
+        }
+    }
+
+    /// A full report scans and reads many keys, so production asks for the connection name
+    /// even though nothing is written.
+    fn start_analysis(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.redis() else {
+            return;
+        };
+        let Some(connection) = self.active_connection().cloned() else {
+            return;
+        };
+        let generation = self.generation;
+        let delimiter = self
+            .redis_state
+            .as_ref()
+            .map_or(":".to_string(), |state| state.delimiter().to_string());
+        let Some(analyze) = self.analyze() else {
+            return;
+        };
+        let typed = analyze
+            .analysis_confirm
+            .as_ref()
+            .map(|editor| editor.read(cx).text(cx))
+            .unwrap_or_default();
+        if mongo_write::guarded(&connection) && typed.trim() != connection.name.trim() {
+            analyze.analysis_message =
+                Some("Type the connection name exactly to start the analysis.".into());
+            cx.notify();
+            return;
+        }
+        let sample = Self::analysis_sample(analyze);
+        let stop = Arc::new(AtomicBool::new(false));
+        let task = run(cx, {
+            let stop = stop.clone();
+            async move { Ok(session.analyze(sample, &delimiter, &stop).await) }
+        });
+        analyze.analysis = Some(Fetch::Loading);
+        analyze.analysis_message = None;
+        analyze._analysis = Some((
+            StopOnDrop(stop),
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                this.update(cx, |this, cx| {
+                    if this.generation != generation {
+                        return;
+                    }
+                    if let Some(analyze) = this.analyze() {
+                        analyze.analysis = Some(match result {
+                            Ok(analysis) => Fetch::Loaded(analysis),
+                            Err(error) => Fetch::Failed(format!("{error:#}").into()),
+                        });
+                        analyze._analysis = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }),
+        ));
+        cx.notify();
+    }
+
+    fn cancel_analysis(&mut self, cx: &mut Context<Self>) {
+        if let Some(analyze) = self.analyze() {
+            analyze._analysis = None;
+            analyze.analysis = None;
+            analyze.analysis_message =
+                Some("Cancelled; the scan stops after its current page.".into());
+        }
+        cx.notify();
+    }
+
     pub(crate) fn load_clients(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.redis() else {
             return;
@@ -260,6 +525,15 @@ impl DatabaseView {
         };
         analyze.tab = tab;
         let (load_slowlog, load_clients) = (analyze.slowlog.is_none(), analyze.clients.is_none());
+        if analyze.analysis_confirm.is_none() {
+            let confirm = single_line("Type the connection name", "", false, window, cx);
+            if let Some(analyze) = self.analyze() {
+                analyze.analysis_confirm = Some(confirm);
+            }
+        }
+        let Some(analyze) = self.analyze() else {
+            return;
+        };
         if analyze.client_filter.is_none() {
             let filter = single_line(
                 "Filter connections, e.g. name=worker or cmd=subscribe",
@@ -635,6 +909,107 @@ impl DatabaseView {
             .into_any_element()
     }
 
+    fn render_database_analysis(
+        &self,
+        analyze: &AnalyzeState,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let production = self.active_connection().is_some_and(mongo_write::guarded);
+        let running = analyze._analysis.is_some();
+        let sample = Self::analysis_sample(analyze);
+        let view = cx.entity().downgrade();
+        let sample_menu = PopoverMenu::new("database-analysis-sample")
+            .trigger(
+                Button::new(
+                    "database-analysis-sample-button",
+                    format!("Up to {sample} keys per node"),
+                )
+                .label_size(LabelSize::Small)
+                .style(ButtonStyle::Subtle)
+                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                .disabled(running),
+            )
+            .menu(move |window, cx| {
+                let view = view.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for choice in KEYS_PER_NODE_CHOICES {
+                        let view = view.clone();
+                        menu = menu.entry(
+                            format!("Up to {choice} keys per node"),
+                            None,
+                            move |_, cx| {
+                                view.update(cx, |this, cx| {
+                                    if let Some(analyze) = this.analyze() {
+                                        analyze.analysis_sample = choice;
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            });
+        let controls = h_flex()
+            .gap_2()
+            .child(sample_menu)
+            .when(production && !running, |this| {
+                this.when_some(analyze.analysis_confirm.clone(), |this, confirm| {
+                    this.child(div().w(px(220.)).child(boxed(confirm, cx)))
+                })
+            })
+            .child(if running {
+                Button::new("database-analysis-cancel", "Cancel")
+                    .style(ButtonStyle::Outlined)
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_analysis(cx)))
+            } else {
+                Button::new("database-analysis-start", "New report")
+                    .style(ButtonStyle::Filled)
+                    .on_click(cx.listener(|this, _, _, cx| this.start_analysis(cx)))
+            });
+        let note = Label::new(format!(
+            "Samples up to {sample} keys on each primary with SCAN, in small batches with a pause between pages, and stops after {} seconds. Figures describe the keys sampled; the largest keys are the largest of those, not of the whole database.{}",
+            TIME_LIMIT.as_secs(),
+            if production {
+                " This is a production connection: type its name to start."
+            } else {
+                ""
+            }
+        ))
+        .size(LabelSize::Small)
+        .color(Color::Muted);
+        let body = match &analyze.analysis {
+            None => Label::new("No report yet. Pick a sample size and press New report.")
+                .color(Color::Muted)
+                .into_any_element(),
+            Some(Fetch::Loading) => Label::new(format!(
+                "Analyzing… up to {} seconds.",
+                TIME_LIMIT.as_secs()
+            ))
+            .color(Color::Muted)
+            .into_any_element(),
+            Some(Fetch::Failed(message)) => Label::new(message.clone())
+                .color(Color::Error)
+                .into_any_element(),
+            Some(Fetch::Loaded(analysis)) => render_report(analysis, &colors, cx),
+        };
+        v_flex()
+            .gap_3()
+            .child(controls)
+            .child(note)
+            .when_some(analyze.analysis_message.clone(), |this, message| {
+                this.child(
+                    Label::new(message)
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+            })
+            .child(body)
+            .into_any_element()
+    }
+
     pub(crate) fn render_analyze(
         &self,
         analyze: &AnalyzeState,
@@ -671,6 +1046,12 @@ impl DatabaseView {
                 AnalyzeTab::Clients,
                 cx,
             ))
+            .child(sub_tab(
+                "database-analyze-database",
+                "Database Analysis",
+                AnalyzeTab::Database,
+                cx,
+            ))
             .child(div().flex_1())
             .child(
                 IconButton::new("database-analyze-refresh", IconName::RotateCw)
@@ -680,6 +1061,8 @@ impl DatabaseView {
                         let tab = this.redis_state.as_ref().map(|state| state.analyze.tab);
                         match tab {
                             Some(AnalyzeTab::Clients) => this.load_clients(cx),
+                            // A report is costly, so it only runs from its own button.
+                            Some(AnalyzeTab::Database) => {}
                             _ => this.load_slowlog(cx),
                         }
                     })),
@@ -899,6 +1282,7 @@ impl DatabaseView {
                         .into_any_element()
                 }
             },
+            AnalyzeTab::Database => self.render_database_analysis(analyze, cx),
             AnalyzeTab::Clients => match &analyze.clients {
                 None | Some(Fetch::Loading) => Label::new("Loading…")
                     .color(Color::Muted)

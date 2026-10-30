@@ -21,7 +21,7 @@ fred = { version = "10.1", default-features = false, features = ["i-std", "i-mem
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

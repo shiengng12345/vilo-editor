@@ -303,6 +303,10 @@ impl RedisState {
         self.switching.is_some()
     }
 
+    pub(crate) fn delimiter(&self) -> &str {
+        &self.delimiter
+    }
+
     pub(crate) fn clear_helper_pick(&mut self) {
         self.helper_selected = None;
     }
@@ -458,7 +462,7 @@ pub(crate) fn describe_ttl(ttl_ms: i64) -> String {
     }
 }
 
-fn describe_size(bytes: u64) -> String {
+pub(crate) fn describe_size(bytes: u64) -> String {
     match bytes {
         0..1024 => format!("{bytes} B"),
         1024..1_048_576 => format!("{:.0} KB", bytes as f64 / 1024.),
@@ -504,7 +508,7 @@ fn type_badge(kind: &str) -> (&'static str, Hsla) {
     (label, rgb(color).into())
 }
 
-fn badge(kind: &str) -> AnyElement {
+pub(crate) fn badge(kind: &str) -> AnyElement {
     // Until its type arrives a key shows no badge rather than an empty one.
     if kind.is_empty() {
         return div().w(px(58.)).flex_none().into_any_element();

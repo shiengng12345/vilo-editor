@@ -772,7 +772,7 @@ impl RedisSession {
         }]
     }
 
-    async fn call(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
+    pub(crate) async fn call(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
         Ok(self.client.custom(cmd!(name), args).await?)
     }
 
