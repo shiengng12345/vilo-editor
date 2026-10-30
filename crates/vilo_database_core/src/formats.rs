@@ -169,6 +169,10 @@ impl Output {
         self.text.push_str(text);
     }
 
+    fn remaining(&self) -> usize {
+        MAX_OUTPUT.saturating_sub(self.text.len())
+    }
+
     fn finish(mut self) -> String {
         if self.cut {
             self.text
@@ -224,17 +228,39 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
         Node::Bool(flag) => out.push(if *flag { "true" } else { "false" }),
         Node::Int(number) => out.push(number),
         Node::Float(value) => out.push(&format_float(*value)),
-        Node::Text(text) => out.push(&quoted(text)),
-        Node::Bytes(bytes) => out.push(&format!("b{}", crate::redis::quote_bytes(bytes))),
+        Node::Text(text) => {
+            // Only as much as can still be shown is escaped, so a huge value is never copied whole.
+            let end = (0..=text.len().min(out.remaining()))
+                .rev()
+                .find(|end| text.is_char_boundary(*end))
+                .unwrap_or(0);
+            out.push(&quoted(&text[..end]));
+            if end < text.len() {
+                out.cut = true;
+            }
+        }
+        Node::Bytes(bytes) => {
+            let end = bytes.len().min(out.remaining());
+            out.push(&format!("b{}", crate::redis::quote_bytes(&bytes[..end])));
+            if end < bytes.len() {
+                out.cut = true;
+            }
+        }
         Node::List(ids) => items("[", ids, "]", out),
         Node::Tuple(ids) => items("(", ids, ")", out),
         Node::Set(ids) => items("{", ids, "}", out),
         Node::Name(name) => out.push(name),
-        Node::Custom(label, bytes) => out.push(&format!(
-            "<{label}: {} bytes {}>",
-            bytes.len(),
-            crate::redis::quote_bytes(bytes)
-        )),
+        Node::Custom(label, bytes) => {
+            let end = bytes.len().min(out.remaining());
+            out.push(&format!(
+                "<{label}: {} bytes {}>",
+                bytes.len(),
+                crate::redis::quote_bytes(&bytes[..end])
+            ));
+            if end < bytes.len() {
+                out.cut = true;
+            }
+        }
         Node::Map(pairs) => {
             if pairs.is_empty() {
                 out.push("{}");
@@ -1009,7 +1035,10 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 let state = pop(&mut stack, at)?;
                 let target = top(&stack, at)?;
                 match arena.get_mut(target)? {
-                    Node::Object { fields, .. } => fields.push(("state".to_string(), state)),
+                    Node::Object { fields, .. } => {
+                        fields.push(("state".to_string(), state));
+                        arena.entries(1)?;
+                    }
                     _ => return fail(at, "state set on something that is not an object"),
                 }
             }
@@ -1146,6 +1175,7 @@ impl Java<'_> {
         let mut contents = Vec::new();
         while self.at < self.bytes.len() {
             contents.push(self.content(0)?);
+            self.arena.entries(1)?;
         }
         match contents.as_slice() {
             [one] => Ok(*one),
@@ -1266,6 +1296,25 @@ impl Java<'_> {
         })
     }
 
+    /// The values of a class's serialized fields, in their declared order.
+    fn default_fields(
+        &mut self,
+        class: &ClassDesc,
+        depth: usize,
+    ) -> Result<Vec<(String, Id)>, String> {
+        let mut fields = Vec::new();
+        for (code, name) in &class.fields {
+            let value = if *code == b'L' || *code == b'[' {
+                self.content(depth + 1)?
+            } else {
+                let node = self.primitive(*code)?;
+                self.arena.add(node)?
+            };
+            fields.push((name.clone(), value));
+        }
+        Ok(fields)
+    }
+
     fn content(&mut self, depth: usize) -> Result<Id, String> {
         if depth > MAX_DEPTH {
             return self.error("nested too deeply");
@@ -1274,7 +1323,11 @@ impl Java<'_> {
         match code {
             0x70 => self.arena.add(Node::Null),
             0x71 => match self.reference()? {
-                Handle::Value(id) => Ok(id),
+                Handle::Value(id) => {
+                    // A reference is one more entry wherever it is used.
+                    self.arena.entries(1)?;
+                    Ok(id)
+                }
                 Handle::Class(class) => self.arena.add(Node::Name(format!("class {}", class.name))),
             },
             0x74 | 0x7C => {
@@ -1372,21 +1425,30 @@ impl Java<'_> {
                         fields.push((format!("{} external data", class.name), custom));
                         continue;
                     }
-                    for (code, name) in &class.fields {
-                        let value = if *code == b'L' || *code == b'[' {
-                            self.content(depth + 1)?
-                        } else {
-                            let node = self.primitive(*code)?;
-                            self.arena.add(node)?
-                        };
-                        fields.push((name.clone(), value));
+                    if class.flags & SC_WRITE_METHOD == 0 {
+                        fields.extend(self.default_fields(class, depth)?);
+                        continue;
                     }
-                    if class.flags & SC_WRITE_METHOD != 0 {
-                        let items = self.annotations(depth + 1)?;
-                        if !items.is_empty() {
-                            let custom = self.arena.add(Node::List(items))?;
-                            fields.push((format!("{} custom data", class.name), custom));
+                    // A class with its own writeObject usually writes its fields first
+                    // (defaultWriteObject), but need not; if fields and data do not read
+                    // together, everything it wrote is read as its own data instead.
+                    let saved = (self.at, self.handles.len(), self.arena.nodes.len());
+                    let (defaults, items) = match self
+                        .default_fields(class, depth)
+                        .and_then(|defaults| Ok((defaults, self.annotations(depth + 1)?)))
+                    {
+                        Ok(read) => read,
+                        Err(_) => {
+                            self.at = saved.0;
+                            self.handles.truncate(saved.1);
+                            self.arena.nodes.truncate(saved.2);
+                            (Vec::new(), self.annotations(depth + 1)?)
                         }
+                    };
+                    fields.extend(defaults);
+                    if !items.is_empty() {
+                        let custom = self.arena.add(Node::List(items))?;
+                        fields.push((format!("{} custom data", class.name), custom));
                     }
                 }
                 *self.arena.get_mut(id)? = Node::Object {
@@ -1771,6 +1833,43 @@ mod tests {
                 .unwrap()
                 .contains(&"z".repeat(100))
         );
+    }
+
+    #[test]
+    fn test_java_write_object_without_default_fields() {
+        // Java 21: a class with `int x` whose writeObject only writes writeInt(42) and
+        // writeUTF("hi"), never defaultWriteObject.
+        let bytes = hex(
+            "aced00057372000b4f776e24436f756e746572873d94ab468ea01903000149000178787077080000002a0002686978",
+        );
+        let text = decode(Decoder::Java, &bytes).unwrap();
+        assert!(text.contains("Own$Counter custom data"), "{text}");
+        assert!(text.contains(r#"\x00\x00\x00*\x00\x02hi"#), "{text}");
+        assert!(!text.contains("x: "), "no made-up field value: {text}");
+    }
+
+    #[test]
+    fn test_reference_growth_is_bounded() {
+        // DUP and BUILD on one object: a few values, many fields.
+        let mut build = b"cm\nC\n)R".to_vec();
+        for _ in 0..1_100_000 {
+            build.extend_from_slice(b"2b");
+        }
+        build.push(b'.');
+        assert!(decode(Decoder::Pickle, &build).is_err());
+        // A Java string, then many references to it.
+        let mut references = b"\xac\xed\x00\x05\x74\x00\x01a".to_vec();
+        for _ in 0..1_100_000 {
+            references.extend_from_slice(&[0x71, 0x00, 0x7e, 0x00, 0x00]);
+        }
+        assert!(decode(Decoder::Java, &references).is_err());
+        // A large binary value is cut without escaping all of it.
+        let mut big = vec![0xc6, 0x00, 0x60, 0x00, 0x00];
+        big.extend(std::iter::repeat_n(0_u8, 0x0060_0000));
+        let started = std::time::Instant::now();
+        let text = decode(Decoder::Msgpack, &big).unwrap();
+        assert!(text.ends_with("KB of text") && text.len() < 1_100_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
