@@ -901,6 +901,7 @@ impl DatabaseView {
         if detail.info.kind == "list" {
             detail.local_filter = (!text.trim().is_empty()).then(|| text.trim().to_string());
             detail.more_error = None;
+            state.detail_search = Some((key, None, detail.local_filter.clone()));
             cx.notify();
             return;
         }
@@ -2024,10 +2025,7 @@ impl DatabaseView {
         let colors = cx.theme().colors().clone();
         let close = IconButton::new("database-redis-close-detail", IconName::Close).on_click(
             cx.listener(|this, _, _, cx| {
-                if let Some(state) = this.redis_state() {
-                    state.panel = RightPanel::Empty;
-                    state.selected = None;
-                }
+                this.close_redis_key();
                 cx.notify();
             }),
         );
@@ -3238,6 +3236,7 @@ mod tests {
     #[test]
     fn test_history_appends_from_every_window() {
         let folder = std::env::temp_dir().join(format!("vilo-history-{}", std::process::id()));
+        std::fs::remove_dir_all(&folder).ok();
         let path = folder.join("history.json");
         // Two windows, each holding an older copy, add their own commands to the same file.
         assert_eq!(append_history(&path, "GET a", 3).unwrap(), ["GET a"]);

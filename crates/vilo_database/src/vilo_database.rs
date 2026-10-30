@@ -350,7 +350,7 @@ pub struct DatabaseView {
     /// Searches the values of the open Redis key.
     value_search: Entity<Editor>,
     workbench_input: Entity<Editor>,
-    /// Workbench and CLI commands, oldest first, kept in database_redis_history.json.
+    /// Workbench read commands, oldest first, kept in database_redis_history.json.
     command_history: Vec<String>,
     /// Where Up/Down stands in `command_history` while browsing it.
     history_position: Option<usize>,
