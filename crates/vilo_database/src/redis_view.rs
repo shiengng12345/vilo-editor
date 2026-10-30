@@ -1003,6 +1003,14 @@ impl DatabaseView {
                         this.generation += 1;
                         this.session = Some(crate::Session::Redis(Arc::new(session)));
                         this.redis_write = None;
+                        // A run keeps its own session; anything not yet sent belongs to the old one.
+                        if this
+                            .bulk_delete
+                            .as_ref()
+                            .is_some_and(|form| form.closable())
+                        {
+                            this.bulk_delete = None;
+                        }
                         this.redis_state = Some(RedisState::new());
                         this.start_redis_stats(cx);
                         this.scan(true, cx);
@@ -3707,7 +3715,7 @@ impl DatabaseView {
                     .child(
                         Button::new("database-redis-bulk", "Bulk delete")
                             .start_icon(Icon::new(IconName::Trash).size(IconSize::Small))
-                            .disabled(!self.writes_allowed(connection))
+                            .disabled(!self.writes_allowed(connection) || state.switching_database())
                             .tooltip(Tooltip::text(if self.writes_allowed(connection) {
                                 "Preview the keys a pattern matches, then delete exactly those"
                             } else {

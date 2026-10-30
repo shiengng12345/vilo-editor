@@ -786,6 +786,14 @@ impl DatabaseView {
         self.tabs.clear();
         self.active_tab = None;
         self.redis_state = None;
+        // Its preview belongs to the session that is going; a run keeps its own session.
+        if self
+            .bulk_delete
+            .as_ref()
+            .is_some_and(redis_bulk::BulkForm::closable)
+        {
+            self.bulk_delete = None;
+        }
         self.tasks.clear();
     }
 

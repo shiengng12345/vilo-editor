@@ -26,6 +26,8 @@ use crate::{
 };
 
 pub(crate) struct BulkForm {
+    /// The session the dialog was opened for; a preview never applies to another one.
+    generation: u64,
     pattern: Entity<Editor>,
     /// A SCAN TYPE, or every type.
     kind: Option<&'static str>,
@@ -72,10 +74,18 @@ fn lock_key(connection: &str, database: u8) -> String {
 
 impl DatabaseView {
     pub(crate) fn open_bulk_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .redis_state
+            .as_ref()
+            .is_none_or(|state| state.switching_database())
+        {
+            return;
+        }
         let pattern = single_line("Pattern, e.g. session:*", "", false, window, cx);
         let typed_name = single_line("Type the connection name", "", false, window, cx);
         let typed_pattern = single_line("Type the pattern", "", false, window, cx);
         self.bulk_delete = Some(BulkForm {
+            generation: self.generation,
             pattern,
             kind: None,
             preview: None,
@@ -98,7 +108,7 @@ impl DatabaseView {
         let Some(form) = &mut self.bulk_delete else {
             return;
         };
-        if form.running() || form.run.is_some() {
+        if form.running() || form.run.is_some() || form.generation != generation {
             return;
         }
         let pattern = form.pattern.read(cx).text(cx).trim().to_string();
@@ -149,9 +159,18 @@ impl DatabaseView {
         let database = session.database();
         let clustered = session.is_clustered();
         let log_checked = self.write_log_checked;
+        let generation = self.generation;
         let Some(form) = &mut self.bulk_delete else {
             return;
         };
+        // The keys belong to the session they were found in; never send them to another one.
+        if form.generation != generation {
+            form.message = Some(
+                "The connection changed since this was opened. Close it and start again.".into(),
+            );
+            cx.notify();
+            return;
+        }
         if form.running() || form.run.is_some() {
             return;
         }
@@ -267,7 +286,9 @@ impl DatabaseView {
                     let session = session.clone();
                     let operation = operation.clone();
                     async move {
-                        mongo_write::audit(intent)?;
+                        if let Err(error) = mongo_write::audit(intent) {
+                            return anyhow::Ok(Err(format!("{error:#}")));
+                        }
                         let outcome = session.delete_batch(&batch).await;
                         let result = match &outcome {
                             Ok(_) => "ok",
@@ -277,10 +298,16 @@ impl DatabaseView {
                         let logged = mongo_write::audit(serde_json::json!({ "operation": operation, "phase": "result", "result": result }))
                             .err()
                             .map(|error| format!("{error:#}"));
-                        Ok((outcome, logged))
+                        Ok(Ok((outcome, logged)))
                     }
                 }));
-                let result = task.await;
+                let result = match task.await {
+                    Ok(Ok(done)) => Ok(done),
+                    // The intent could not be logged, so nothing was sent.
+                    Ok(Err(not_logged)) => Err(not_logged),
+                    // The task itself failed, possibly after sending.
+                    Err(error) => Ok((Err(WriteError::Unknown(format!("{error:#}"))), None)),
+                };
                 if let Ok((Err(WriteError::Unknown(message)), _)) = &result {
                     unknown = Some((operation.clone(), summary.clone(), message.clone()));
                 }
@@ -324,9 +351,9 @@ impl DatabaseView {
                         ));
                         break;
                     }
-                    Err(error) => {
+                    Err(not_logged) => {
                         ended = Some((
-                            format!("Batch {} was not sent: {error:#}. The rest were not sent either.", index + 1),
+                            format!("Batch {} was not sent: the write log could not record it ({not_logged}). The rest were not sent either.", index + 1),
                             Color::Error,
                         ));
                         break;
