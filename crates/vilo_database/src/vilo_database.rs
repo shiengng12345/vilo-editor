@@ -289,10 +289,7 @@ impl RedisFields {
             key_file: (!key.is_empty()).then(|| PathBuf::from(key)),
             known_hosts: None,
         };
-        anyhow::ensure!(
-            !settings.host.is_empty() && !settings.user.is_empty(),
-            "Fill in the SSH host and user."
-        );
+        anyhow::ensure!(!settings.host.is_empty(), "Fill in the SSH host.");
         Ok(settings)
     }
 
@@ -1180,7 +1177,7 @@ impl DatabaseView {
                         cx,
                     ),
                     ssh_user: editor(
-                        "User on the jump host",
+                        "User on the jump host; empty uses ~/.ssh/config",
                         &saved_ssh.map(|ssh| ssh.user.clone()).unwrap_or_default(),
                         false,
                         window,

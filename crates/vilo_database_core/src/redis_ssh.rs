@@ -31,12 +31,18 @@ pub struct SshSettings {
 }
 
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
+/// What is kept of the master's error output, the end of it, for saying why it failed.
+const LOG_BYTES: usize = 8 * 1024;
 
 pub struct SshTunnel {
     /// The options every ssh call for this tunnel shares, ending with the destination.
     arguments: Vec<String>,
     control: PathBuf,
     master: std::sync::Mutex<Option<Child>>,
+    /// The end of the master's error output. It is read all along, since a full pipe would
+    /// stop ssh, and every forward with it.
+    log: Arc<std::sync::Mutex<Vec<u8>>>,
+    _drain: tokio::task::JoinHandle<()>,
     /// Redis host and port to the local port forwarding to it.
     forwards: tokio::sync::Mutex<HashMap<(String, u16), u16>>,
 }
@@ -46,7 +52,6 @@ impl SshTunnel {
         let host = settings.host.trim();
         let user = settings.user.trim();
         anyhow::ensure!(!host.is_empty(), "Fill in the SSH host.");
-        anyhow::ensure!(!user.is_empty(), "Fill in the SSH user.");
         // ssh would read a leading `-` as an option, such as one that runs a command.
         for (what, value) in [("host", host), ("user", user)] {
             anyhow::ensure!(
@@ -72,9 +77,11 @@ impl SshTunnel {
             format!("ControlPath={}", control.display()),
             "-p".into(),
             settings.port.unwrap_or(22).to_string(),
-            "-l".into(),
-            user.to_string(),
         ];
+        // An empty user is left to ~/.ssh/config.
+        if !user.is_empty() {
+            arguments.extend(["-l".into(), user.to_string()]);
+        }
         if let Some(key) = &settings.key_file {
             arguments.extend(["-i".into(), key.display().to_string()]);
             arguments.extend(["-o".into(), "IdentitiesOnly=yes".into()]);
@@ -87,8 +94,17 @@ impl SshTunnel {
         }
         // Nothing after `--` is an option, whatever it looks like.
         arguments.extend(["--".into(), host.to_string()]);
-        let master = Command::new("ssh")
-            .args(["-M", "-N", "-o", "ControlPersist=no"])
+        let mut master = Command::new("ssh")
+            // The master stays this process, whatever ~/.ssh/config says, so closing the
+            // session ends it.
+            .args([
+                "-M",
+                "-N",
+                "-o",
+                "ControlPersist=no",
+                "-o",
+                "ForkAfterAuthentication=no",
+            ])
             .args(&arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -96,10 +112,33 @@ impl SshTunnel {
             .kill_on_drop(true)
             .spawn()
             .context("Could not start ssh")?;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stderr = master.stderr.take();
+        let drain = tokio::spawn({
+            let log = log.clone();
+            async move {
+                use tokio::io::AsyncReadExt as _;
+                let Some(mut stderr) = stderr else {
+                    return;
+                };
+                let mut chunk = [0_u8; 4096];
+                // Ends when ssh closes its side, that is when it exits.
+                while let Ok(read) = stderr.read(&mut chunk).await
+                    && read > 0
+                {
+                    let mut log = log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    log.extend_from_slice(chunk.get(..read).unwrap_or_default());
+                    let excess = log.len().saturating_sub(LOG_BYTES);
+                    log.drain(..excess);
+                }
+            }
+        });
         let tunnel = Arc::new(Self {
             arguments,
             control,
             master: std::sync::Mutex::new(Some(master)),
+            log,
+            _drain: drain,
             forwards: Default::default(),
         });
         tunnel.wait_ready().await?;
@@ -146,15 +185,14 @@ impl SshTunnel {
         }
     }
 
+    /// What ssh said before it exited; the drain is given a moment to take its last words.
     async fn master_error(&self) -> String {
-        let master = self.master().take();
-        let Some(master) = master else {
-            return String::new();
-        };
-        match master.wait_with_output().await {
-            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            Err(error) => error.to_string(),
-        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let log = self
+            .log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&log).trim().to_string()
     }
 
     /// The local address forwarding to `host:port` as the jump host sees it, set up on first use.
@@ -171,9 +209,15 @@ impl SshTunnel {
         let mut last = String::new();
         // A free port can be taken between finding it and ssh binding it; try another then.
         for _ in 0..3 {
-            let local = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?
-                .local_addr()?
-                .port();
+            let local = match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .and_then(|listener| listener.local_addr())
+            {
+                Ok(address) => address.port(),
+                Err(error) => {
+                    last = format!("no free local port ({error})");
+                    continue;
+                }
+            };
             let output = Command::new("ssh")
                 .args(["-O", "forward", "-L"])
                 .arg(format!("127.0.0.1:{local}:{target}:{port}"))
@@ -195,9 +239,10 @@ impl SshTunnel {
 impl Drop for SshTunnel {
     fn drop(&mut self) {
         if let Some(mut master) = self.master().take() {
-            // Closing the master ends every forward; the socket file goes with it.
+            // Closing the master ends every forward. It fails only when ssh already exited.
             master.start_kill().ok();
         }
+        // ssh removes its socket when it exits; this only covers a master killed before that.
         std::fs::remove_file(&self.control).ok();
     }
 }
@@ -409,6 +454,11 @@ mod tests {
             .err()
             .expect("an unknown key");
         assert!(format!("{error:#}").contains("SSH"), "{error:#}");
+        // ssh's own words, read from its drained output.
+        assert!(
+            format!("{error:#}").contains("Permission denied"),
+            "{error:#}"
+        );
         std::fs::remove_file(&other).ok();
         std::fs::remove_file(other.with_extension("pub")).ok();
     }
