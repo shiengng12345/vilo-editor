@@ -844,7 +844,20 @@ impl RedisSession {
                 )
                 .await
             {
-                Ok(reply) => report.items.extend(parse_slowlog(&node.label, reply)),
+                Ok(reply) => {
+                    let total = reply.array_len().unwrap_or(0);
+                    let entries = parse_slowlog(&node.label, reply);
+                    if entries.len() < total {
+                        report.failures.push((
+                            node.label.clone(),
+                            format!(
+                                "{} slow log entries could not be read",
+                                total - entries.len()
+                            ),
+                        ));
+                    }
+                    report.items.extend(entries);
+                }
                 Err(error) => report
                     .failures
                     .push((node.label.clone(), error.to_string())),
@@ -891,10 +904,13 @@ impl RedisSession {
         let mut report = NodeReport::default();
         for node in self.scan_nodes() {
             match self.node_call(&node, "CLIENT", vec!["LIST".into()]).await {
-                Ok(reply) => report.items.extend(parse_client_list(
-                    &node.label,
-                    &reply.as_string().unwrap_or_default(),
-                )),
+                Ok(reply) => match reply.as_string() {
+                    Some(text) => report.items.extend(parse_client_list(&node.label, &text)),
+                    None => report.failures.push((
+                        node.label.clone(),
+                        "CLIENT LIST did not answer with text".into(),
+                    )),
+                },
                 Err(error) => report
                     .failures
                     .push((node.label.clone(), error.to_string())),
@@ -1672,6 +1688,36 @@ broken line";
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(nodes.len(), 3, "one CLIENT LIST per primary");
         assert_eq!(session.slowlog_config().await.items.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_slowlog_skips_malformed_entries() {
+        let entry = |id: i64, args: Vec<Value>| {
+            Value::Array(vec![
+                Value::from(id),
+                Value::from(1_793_000_000_i64),
+                Value::from(1500_i64),
+                Value::Array(args),
+                Value::from("127.0.0.1:1"),
+                Value::from("worker"),
+            ])
+        };
+        let reply = Value::Array(vec![
+            entry(7, vec![Value::from("GET"), Value::from("k")]),
+            Value::Array(vec![Value::from("not an id")]),
+            entry(6, vec![Value::from("PING")]),
+        ]);
+        assert_eq!(reply.array_len(), Some(3));
+        let entries = parse_slowlog("n", reply);
+        assert_eq!(
+            entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            [7, 6]
+        );
+        assert_eq!(entries[0].args, vec![b"GET".to_vec(), b"k".to_vec()]);
+        assert_eq!(
+            (entries[0].client.as_str(), entries[0].client_name.as_str()),
+            ("127.0.0.1:1", "worker")
+        );
     }
 
     #[test]

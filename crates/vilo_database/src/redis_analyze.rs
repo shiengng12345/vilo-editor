@@ -48,8 +48,17 @@ pub(crate) struct AnalyzeState {
     client_sort: ClientSort,
 }
 
+struct NodeOutcome {
+    node: String,
+    result: Result<(), String>,
+    /// The operation and its summary when its result line could not be logged.
+    unlogged: Option<(String, String)>,
+}
+
 pub(crate) struct AdminWriteForm {
     write: Option<AdminWrite>,
+    /// Set once the write has been attempted; the form never sends twice.
+    sent: bool,
     threshold: Entity<Editor>,
     typed: Entity<Editor>,
     sending: bool,
@@ -167,7 +176,8 @@ impl DatabaseView {
                             analyze.config = Some(config);
                         }
                         Err(error) => {
-                            analyze.slowlog = Some(Fetch::Failed(format!("{error:#}").into()))
+                            analyze.slowlog = Some(Fetch::Failed(format!("{error:#}").into()));
+                            analyze.config = None;
                         }
                     }
                     cx.notify();
@@ -263,6 +273,7 @@ impl DatabaseView {
         );
         self.admin_write = Some(AdminWriteForm {
             write: reset.then_some(AdminWrite::SlowlogReset),
+            sent: false,
             threshold,
             typed: single_line("Type the connection name", "", false, window, cx),
             sending: false,
@@ -304,7 +315,8 @@ impl DatabaseView {
         let Some(write) = form.write.clone() else {
             return;
         };
-        if form.sending {
+        // One attempt per form: a second press could repeat a node that already applied it.
+        if form.sending || form.sent {
             return;
         }
         if mongo_write::guarded(&connection)
@@ -315,15 +327,16 @@ impl DatabaseView {
             return;
         }
         form.sending = true;
+        form.sent = true;
         form.message = Some("Sending…".into());
         form.results.clear();
         let task = run(cx, async move {
-            let mut results = Vec::new();
-            // One node at a time, each logged before it is sent; a node whose outcome is unknown
-            // stops the rest so nothing more is sent blind.
+            let mut outcomes = Vec::new();
+            // One node at a time, each logged before it is sent. A node whose intent cannot be
+            // logged, or whose outcome is unknown, stops the rest so nothing more is sent blind.
             for node in session.scan_nodes() {
                 let operation = uuid::Uuid::new_v4().simple().to_string();
-                mongo_write::audit(serde_json::json!({
+                let intent = serde_json::json!({
                     "time": chrono::Utc::now().to_rfc3339(),
                     "operation": operation,
                     "connection": connection.id,
@@ -333,7 +346,18 @@ impl DatabaseView {
                     "target": format!("node {}", node.label),
                     "kind": write.name(),
                     "phase": "intent",
-                }))?;
+                });
+                let summary = mongo_write::summarize_intent(&intent);
+                if let Err(error) = mongo_write::audit(intent) {
+                    outcomes.push(NodeOutcome {
+                        node: node.label.clone(),
+                        result: Err(format!(
+                            "not sent: the write log could not record it ({error:#})"
+                        )),
+                        unlogged: None,
+                    });
+                    break;
+                }
                 let outcome = session.admin_write(&node, &write).await;
                 let result = match &outcome {
                     Ok(()) => "ok",
@@ -344,44 +368,58 @@ impl DatabaseView {
                     serde_json::json!({ "operation": operation, "phase": "result", "result": result }),
                 );
                 let unknown = matches!(outcome, Err(WriteError::Unknown(_)));
-                results.push((
-                    node.label.clone(),
-                    match (outcome, logged) {
-                        (Ok(()), Ok(())) => Ok(()),
-                        (Ok(()), Err(error)) => {
-                            Err(format!("done, but the write log has no result: {error:#}"))
-                        }
-                        (Err(error), _) => Err(error.to_string()),
-                    },
-                ));
+                outcomes.push(NodeOutcome {
+                    node: node.label.clone(),
+                    result: outcome.map_err(|error| error.to_string()),
+                    unlogged: logged.err().map(|error| {
+                        (
+                            operation,
+                            format!("{summary} · its result is not in the log: {error:#}"),
+                        )
+                    }),
+                });
                 if unknown {
                     break;
                 }
             }
-            Ok(results)
+            anyhow::Ok(outcomes)
         });
         form._task = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                // The per-node outcome is shown even if the page moved on; the slow log only
-                // reloads for the same session.
+                // Recorded even if the page moved on, like key writes.
+                if let Ok(outcomes) = &result {
+                    for outcome in outcomes {
+                        if let Some(entry) = outcome.unlogged.clone() {
+                            this.unlogged_writes.push(entry);
+                        }
+                    }
+                }
                 let same_session = this.generation == generation;
+                let nodes = this
+                    .redis()
+                    .map_or(0, |session| session.scan_nodes().len());
                 let Some(form) = &mut this.admin_write else {
+                    cx.notify();
                     return;
                 };
                 form.sending = false;
                 match result {
-                    Ok(results) => {
-                        let all_ok = results.iter().all(|(_, result)| result.is_ok());
-                        form.results = results;
+                    Ok(outcomes) => {
+                        let all_ok = outcomes.len() == nodes
+                            && outcomes.iter().all(|outcome| outcome.result.is_ok());
                         form.message = Some(
                             if all_ok {
                                 "Done on every node."
                             } else {
-                                "Not every node succeeded; see below."
+                                "Not every node was done; see below. Nodes not listed were not sent."
                             }
                             .into(),
                         );
+                        form.results = outcomes
+                            .into_iter()
+                            .map(|outcome| (outcome.node, outcome.result))
+                            .collect();
                         if all_ok && same_session {
                             this.load_slowlog(cx);
                         }
@@ -420,7 +458,7 @@ impl DatabaseView {
                 cx.notify();
             }
         };
-        let done = !form.results.is_empty();
+        let done = form.sent && !form.sending;
         v_flex()
             .id("database-admin-write")
             .gap_3()
@@ -617,6 +655,11 @@ impl DatabaseView {
                                 .bg(colors.element_background)
                                 .child(
                                     div()
+                                        .w(px(60.))
+                                        .child(Label::new("ID").size(LabelSize::Small)),
+                                )
+                                .child(
+                                    div()
                                         .w(px(150.))
                                         .child(Label::new("Time").size(LabelSize::Small)),
                                 )
@@ -644,6 +687,14 @@ impl DatabaseView {
                                 .gap_3()
                                 .border_t_1()
                                 .border_color(colors.border_variant)
+                                .child(
+                                    div().w(px(60.)).child(
+                                        Label::new(entry.id.to_string())
+                                            .size(LabelSize::Small)
+                                            .buffer_font(cx)
+                                            .color(Color::Muted),
+                                    ),
+                                )
                                 .child(
                                     div().w(px(150.)).child(
                                         Label::new(local_time(entry.time))
