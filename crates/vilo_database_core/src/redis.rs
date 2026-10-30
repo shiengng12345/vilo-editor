@@ -1634,6 +1634,12 @@ const LIST_REMOVE_AT: &str = "if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[
        and redis.acl_check_cmd('LREM', KEYS[1], 1, ARGV[3])) then return -2 end \
      redis.call('LSET', KEYS[1], ARGV[1], ARGV[3]) \
      return redis.call('LREM', KEYS[1], 1, ARGV[3])";
+/// ARGV: group, consumer, min idle, id. XCLAIM of an entry deleted from the stream drops it
+/// from the pending list yet answers nothing claimed (Redis 7), so a missing entry is refused
+/// (-3) before claiming; in this script an empty answer then really means nothing changed.
+const STREAM_CLAIM_GUARDED: &str = "if #redis.call('XRANGE', KEYS[1], ARGV[4], ARGV[4]) == 0 then return -3 end \
+     return #redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[2], ARGV[3], ARGV[4], 'JUSTID')";
+const ENTRY_GONE: i64 = -3;
 /// ARGV: the document as read, the new document.
 const JSON_SET_GUARDED: &str = "if redis.call('JSON.GET', KEYS[1]) ~= ARGV[1] then return 0 end \
      redis.call('JSON.SET', KEYS[1], '$', ARGV[2]) return 1";
@@ -2102,19 +2108,17 @@ impl RedisSession {
                 min_idle_ms,
                 id,
             } => {
-                self.client
-                    .custom(
-                        cmd!("XCLAIM"),
-                        vec![
-                            bytes_arg(key),
-                            Value::from(group.clone()),
-                            Value::from(consumer.clone()),
-                            Value::from(*min_idle_ms as i64),
-                            Value::from(id.clone()),
-                            "JUSTID".into(),
-                        ],
-                    )
-                    .await
+                self.eval(
+                    STREAM_CLAIM_GUARDED,
+                    key,
+                    vec![
+                        Value::from(group.clone()),
+                        Value::from(consumer.clone()),
+                        Value::from(*min_idle_ms as i64),
+                        Value::from(id.clone()),
+                    ],
+                )
+                .await
             }
             RedisWrite::JsonSet {
                 key,
@@ -2143,13 +2147,16 @@ impl RedisSession {
             other => other,
         })?;
         match (write, reply) {
-            // XADD answers the new id (nil when the stream is gone), XGROUP CREATE "OK", and
-            // XCLAIM the ids it claimed.
+            // XADD answers the new id (nil when the stream is gone) and XGROUP CREATE "OK".
             (RedisWrite::StreamAdd { .. } | RedisWrite::GroupCreate { .. }, reply) => {
                 Ok(!matches!(reply, Value::Null))
             }
-            (RedisWrite::StreamClaim { .. }, Value::Array(claimed)) => Ok(!claimed.is_empty()),
-            (RedisWrite::StreamClaim { .. }, _) => Ok(false),
+            (RedisWrite::StreamClaim { .. }, reply) if reply.as_i64() == Some(ENTRY_GONE) => {
+                Err(crate::mongo::WriteError::Refused(
+                    "The entry was deleted from the stream; acknowledge it to clear it from the pending list. Nothing was claimed."
+                        .into(),
+                ))
+            }
             (_, reply) => match reply.as_i64() {
                 Some(NOT_PERMITTED) => Err(crate::mongo::WriteError::Refused(
                     "This connection's ACL does not allow every step of this write; nothing was changed."
@@ -2543,6 +2550,65 @@ broken line";
             "not idle long enough: left with its consumer"
         );
         assert!(write(claim(0)).await.unwrap());
+        // On a stream of its own: an entry deleted from the stream is refused, and stays pending.
+        let other = b"vilo_test:stream_gone".to_vec();
+        session.call("DEL", vec![bytes_arg(&other)]).await.unwrap();
+        for command in [
+            vec![
+                "XADD".into(),
+                bytes_arg(&other),
+                "1-1".into(),
+                "f".into(),
+                "c".into(),
+            ],
+            vec![
+                "XGROUP".into(),
+                "CREATE".into(),
+                bytes_arg(&other),
+                "g".into(),
+                "0".into(),
+            ],
+            vec![
+                "XREADGROUP".into(),
+                "GROUP".into(),
+                "g".into(),
+                "c1".into(),
+                "STREAMS".into(),
+                bytes_arg(&other),
+                ">".into(),
+            ],
+            vec!["XDEL".into(), bytes_arg(&other), "1-1".into()],
+        ] {
+            let (name, args) = command.split_first().unwrap();
+            let name: &'static str = match name.as_string().unwrap().as_str() {
+                "XADD" => "XADD",
+                "XGROUP" => "XGROUP",
+                "XREADGROUP" => "XREADGROUP",
+                _ => "XDEL",
+            };
+            session.call(name, args.to_vec()).await.unwrap();
+        }
+        let gone = RedisWrite::StreamClaim {
+            key: other.clone(),
+            group: "g".into(),
+            consumer: "c2".into(),
+            min_idle_ms: 0,
+            id: "1-1".into(),
+        };
+        assert!(matches!(
+            write(gone).await,
+            Err(crate::mongo::WriteError::Refused(_))
+        ));
+        assert_eq!(
+            session
+                .stream_pending(&other, "g", 100)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a refused claim leaves the pending list alone"
+        );
+        session.call("DEL", vec![bytes_arg(&other)]).await.unwrap();
         let pending = session.stream_pending(&key, "g", 100).await.unwrap();
         assert_eq!((pending.len(), pending[0].consumer.as_str()), (1, "c2"));
 

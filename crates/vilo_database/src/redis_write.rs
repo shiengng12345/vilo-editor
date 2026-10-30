@@ -807,6 +807,17 @@ impl DatabaseView {
                     cx.notify();
                     return;
                 }
+                // The group's pending list may differ from what was shown; show it as it is.
+                let reload_group = matches!(result, Ok(Ok(false)))
+                    && matches!(
+                        planned,
+                        RedisWrite::StreamAck { .. }
+                            | RedisWrite::StreamClaim { .. }
+                            | RedisWrite::GroupDestroy { .. }
+                    );
+                if reload_group {
+                    this.reload_stream_group(cx);
+                }
                 let Some(form) = this
                     .redis_write
                     .as_mut()
