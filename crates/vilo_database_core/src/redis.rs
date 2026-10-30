@@ -336,6 +336,127 @@ pub fn split_command(line: &str) -> Result<Vec<Bytes>> {
 }
 
 /// Text for bytes in redis-cli's quoted style: printable ASCII as is, everything else escaped.
+/// One SLOWLOG entry, with the node it came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlowEntry {
+    pub node: String,
+    pub id: u64,
+    /// Unix seconds when the command ran.
+    pub time: i64,
+    pub micros: u64,
+    pub args: Vec<Bytes>,
+    pub client: String,
+    pub client_name: String,
+}
+
+/// Parses a `SLOWLOG GET` reply; entries of an unexpected shape are skipped.
+pub fn parse_slowlog(node: &str, reply: Value) -> Vec<SlowEntry> {
+    reply
+        .into_array()
+        .into_iter()
+        .filter_map(|entry| {
+            let mut fields = entry.into_array().into_iter();
+            let id = fields.next()?.as_u64()?;
+            let time = fields.next()?.as_i64()?;
+            let micros = fields.next()?.as_u64()?;
+            let args = fields
+                .next()?
+                .into_array()
+                .iter()
+                .map(value_bytes)
+                .collect();
+            let text = |value: Option<Value>| {
+                value
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_default()
+            };
+            Some(SlowEntry {
+                node: node.to_string(),
+                id,
+                time,
+                micros,
+                args,
+                client: text(fields.next()),
+                client_name: text(fields.next()),
+            })
+        })
+        .collect()
+}
+
+/// One connection from `CLIENT LIST`, fields in the server's order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientInfo {
+    pub node: String,
+    pub fields: Vec<(String, String)>,
+}
+
+impl ClientInfo {
+    pub fn get(&self, name: &str) -> &str {
+        self.fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .map_or("", |(_, value)| value.as_str())
+    }
+}
+
+/// Parses `CLIENT LIST`: one line per connection of `key=value` pairs.
+pub fn parse_client_list(node: &str, text: &str) -> Vec<ClientInfo> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| ClientInfo {
+            node: node.to_string(),
+            fields: line
+                .split(' ')
+                .filter_map(|pair| {
+                    let (key, value) = pair.split_once('=')?;
+                    Some((key.to_string(), value.to_string()))
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// What each node answered; a node that failed is reported, not dropped.
+#[derive(Debug, Clone)]
+pub struct NodeReport<T> {
+    pub items: Vec<T>,
+    pub failures: Vec<(String, String)>,
+}
+
+impl<T> Default for NodeReport<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+}
+
+/// Server administration writes; each runs on one node.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdminWrite {
+    SlowlogReset,
+    SlowlogThreshold { micros: i64 },
+}
+
+impl AdminWrite {
+    pub fn describe(&self) -> String {
+        match self {
+            AdminWrite::SlowlogReset => "SLOWLOG RESET   (clears the slow log)".into(),
+            AdminWrite::SlowlogThreshold { micros } => {
+                format!("CONFIG SET slowlog-log-slower-than {micros}")
+            }
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            AdminWrite::SlowlogReset => "SLOWLOG RESET",
+            AdminWrite::SlowlogThreshold { .. } => "CONFIG SET slowlog-log-slower-than",
+        }
+    }
+}
+
 /// One node of a cluster as `CLUSTER NODES` reports it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClusterNode {
@@ -692,6 +813,120 @@ impl RedisSession {
     }
 
     /// Keys in the current database of one node (`None` for the node the client is connected to).
+    /// Runs one command on one node (any node when not clustered).
+    async fn node_call(
+        &self,
+        node: &ScanNode,
+        name: &'static str,
+        args: Vec<Value>,
+    ) -> Result<Value, fred::error::Error> {
+        match &node.server {
+            Some(server) => {
+                self.client
+                    .with_cluster_node(server.clone())
+                    .custom(cmd!(name), args)
+                    .await
+            }
+            None => self.client.custom(cmd!(name), args).await,
+        }
+    }
+
+    /// The newest `count` (1–1024) slow commands of every primary, newest first.
+    pub async fn slowlog(&self, count: u32) -> NodeReport<SlowEntry> {
+        let count = count.clamp(1, 1024);
+        let mut report = NodeReport::default();
+        for node in self.scan_nodes() {
+            match self
+                .node_call(
+                    &node,
+                    "SLOWLOG",
+                    vec!["GET".into(), Value::from(i64::from(count))],
+                )
+                .await
+            {
+                Ok(reply) => report.items.extend(parse_slowlog(&node.label, reply)),
+                Err(error) => report
+                    .failures
+                    .push((node.label.clone(), error.to_string())),
+            }
+        }
+        report
+            .items
+            .sort_by(|a, b| b.time.cmp(&a.time).then(b.id.cmp(&a.id)));
+        report
+    }
+
+    /// `slowlog-log-slower-than` (µs) and `slowlog-max-len` of each primary.
+    pub async fn slowlog_config(&self) -> NodeReport<(String, Option<i64>, Option<i64>)> {
+        let mut report = NodeReport::default();
+        for node in self.scan_nodes() {
+            match self
+                .node_call(&node, "CONFIG", vec!["GET".into(), "slowlog-*".into()])
+                .await
+            {
+                Ok(reply) => {
+                    let pairs = pairs(reply);
+                    let read = |name: &str| {
+                        pairs
+                            .iter()
+                            .find(|(key, _)| key.as_string().as_deref() == Some(name))
+                            .and_then(|(_, value)| value.as_string()?.parse::<i64>().ok())
+                    };
+                    report.items.push((
+                        node.label.clone(),
+                        read("slowlog-log-slower-than"),
+                        read("slowlog-max-len"),
+                    ));
+                }
+                Err(error) => report
+                    .failures
+                    .push((node.label.clone(), error.to_string())),
+            }
+        }
+        report
+    }
+
+    /// Every connection of every primary.
+    pub async fn clients(&self) -> NodeReport<ClientInfo> {
+        let mut report = NodeReport::default();
+        for node in self.scan_nodes() {
+            match self.node_call(&node, "CLIENT", vec!["LIST".into()]).await {
+                Ok(reply) => report.items.extend(parse_client_list(
+                    &node.label,
+                    &reply.as_string().unwrap_or_default(),
+                )),
+                Err(error) => report
+                    .failures
+                    .push((node.label.clone(), error.to_string())),
+            }
+        }
+        report
+    }
+
+    /// Sends one administration write to one node, once.
+    pub async fn admin_write(
+        &self,
+        node: &ScanNode,
+        write: &AdminWrite,
+    ) -> Result<(), crate::mongo::WriteError> {
+        let reply = match write {
+            AdminWrite::SlowlogReset => self.node_call(node, "SLOWLOG", vec!["RESET".into()]).await,
+            AdminWrite::SlowlogThreshold { micros } => {
+                self.node_call(
+                    node,
+                    "CONFIG",
+                    vec![
+                        "SET".into(),
+                        "slowlog-log-slower-than".into(),
+                        Value::from(micros.to_string()),
+                    ],
+                )
+                .await
+            }
+        };
+        reply.map(|_| ()).map_err(classify_redis)
+    }
+
     pub async fn dbsize(&self, node: &ScanNode) -> Result<u64> {
         let reply: Value = match &node.server {
             Some(server) => {
@@ -1425,6 +1660,84 @@ broken line";
                 .is_err()
         );
         assert_eq!(session.database_count().await.unwrap_or(1), 1);
+        // Every primary answers SLOWLOG and CLIENT LIST, tagged with its node.
+        let slow = session.slowlog(5).await;
+        assert!(slow.failures.is_empty(), "{:?}", slow.failures);
+        let clients = session.clients().await;
+        assert!(clients.failures.is_empty());
+        let nodes = clients
+            .items
+            .iter()
+            .map(|client| client.node.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(nodes.len(), 3, "one CLIENT LIST per primary");
+        assert_eq!(session.slowlog_config().await.items.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_client_list() {
+        let text = "id=3 addr=127.0.0.1:52555 laddr=127.0.0.1:6379 fd=8 name=worker age=12 idle=0 flags=N db=2 cmd=client|list user=default\nid=4 addr=10.0.0.1:1 name= age=1 idle=9 flags=P db=0 cmd=subscribe user=app\n";
+        let clients = parse_client_list("server", text);
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].get("name"), "worker");
+        assert_eq!(clients[0].get("cmd"), "client|list");
+        assert_eq!(clients[1].get("name"), "");
+        assert_eq!(clients[1].get("missing"), "");
+        assert_eq!(clients[1].node, "server");
+    }
+
+    async fn slowlog_and_clients(url: &str) {
+        let session = RedisSession::connect(url).await.unwrap();
+        let node = session.scan_nodes().remove(0);
+        // Logs every command for the duration of the test, then restores the server's setting.
+        let before = session.slowlog_config().await;
+        assert!(before.failures.is_empty(), "{:?}", before.failures);
+        let threshold = before.items[0].1.unwrap();
+        session
+            .admin_write(&node, &AdminWrite::SlowlogReset)
+            .await
+            .unwrap();
+        session
+            .admin_write(&node, &AdminWrite::SlowlogThreshold { micros: 0 })
+            .await
+            .unwrap();
+        session
+            .call("GET", vec!["vilo_test:slow".into()])
+            .await
+            .unwrap();
+        let report = session.slowlog(10).await;
+        assert!(report.failures.is_empty());
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|entry| entry.args.first().map(Vec::as_slice) == Some(b"GET")),
+            "{:?}",
+            report.items
+        );
+        assert!(
+            report
+                .items
+                .windows(2)
+                .all(|pair| pair[0].time >= pair[1].time)
+        );
+        session
+            .admin_write(&node, &AdminWrite::SlowlogThreshold { micros: threshold })
+            .await
+            .unwrap();
+        assert_eq!(session.slowlog_config().await.items[0].1, Some(threshold));
+        session
+            .admin_write(&node, &AdminWrite::SlowlogReset)
+            .await
+            .unwrap();
+        let clients = session.clients().await;
+        assert!(clients.failures.is_empty());
+        assert!(
+            clients
+                .items
+                .iter()
+                .any(|client| client.get("cmd").starts_with("client"))
+        );
     }
 
     #[test]
@@ -1621,6 +1934,7 @@ broken line";
         let session = RedisSession::connect(&url).await.unwrap();
         writes_are_guarded(&session).await;
         databases_are_separate(&url).await;
+        slowlog_and_clients(&url).await;
         assert!(session.cluster_nodes().await.unwrap().is_none());
         assert!(
             session

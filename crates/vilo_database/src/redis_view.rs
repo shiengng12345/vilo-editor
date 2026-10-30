@@ -44,6 +44,7 @@ const KEY_TYPES: [(&str, &str); 8] = [
 pub(crate) enum RedisTab {
     Browse,
     Workbench,
+    Analyze,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -197,6 +198,7 @@ pub(crate) struct RedisState {
     /// The database being connected to while a switch is in progress.
     switching: Option<u8>,
     pub(crate) switch_error: Option<SharedString>,
+    pub(crate) analyze: crate::redis_analyze::AnalyzeState,
     /// A database number typed in when the menu cannot know how many there are.
     database_input: Option<Entity<editor::Editor>>,
 }
@@ -246,6 +248,7 @@ impl RedisState {
             keyspace_error: None,
             switching: None,
             switch_error: None,
+            analyze: Default::default(),
             database_input: None,
         }
     }
@@ -590,7 +593,7 @@ impl DatabaseView {
             return;
         };
         // A write must finish or be closed first; its result belongs to the database it was sent to.
-        let editing = self.redis_write.is_some();
+        let editing = self.redis_write.is_some() || self.admin_write.is_some();
         let Some(state) = self.redis_state() else {
             return;
         };
@@ -2396,9 +2399,13 @@ impl DatabaseView {
                 })
                 .when_some(target, |this, target| {
                     this.cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(state) = this.redis_state() {
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let analyze = this.redis_state().map(|state| {
                                 state.tab = target;
+                                state.analyze.tab()
+                            });
+                            if let (RedisTab::Analyze, Some(analyze)) = (target, analyze) {
+                                this.open_analyze_tab(analyze, window, cx);
                             }
                             cx.notify();
                         }))
@@ -2429,6 +2436,7 @@ impl DatabaseView {
         let body = match state.tab {
             RedisTab::Browse => self.render_browse(state, cx),
             RedisTab::Workbench => self.render_workbench(state, cx),
+            RedisTab::Analyze => self.render_analyze(&state.analyze, cx),
         };
         let cli_lines = Self::workbench_lines(state);
         v_flex()
@@ -2536,7 +2544,12 @@ impl DatabaseView {
                         Some(RedisTab::Workbench),
                         cx,
                     ))
-                    .child(tab("database-redis-tab-analyze", "Analyze", None, cx))
+                    .child(tab(
+                        "database-redis-tab-analyze",
+                        "Analyze",
+                        Some(RedisTab::Analyze),
+                        cx,
+                    ))
                     .child(tab("database-redis-tab-pubsub", "Pub/Sub", None, cx))
                     .child(div().flex_1())
                     .child(

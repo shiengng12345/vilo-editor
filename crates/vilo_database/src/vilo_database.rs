@@ -1,5 +1,6 @@
 mod mongo_tab;
 mod mongo_write;
+mod redis_analyze;
 mod redis_view;
 mod redis_write;
 
@@ -350,6 +351,7 @@ pub struct DatabaseView {
     redis_state: Option<RedisState>,
     doc_write: Option<mongo_write::DocWrite>,
     redis_write: Option<redis_write::RedisWriteForm>,
+    admin_write: Option<redis_analyze::AdminWriteForm>,
     /// Production connections with writes switched on for this run of Vilo only.
     session_writes: collections::HashSet<String>,
     /// Documents whose last write has an unknown outcome; writing to them waits for a refresh.
@@ -486,6 +488,7 @@ impl DatabaseView {
             redis_state: None,
             doc_write: None,
             redis_write: None,
+            admin_write: None,
             session_writes: Default::default(),
             unknown_writes: Default::default(),
             write_notice: None,
@@ -2018,6 +2021,8 @@ impl Render for DatabaseView {
         let naming = self.name_edit.is_some() || self.name_message.is_some();
         let dialog = if naming {
             Some((false, self.render_name_form(cx)))
+        } else if let Some(form) = &self.admin_write {
+            Some((false, self.render_admin_write(form, cx)))
         } else if let Some(form) = &self.redis_write {
             Some((false, self.render_redis_write(form, cx)))
         } else if let Some(write) = &self.doc_write {
@@ -2137,6 +2142,10 @@ impl Render for DatabaseView {
                             if this.name_edit.is_some() || this.name_message.is_some() {
                                 this.name_edit = None;
                                 this.name_message = None;
+                            } else if let Some(form) = &this.admin_write {
+                                if !form.sending_now() {
+                                    this.admin_write = None;
+                                }
                             } else if let Some(form) = &this.redis_write {
                                 if !form.sending_now() {
                                     this.redis_write = None;
