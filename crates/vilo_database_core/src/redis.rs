@@ -2553,23 +2553,22 @@ broken line";
         // On a stream of its own: an entry deleted from the stream is refused, and stays pending.
         let other = b"vilo_test:stream_gone".to_vec();
         session.call("DEL", vec![bytes_arg(&other)]).await.unwrap();
-        for command in [
+        let call = |name: &'static str, args: Vec<Value>| session.call(name, args);
+        call(
+            "XADD",
+            vec![bytes_arg(&other), "1-1".into(), "f".into(), "c".into()],
+        )
+        .await
+        .unwrap();
+        call(
+            "XGROUP",
+            vec!["CREATE".into(), bytes_arg(&other), "g".into(), "0".into()],
+        )
+        .await
+        .unwrap();
+        call(
+            "XREADGROUP",
             vec![
-                "XADD".into(),
-                bytes_arg(&other),
-                "1-1".into(),
-                "f".into(),
-                "c".into(),
-            ],
-            vec![
-                "XGROUP".into(),
-                "CREATE".into(),
-                bytes_arg(&other),
-                "g".into(),
-                "0".into(),
-            ],
-            vec![
-                "XREADGROUP".into(),
                 "GROUP".into(),
                 "g".into(),
                 "c1".into(),
@@ -2577,17 +2576,12 @@ broken line";
                 bytes_arg(&other),
                 ">".into(),
             ],
-            vec!["XDEL".into(), bytes_arg(&other), "1-1".into()],
-        ] {
-            let (name, args) = command.split_first().unwrap();
-            let name: &'static str = match name.as_string().unwrap().as_str() {
-                "XADD" => "XADD",
-                "XGROUP" => "XGROUP",
-                "XREADGROUP" => "XREADGROUP",
-                _ => "XDEL",
-            };
-            session.call(name, args.to_vec()).await.unwrap();
-        }
+        )
+        .await
+        .unwrap();
+        call("XDEL", vec![bytes_arg(&other), "1-1".into()])
+            .await
+            .unwrap();
         let gone = RedisWrite::StreamClaim {
             key: other.clone(),
             group: "g".into(),
