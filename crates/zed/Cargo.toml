@@ -223,6 +223,7 @@ urlencoding.workspace = true
 util.workspace = true
 uuid.workspace = true
 vilo_account.workspace = true
+vilo_database.workspace = true
 vilo_tools.workspace = true
 vim.workspace = true
 vim_mode_setting.workspace = true

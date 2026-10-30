@@ -20131,6 +20131,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "vilo_database"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "editor",
+ "gpui",
+ "gpui_tokio",
+ "log",
+ "paths",
+ "serde",
+ "serde_json",
+ "ui",
+ "util",
+ "uuid",
+ "vilo_database_core",
+ "workspace",
+]
+
+[[package]]
 name = "vilo_database_core"
 version = "0.1.0"
 dependencies = [
@@ -23159,6 +23179,7 @@ dependencies = [
  "util",
  "uuid",
  "vilo_account",
+ "vilo_database",
  "vilo_tools",
  "vim",
  "vim_mode_setting",

@@ -781,6 +781,7 @@ fn main() {
         onboarding::init(cx);
         vilo_account::init(cx);
         vilo_tools::init(cx);
+        vilo_database::init(cx);
         settings_ui::init(cx);
         keymap_editor::init(cx);
         extensions_ui::init(cx);
