@@ -327,6 +327,8 @@ enum RowKind {
     },
     /// Space between two cards.
     Gap,
+    /// Blank line inside a card's top and bottom border, so fields don't touch the frame.
+    Padding,
 }
 
 /// One line of the list view. Every row has the same height so the list can be virtual; a card is drawn
@@ -419,6 +421,13 @@ impl MongoTab {
                 });
             }
             let start = rows.len();
+            let padding = Row {
+                document: index,
+                kind: RowKind::Padding,
+                first: false,
+                last: false,
+            };
+            rows.push(padding.clone());
             let all = self.show_all.contains(&index);
             for (key, value) in document
                 .iter()
@@ -435,11 +444,10 @@ impl MongoTab {
                     last: false,
                 });
             }
-            if rows.len() > start {
-                rows[start].first = true;
-                let end = rows.len() - 1;
-                rows[end].last = true;
-            }
+            rows.push(padding);
+            rows[start].first = true;
+            let end = rows.len() - 1;
+            rows[end].last = true;
         }
         rows
     }
@@ -1464,6 +1472,12 @@ impl DatabaseView {
                         .when(row.last, |this| this.border_b_1().rounded_b_md());
                     // The card's expand toggle sits left of its first line, as in Compass.
                     // Compass shows it only while the pointer is on the document.
+                    let first_field = index
+                        .checked_sub(1)
+                        .and_then(|previous| rows.get(previous))
+                        .is_some_and(|previous| {
+                            previous.first && matches!(previous.kind, RowKind::Padding)
+                        });
                     card = card.child(
                         div()
                             .w(px(36.))
@@ -1471,7 +1485,7 @@ impl DatabaseView {
                             .flex()
                             .justify_center()
                             .visible_on_hover(group.clone())
-                            .when(row.first, |this| {
+                            .when(first_field, |this| {
                                 let opened = opened_documents.contains(&document);
                                 let keys = containers.get(document).cloned().unwrap_or_default();
                                 let view = view.clone();
@@ -1513,7 +1527,7 @@ impl DatabaseView {
                             }),
                     );
                     let content = match row.kind {
-                        RowKind::Gap => div().into_any_element(),
+                        RowKind::Gap | RowKind::Padding => div().into_any_element(),
                         RowKind::MoreFields { hidden } => {
                             let view = view.clone();
                             Button::new(
