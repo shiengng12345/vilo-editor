@@ -361,6 +361,7 @@ impl DatabaseView {
                             this.load_databases(cx);
                         } else {
                             this.redis_state = Some(RedisState::new());
+                            this.start_redis_stats(cx);
                             this.scan(true, cx);
                         }
                     }
@@ -932,7 +933,7 @@ impl DatabaseView {
                     if current_site.is_empty() {
                         "No site".to_string()
                     } else {
-                        current_site.clone()
+                        current_site
                     },
                 )
                 .style(ButtonStyle::Outlined)

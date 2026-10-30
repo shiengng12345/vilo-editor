@@ -1,44 +1,67 @@
-//! Redis, laid out like RedisInsight: Browser (keys as a list or a tree, key details by type), Workbench and Analysis.
+//! Redis, laid out like RedisInsight: a top bar with live server stats, Browse / Search / Workbench / Analyze /
+//! Pub/Sub tabs, keys as a tree or a list with type badges, TTL and size, key details by type, and a CLI bar.
+//! This release only reads; the write entry points are shown but switched off.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use collections::{HashMap, HashSet};
-use gpui::{ClipboardItem, Task, UniformListScrollHandle, prelude::*, uniform_list};
-use ui::{
-    Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, TintColor, Tooltip, prelude::*,
-};
+use gpui::{ClipboardItem, Hsla, Task, UniformListScrollHandle, prelude::*, rgb, uniform_list};
+use ui::{Button, ButtonStyle, ContextMenu, IconButton, PopoverMenu, Tooltip, prelude::*};
 use vilo_database_core::redis::{
     Bytes, KeyInfo, ScanNode, StreamEntry, format_reply, quote_bytes, split_command,
 };
 
 use crate::{Connection, DatabaseView, Fetch, fetched, render_lines, run};
 
-const SCAN_COUNT: u32 = 500;
+/// Keys asked for per SCAN call, and keys walked per "Scan more", as RedisInsight does.
+const SCAN_COUNT: u32 = 200;
+const SCAN_ROUND: u64 = 10_000;
+/// Keys whose type, TTL and size are fetched together.
+const META_BATCH: usize = 200;
 const PAGE: u32 = 200;
-const ROW_HEIGHT: f32 = 24.;
+const ROW_HEIGHT: f32 = 28.;
+const STATS_EVERY: Duration = Duration::from_secs(10);
 const KEY_TYPES: [(&str, &str); 8] = [
-    ("All key types", ""),
-    ("String", "string"),
+    ("All Key Types", ""),
     ("Hash", "hash"),
     ("List", "list"),
     ("Set", "set"),
     ("Sorted Set", "zset"),
-    ("Stream", "stream"),
+    ("String", "string"),
     ("JSON", "ReJSON-RL"),
+    ("Stream", "stream"),
 ];
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum RedisTab {
-    Browser,
+    Browse,
     Workbench,
-    Analysis,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
-    Text,
+    Unicode,
+    Ascii,
     Hex,
+    Binary,
     Json,
+}
+
+impl Format {
+    fn label(self) -> &'static str {
+        match self {
+            Format::Unicode => "Unicode",
+            Format::Ascii => "ASCII",
+            Format::Hex => "HEX",
+            Format::Binary => "Binary",
+            Format::Json => "JSON",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -51,14 +74,13 @@ enum KeyView {
 struct KeyMeta {
     kind: String,
     ttl_ms: i64,
-    memory: Option<u64>,
+    size: Option<u64>,
 }
 
 /// One node's walk: `None` once its cursor came back to 0.
 struct NodeScan {
     node: ScanNode,
     cursor: Option<String>,
-    scanned: u64,
 }
 
 enum Value {
@@ -92,9 +114,30 @@ struct Detail {
     key: Bytes,
     info: KeyInfo,
     length: Option<u64>,
-    memory: Option<u64>,
+    size: Option<u64>,
     value: Value,
 }
+
+/// What the right panel shows.
+enum RightPanel {
+    Empty,
+    Key,
+    Info,
+}
+
+#[derive(Clone, Default)]
+struct Stats {
+    cpu_percent: Option<f64>,
+    ops_per_second: Option<u64>,
+    memory: Option<String>,
+    keys: Option<u64>,
+    clients: Option<u64>,
+    /// The last CPU sample (seconds used, when), to turn totals into a percentage.
+    cpu_sample: Option<(f64, Instant)>,
+}
+
+/// The tree or list built for one set of keys, reused until the keys, view or opened folders change.
+type RowsKey = (usize, u64, String, bool);
 
 pub(crate) struct RedisState {
     tab: RedisTab,
@@ -102,56 +145,105 @@ pub(crate) struct RedisState {
     delimiter: String,
     kind_filter: &'static str,
     nodes: Vec<NodeScan>,
+    /// Keys walked so far, counted as RedisInsight does from each SCAN's COUNT: an estimate of the work done.
+    scanned: u64,
+    total: Option<u64>,
     keys: Vec<Bytes>,
     seen: HashSet<Bytes>,
     meta: HashMap<Bytes, KeyMeta>,
-    show_memory: bool,
     expanded: HashSet<Bytes>,
+    expanded_version: u64,
+    rows: RefCell<Option<(RowsKey, Arc<Vec<KeyRow>>)>>,
     scanning: bool,
     scan_error: Option<SharedString>,
+    last_refresh: Option<Instant>,
     selected: Option<Bytes>,
+    panel: RightPanel,
     detail: Option<Fetch<Detail>>,
     format: Format,
+    cli_open: bool,
     workbench: Vec<(String, Result<Vec<String>, String>)>,
     info: Option<Fetch<String>>,
+    stats: Stats,
     keys_scroll: UniformListScrollHandle,
     value_scroll: UniformListScrollHandle,
+    cli_scroll: UniformListScrollHandle,
     generation: u64,
+    _stats: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
 }
 
 impl RedisState {
     pub(crate) fn new() -> Self {
         Self {
-            tab: RedisTab::Browser,
+            tab: RedisTab::Browse,
             key_view: KeyView::Tree,
             delimiter: ":".into(),
             kind_filter: "",
             nodes: Vec::new(),
+            scanned: 0,
+            total: None,
             keys: Vec::new(),
             seen: HashSet::default(),
             meta: HashMap::default(),
-            show_memory: false,
             expanded: HashSet::default(),
+            expanded_version: 0,
+            rows: RefCell::new(None),
             scanning: false,
             scan_error: None,
+            last_refresh: None,
             selected: None,
+            panel: RightPanel::Empty,
             detail: None,
-            format: Format::Text,
+            format: Format::Unicode,
+            cli_open: false,
             workbench: Vec::new(),
             info: None,
+            stats: Stats::default(),
             keys_scroll: UniformListScrollHandle::new(),
             value_scroll: UniformListScrollHandle::new(),
+            cli_scroll: UniformListScrollHandle::new(),
             generation: 0,
+            _stats: None,
             _tasks: Vec::new(),
         }
     }
 
     fn keep(&mut self, task: Task<()>) {
         self._tasks.push(task);
-        if self._tasks.len() > 16 {
-            self._tasks.drain(..self._tasks.len() - 8);
+        if self._tasks.len() > 24 {
+            self._tasks.drain(..self._tasks.len() - 12);
         }
+    }
+
+    fn rows(&self) -> Arc<Vec<KeyRow>> {
+        let key = (
+            self.keys.len(),
+            self.expanded_version,
+            self.delimiter.clone(),
+            self.key_view == KeyView::Tree,
+        );
+        if let Some((cached, rows)) = self.rows.borrow().as_ref()
+            && *cached == key
+        {
+            return rows.clone();
+        }
+        let rows = Arc::new(match self.key_view {
+            KeyView::Tree => tree_rows(&self.keys, self.delimiter.as_bytes(), &self.expanded),
+            KeyView::List => {
+                let mut keys = self.keys.clone();
+                keys.sort();
+                keys.into_iter()
+                    .map(|key| KeyRow::Key {
+                        label: escape_bytes(&key),
+                        key,
+                        depth: 0,
+                    })
+                    .collect()
+            }
+        });
+        *self.rows.borrow_mut() = Some((key, rows.clone()));
+        rows
     }
 }
 
@@ -175,10 +267,11 @@ pub(crate) fn hex_bytes(bytes: &[u8]) -> String {
         .join(" ")
 }
 
+/// RedisInsight's TTL wording: "No limit", or the largest whole unit left.
 pub(crate) fn describe_ttl(ttl_ms: i64) -> String {
     match ttl_ms {
         -1 => "No limit".into(),
-        -2 => "Gone".into(),
+        -2 => "—".into(),
         ms if ms < 1000 => format!("{ms} ms"),
         ms if ms < 60_000 => format!("{} s", ms / 1000),
         ms if ms < 3_600_000 => format!("{} min", ms / 60_000),
@@ -190,38 +283,76 @@ pub(crate) fn describe_ttl(ttl_ms: i64) -> String {
 fn describe_size(bytes: u64) -> String {
     match bytes {
         0..1024 => format!("{bytes} B"),
-        1024..1_048_576 => format!("{:.1} KB", bytes as f64 / 1024.),
+        1024..1_048_576 => format!("{:.0} KB", bytes as f64 / 1024.),
         _ => format!("{:.1} MB", bytes as f64 / 1_048_576.),
     }
 }
 
-/// RedisInsight's type badges: a short name and a colour per type.
-fn type_badge(kind: &str) -> (&'static str, Color) {
-    match kind {
-        "string" => ("STRING", Color::Accent),
-        "hash" => ("HASH", Color::Info),
-        "list" => ("LIST", Color::Success),
-        "set" => ("SET", Color::Warning),
-        "zset" => ("ZSET", Color::Error),
-        "stream" => ("STREAM", Color::Modified),
-        "ReJSON-RL" => ("JSON", Color::Created),
-        "none" => ("GONE", Color::Disabled),
-        _ => ("…", Color::Muted),
+/// "36 300" → "36 K", as RedisInsight's header.
+fn short_number(number: u64) -> String {
+    match number {
+        0..1_000 => number.to_string(),
+        1_000..1_000_000 => format!("{} K", number / 1_000),
+        _ => format!("{:.1} M", number as f64 / 1_000_000.),
     }
 }
 
-/// A value shown in the chosen format; JSON pretty-prints only when the bytes are valid JSON.
+fn group_thousands(number: u64) -> String {
+    let digits = number.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// RedisInsight's filled type badges. Colours approximate its palette.
+fn type_badge(kind: &str) -> (&'static str, Hsla) {
+    let (label, color) = match kind {
+        "hash" => ("HASH", 0x364CFF),
+        "list" => ("LIST", 0x008556),
+        "set" => ("SET", 0x9C5C2B),
+        "zset" => ("SORTED SET", 0xA80A62),
+        "string" => ("STRING", 0x6A1DC3),
+        "ReJSON-RL" => ("JSON", 0x3F4B5F),
+        "stream" => ("STREAM", 0x6A741B),
+        "none" => ("GONE", 0x5C6370),
+        "" => ("…", 0x3B3F46),
+        _ => ("OTHER", 0x5C6370),
+    };
+    (label, rgb(color).into())
+}
+
+fn badge(kind: &str) -> impl IntoElement {
+    let (label, color) = type_badge(kind);
+    div().px_1p5().rounded_sm().bg(color).child(
+        Label::new(label)
+            .size(LabelSize::XSmall)
+            .weight(gpui::FontWeight::SEMIBOLD)
+            .color(Color::Custom(gpui::white())),
+    )
+}
+
+/// A value in the chosen format; JSON pretty-prints only when the bytes are valid JSON.
 fn formatted(bytes: &[u8], format: Format) -> String {
+    let text = || String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| escape_bytes(bytes));
     match format {
         Format::Hex => hex_bytes(bytes),
+        Format::Binary => bytes
+            .iter()
+            .map(|byte| format!("{byte:08b}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Format::Ascii => escape_bytes(bytes),
         Format::Json => std::str::from_utf8(bytes)
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
             .and_then(|value| serde_json::to_string_pretty(&value).ok())
-            .unwrap_or_else(|| {
-                String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| escape_bytes(bytes))
-            }),
-        Format::Text => String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| escape_bytes(bytes)),
+            .unwrap_or_else(text),
+        Format::Unicode => text(),
     }
 }
 
@@ -250,6 +381,7 @@ struct Folder {
 }
 
 /// Groups keys into folders by the delimiter, as RedisInsight's tree does; only opened folders list their content.
+/// Works on bytes, so a delimiter byte inside binary data splits exactly where Redis has it.
 fn tree_rows(keys: &[Bytes], delimiter: &[u8], expanded: &HashSet<Bytes>) -> Vec<KeyRow> {
     let mut root = Folder::default();
     for key in keys {
@@ -319,9 +451,88 @@ fn info_sections(info: &str) -> Vec<(String, Vec<(String, String)>)> {
     sections
 }
 
+fn info_value<'a>(info: &'a str, field: &str) -> Option<&'a str> {
+    info.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(field)
+            .and_then(|rest| rest.strip_prefix(':'))
+    })
+}
+
 impl DatabaseView {
     fn redis_state(&mut self) -> Option<&mut RedisState> {
         self.redis_state.as_mut()
+    }
+
+    /// Polls INFO and DBSIZE every few seconds while the Redis connection is open, for the top bar.
+    pub(crate) fn start_redis_stats(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.redis() else {
+            return;
+        };
+        let connection = self.generation;
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                let poll = {
+                    let session = session.clone();
+                    cx.update(|cx| {
+                        run(cx, async move {
+                            let info = session.info().await?;
+                            let mut keys = 0;
+                            for node in session.scan_nodes() {
+                                keys += session.dbsize(&node).await.unwrap_or(0);
+                            }
+                            Ok((info, keys))
+                        })
+                    })
+                };
+                let result = poll.await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        if this.generation != connection {
+                            return false;
+                        }
+                        let Some(state) = this.redis_state() else {
+                            return false;
+                        };
+                        if let Ok((info, keys)) = result {
+                            let stats = &mut state.stats;
+                            stats.ops_per_second = info_value(&info, "instantaneous_ops_per_sec")
+                                .and_then(|value| value.trim().parse().ok());
+                            stats.memory = info_value(&info, "used_memory_human")
+                                .map(|value| value.trim().to_string());
+                            stats.clients = info_value(&info, "connected_clients")
+                                .and_then(|value| value.trim().parse().ok());
+                            stats.keys = Some(keys);
+                            state.total = Some(keys);
+                            // CPU is the change in seconds used between two samples over the wall time between them.
+                            let used = ["used_cpu_sys", "used_cpu_user"]
+                                .iter()
+                                .filter_map(|field| {
+                                    info_value(&info, field)?.trim().parse::<f64>().ok()
+                                })
+                                .sum::<f64>();
+                            let now = Instant::now();
+                            if let Some((previous, at)) = stats.cpu_sample {
+                                let elapsed = now.duration_since(at).as_secs_f64();
+                                if elapsed > 0. && used >= previous {
+                                    stats.cpu_percent = Some(100. * (used - previous) / elapsed);
+                                }
+                            }
+                            stats.cpu_sample = Some((used, now));
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    return;
+                }
+                cx.background_executor().timer(STATS_EVERY).await;
+            }
+        });
+        if let Some(state) = self.redis_state() {
+            state._stats = Some(task);
+        }
     }
 
     pub(crate) fn scan(&mut self, restart: bool, cx: &mut Context<Self>) {
@@ -329,6 +540,7 @@ impl DatabaseView {
             return;
         };
         let pattern = self.pattern.read(cx).text(cx);
+        // A plain word finds keys containing it; a glob is used as typed.
         let pattern = if pattern.trim().is_empty() {
             "*".to_string()
         } else if pattern.contains(['*', '?', '[']) {
@@ -345,82 +557,137 @@ impl DatabaseView {
             state.keys.clear();
             state.seen.clear();
             state.meta.clear();
+            state.scanned = 0;
             state.nodes = session
                 .scan_nodes()
                 .into_iter()
                 .map(|node| NodeScan {
                     node,
                     cursor: Some("0".into()),
-                    scanned: 0,
                 })
                 .collect();
         }
-        // Walk nodes one at a time, the first that still has a cursor.
-        let Some(index) = state.nodes.iter().position(|node| node.cursor.is_some()) else {
+        if state.nodes.iter().all(|node| node.cursor.is_none()) {
             return;
-        };
-        let node = state.nodes[index].node.clone();
-        let cursor = state.nodes[index].cursor.clone().unwrap_or_default();
+        }
+        let nodes = state
+            .nodes
+            .iter()
+            .map(|node| (node.node.clone(), node.cursor.clone()))
+            .collect::<Vec<_>>();
         let kind = (!state.kind_filter.is_empty()).then(|| state.kind_filter.to_string());
-        let show_memory = state.show_memory;
         state.scanning = true;
         state.scan_error = None;
         let generation = state.generation;
+        // One round walks up to SCAN_ROUND keys, node after node, as RedisInsight's "Scan more" does.
         let task = run(cx, async move {
-            let page = session
-                .scan(&node, &cursor, &pattern, SCAN_COUNT, kind.as_deref())
-                .await?;
-            let mut meta = Vec::new();
-            for key in &page.keys {
-                let info = session.key_info(key).await?;
-                let memory = if show_memory {
-                    session.memory_usage(key).await.ok().flatten()
-                } else {
-                    None
+            let mut cursors = nodes;
+            let mut found = Vec::new();
+            let mut walked = 0;
+            while walked < SCAN_ROUND {
+                let Some(index) = cursors.iter().position(|(_, cursor)| cursor.is_some()) else {
+                    break;
                 };
-                meta.push((
-                    key.clone(),
-                    KeyMeta {
-                        kind: info.kind,
-                        ttl_ms: info.ttl_ms,
-                        memory,
-                    },
-                ));
+                let cursor = cursors[index].1.clone().unwrap_or_default();
+                let page = session
+                    .scan(
+                        &cursors[index].0,
+                        &cursor,
+                        &pattern,
+                        SCAN_COUNT,
+                        kind.as_deref(),
+                    )
+                    .await?;
+                walked += u64::from(SCAN_COUNT);
+                found.extend(page.keys);
+                cursors[index].1 = (page.cursor != "0").then_some(page.cursor);
             }
-            Ok((page, meta))
+            Ok((found, cursors, walked))
         });
         state.keep(cx.spawn(async move |this, cx| {
             let result = task.await;
-            this.update(cx, |this, cx| {
-                if this.generation != connection {
-                    return;
-                }
-                let Some(state) = this.redis_state() else {
-                    return;
-                };
-                if state.generation != generation {
-                    return;
-                }
-                state.scanning = false;
-                match result {
-                    Ok((page, meta)) => {
-                        if let Some(node) = state.nodes.get_mut(index) {
-                            node.scanned += page.keys.len() as u64;
-                            node.cursor = (page.cursor != "0").then_some(page.cursor);
-                        }
-                        // SCAN may return a key again on a later page.
-                        for key in page.keys {
-                            if state.seen.insert(key.clone()) {
-                                state.keys.push(key);
+            let new_keys = this
+                .update(cx, |this, cx| {
+                    if this.generation != connection {
+                        return Vec::new();
+                    }
+                    let Some(state) = this.redis_state() else {
+                        return Vec::new();
+                    };
+                    if state.generation != generation {
+                        return Vec::new();
+                    }
+                    state.scanning = false;
+                    state.last_refresh = Some(Instant::now());
+                    let mut new_keys = Vec::new();
+                    match result {
+                        Ok((found, cursors, walked)) => {
+                            state.scanned += walked;
+                            for (node, (_, cursor)) in state.nodes.iter_mut().zip(cursors) {
+                                node.cursor = cursor;
+                            }
+                            // SCAN may return a key again on a later page.
+                            for key in found {
+                                if state.seen.insert(key.clone()) {
+                                    state.keys.push(key.clone());
+                                    new_keys.push(key);
+                                }
+                            }
+                            if state.nodes.iter().all(|node| node.cursor.is_none()) {
+                                // The walk is complete; the estimate gives way to the true total.
+                                state.scanned = state
+                                    .total
+                                    .unwrap_or(state.scanned)
+                                    .max(state.keys.len() as u64);
                             }
                         }
-                        state.meta.extend(meta);
+                        Err(error) => state.scan_error = Some(format!("{error:#}").into()),
                     }
-                    Err(error) => state.scan_error = Some(format!("{error:#}").into()),
+                    cx.notify();
+                    new_keys
+                })
+                .unwrap_or_default();
+            // Names show at once; type, TTL and size follow in batches.
+            for batch in new_keys.chunks(META_BATCH) {
+                let Ok(Some(session)) = this.update(cx, |this, _| this.redis()) else {
+                    return;
+                };
+                let keys = batch.to_vec();
+                let lookup = cx.update(|cx| {
+                    run(cx, async move {
+                        let meta = session.key_meta(&keys, true).await;
+                        Ok(keys.into_iter().zip(meta).collect::<Vec<_>>())
+                    })
+                });
+                let Ok(meta) = lookup.await else {
+                    return;
+                };
+                let still_current = this
+                    .update(cx, |this, cx| {
+                        let Some(state) = this.redis_state() else {
+                            return false;
+                        };
+                        if state.generation != generation {
+                            return false;
+                        }
+                        for (key, (info, size)) in meta {
+                            state.meta.insert(
+                                key,
+                                KeyMeta {
+                                    kind: info.kind,
+                                    ttl_ms: info.ttl_ms,
+                                    size,
+                                },
+                            );
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !still_current {
+                    return;
                 }
-                cx.notify();
-            })
-            .ok();
+            }
         }));
         cx.notify();
     }
@@ -434,13 +701,14 @@ impl DatabaseView {
             return;
         };
         state.selected = Some(key.clone());
+        state.panel = RightPanel::Key;
         state.detail = Some(Fetch::Loading);
         let task = run(cx, {
             let key = key.clone();
             async move {
                 let info = session.key_info(&key).await?;
                 let length = session.length(&key, &info.kind).await.ok().flatten();
-                let memory = session.memory_usage(&key).await.ok().flatten();
+                let size = session.memory_usage(&key).await.ok().flatten();
                 let value = match info.kind.as_str() {
                     "string" => Value::String(session.get_string(&key).await?),
                     "hash" => {
@@ -484,7 +752,7 @@ impl DatabaseView {
                     key,
                     info,
                     length,
-                    memory,
+                    size,
                     value,
                 })
             }
@@ -681,7 +949,7 @@ impl DatabaseView {
         cx.notify();
     }
 
-    fn load_info(&mut self, cx: &mut Context<Self>) {
+    fn show_info(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.redis() else {
             return;
         };
@@ -689,6 +957,7 @@ impl DatabaseView {
         let Some(state) = self.redis_state() else {
             return;
         };
+        state.panel = RightPanel::Info;
         state.info = Some(Fetch::Loading);
         let task = run(cx, async move { session.info().await });
         state.keep(cx.spawn(async move |this, cx| {
@@ -707,36 +976,29 @@ impl DatabaseView {
     }
 
     fn render_key_list(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
-        let rows: Arc<Vec<KeyRow>> = Arc::new(match state.key_view {
-            KeyView::Tree => tree_rows(&state.keys, state.delimiter.as_bytes(), &state.expanded),
-            KeyView::List => {
-                let mut keys = state.keys.clone();
-                keys.sort();
-                keys.into_iter()
-                    .map(|key| KeyRow::Key {
-                        label: escape_bytes(&key),
-                        key,
-                        depth: 0,
-                    })
-                    .collect()
-            }
-        });
+        let rows = state.rows();
         let meta = Arc::new(state.meta.clone());
         let selected = state.selected.clone();
         let view = cx.entity().downgrade();
-        let show_memory = state.show_memory;
         let colors = cx.theme().colors().clone();
-        uniform_list("database-redis-keys", rows.len(), move |range, _, cx| {
+        let loaded = state.keys.len().max(1);
+        uniform_list("database-redis-keys", rows.len(), move |range, _, _cx| {
             range
                 .filter_map(|index| rows.get(index).cloned().map(|row| (index, row)))
                 .map(|(index, row)| {
                     let view = view.clone();
+                    let zebra = if index % 2 == 1 {
+                        colors.element_background
+                    } else {
+                        colors.editor_background
+                    };
                     let base = h_flex()
                         .id(("database-redis-row", index))
                         .w_full()
                         .h(px(ROW_HEIGHT))
-                        .px_2()
+                        .px_3()
                         .gap_2()
+                        .bg(zebra)
                         .cursor_pointer()
                         .hover(|style| style.bg(colors.element_hover));
                     match row {
@@ -750,23 +1012,24 @@ impl DatabaseView {
                             .on_click(move |_, _, cx| {
                                 let prefix = prefix.clone();
                                 view.update(cx, |this, cx| {
-                                    if let Some(state) = this.redis_state()
-                                        && !state.expanded.remove(&prefix)
-                                    {
-                                        state.expanded.insert(prefix);
+                                    if let Some(state) = this.redis_state() {
+                                        if !state.expanded.remove(&prefix) {
+                                            state.expanded.insert(prefix);
+                                        }
+                                        state.expanded_version += 1;
                                     }
                                     cx.notify();
                                 })
                                 .ok();
                             })
-                            .child(div().w(px(depth as f32 * 16.)).flex_none())
+                            .child(div().w(px(depth as f32 * 18.)).flex_none())
                             .child(
                                 Icon::new(if open {
                                     IconName::ChevronDown
                                 } else {
                                     IconName::ChevronRight
                                 })
-                                .size(IconSize::XSmall)
+                                .size(IconSize::Small)
                                 .color(Color::Muted),
                             )
                             .child(
@@ -775,64 +1038,61 @@ impl DatabaseView {
                                     .color(Color::Muted),
                             )
                             .child(
-                                Label::new(label)
-                                    .size(LabelSize::Small)
-                                    .buffer_font(cx)
-                                    .single_line()
-                                    .truncate(),
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Label::new(label).single_line().truncate()),
                             )
-                            .child(div().flex_1())
+                            .child(div().w(px(64.)).flex_none().flex().justify_end().child(
+                                Label::new({
+                                    let share = count * 100 / loaded;
+                                    if share == 0 {
+                                        "<1%".to_string()
+                                    } else {
+                                        format!("{share}%")
+                                    }
+                                }),
+                            ))
                             .child(
-                                Label::new(format!("{count}"))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
+                                div()
+                                    .w(px(72.))
+                                    .flex_none()
+                                    .flex()
+                                    .justify_end()
+                                    .child(Label::new(count.to_string())),
                             )
                             .into_any_element(),
                         KeyRow::Key { key, label, depth } => {
                             let info = meta.get(&key).cloned().unwrap_or_default();
-                            let (badge, color) = type_badge(&info.kind);
                             let is_selected = selected.as_ref() == Some(&key);
                             base.when(is_selected, |this| this.bg(colors.element_selected))
                                 .on_click(move |_, _, cx| {
                                     let key = key.clone();
                                     view.update(cx, |this, cx| this.open_key(key, cx)).ok();
                                 })
-                                .child(div().w(px(depth as f32 * 16. + 14.)).flex_none())
+                                .child(div().w(px(depth as f32 * 18. + 4.)).flex_none())
+                                .child(div().w(px(92.)).flex_none().child(badge(&info.kind)))
                                 .child(
-                                    div().w(px(56.)).flex_none().child(
-                                        Label::new(badge)
-                                            .size(LabelSize::XSmall)
-                                            .weight(gpui::FontWeight::BOLD)
-                                            .color(color),
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(Label::new(label).single_line().truncate()),
+                                )
+                                .child(div().w(px(64.)).flex_none().flex().justify_end().child(
+                                    Label::new(if info.kind.is_empty() {
+                                        String::new()
+                                    } else {
+                                        describe_ttl(info.ttl_ms)
+                                    }),
+                                ))
+                                .child(
+                                    div().w(px(72.)).flex_none().flex().justify_end().child(
+                                        Label::new(
+                                            info.size.map(describe_size).unwrap_or_default(),
+                                        )
+                                        .size(LabelSize::Small),
                                     ),
                                 )
-                                .child(
-                                    div().flex_1().min_w_0().child(
-                                        Label::new(label)
-                                            .size(LabelSize::Small)
-                                            .buffer_font(cx)
-                                            .single_line()
-                                            .truncate(),
-                                    ),
-                                )
-                                .child(
-                                    div().w(px(64.)).flex_none().child(
-                                        Label::new(describe_ttl(info.ttl_ms))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    ),
-                                )
-                                .when(show_memory, |this| {
-                                    this.child(
-                                        div().w(px(64.)).flex_none().child(
-                                            Label::new(
-                                                info.memory.map(describe_size).unwrap_or_default(),
-                                            )
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                        ),
-                                    )
-                                })
                                 .into_any_element()
                         }
                     }
@@ -863,12 +1123,12 @@ impl DatabaseView {
             Value::String(Some(bytes)) => push_block(String::new(), show(bytes)),
             Value::Hash { fields, .. } => {
                 for (field, value) in fields {
-                    push_block(format!("{} → ", escape_bytes(field)), show(value));
+                    push_block(format!("{:<28} ", escape_bytes(field)), show(value));
                 }
             }
             Value::List { items, .. } => {
                 for (index, item) in items.iter().enumerate() {
-                    push_block(format!("{index:>5}  "), show(item));
+                    push_block(format!("{index:<8} "), show(item));
                 }
             }
             Value::Set { members, .. } => {
@@ -878,14 +1138,14 @@ impl DatabaseView {
             }
             Value::SortedSet { members, .. } => {
                 for (member, score) in members {
-                    push_block(format!("{score:>12}  "), show(member));
+                    push_block(format!("{score:<16} "), show(member));
                 }
             }
             Value::Stream { entries, .. } => {
                 for entry in entries {
                     push_block(String::new(), entry.id.clone());
                     for (field, value) in &entry.fields {
-                        push_block(format!("    {} → ", escape_bytes(field)), show(value));
+                        push_block(format!("    {:<24} ", escape_bytes(field)), show(value));
                     }
                 }
             }
@@ -896,7 +1156,7 @@ impl DatabaseView {
             Value::Other => push_block(
                 String::new(),
                 format!(
-                    "Vilo has no viewer for {} keys yet; use the Workbench.",
+                    "Vilo has no viewer for {} keys yet; use the CLI.",
                     detail.info.kind
                 ),
             ),
@@ -906,17 +1166,101 @@ impl DatabaseView {
 
     fn render_detail(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let detail = match &state.detail {
-            None => {
+        let close = IconButton::new("database-redis-close-detail", IconName::Close).on_click(
+            cx.listener(|this, _, _, cx| {
+                if let Some(state) = this.redis_state() {
+                    state.panel = RightPanel::Empty;
+                    state.selected = None;
+                }
+                cx.notify();
+            }),
+        );
+        match state.panel {
+            RightPanel::Empty => {
                 return v_flex()
                     .size_full()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .child(Label::new("Select the key from the list on the left to see the details of the key.").color(Color::Muted))
+                    .child(h_flex().justify_end().child(close))
+                    .child(
+                        v_flex().flex_1().items_center().justify_center().child(
+                            Label::new("Select the key from the list on the left to see the details of the key.").color(Color::Muted),
+                        ),
+                    )
                     .into_any_element();
             }
-            Some(Fetch::Loading) => {
+            RightPanel::Info => {
+                let body = match &state.info {
+                    None | Some(Fetch::Loading) => Label::new("Loading…")
+                        .color(Color::Muted)
+                        .into_any_element(),
+                    Some(Fetch::Failed(message)) => Label::new(message.clone())
+                        .color(Color::Error)
+                        .into_any_element(),
+                    Some(Fetch::Loaded(info)) => {
+                        let mut sections = v_flex().gap_3();
+                        for (title, entries) in info_sections(info) {
+                            let mut table = v_flex()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(colors.border)
+                                .child(
+                                    div().px_3().py_1().bg(colors.element_background).child(
+                                        Label::new(title)
+                                            .size(LabelSize::Small)
+                                            .weight(gpui::FontWeight::SEMIBOLD),
+                                    ),
+                                );
+                            for (key, value) in entries {
+                                table = table.child(
+                                    h_flex()
+                                        .px_3()
+                                        .py_0p5()
+                                        .gap_3()
+                                        .border_t_1()
+                                        .border_color(colors.border_variant)
+                                        .child(
+                                            div().w(px(240.)).flex_none().child(
+                                                Label::new(key)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            ),
+                                        )
+                                        .child(
+                                            div().flex_1().min_w_0().child(
+                                                Label::new(value)
+                                                    .size(LabelSize::Small)
+                                                    .buffer_font(cx),
+                                            ),
+                                        ),
+                                );
+                            }
+                            sections = sections.child(table);
+                        }
+                        sections.into_any_element()
+                    }
+                };
+                return v_flex()
+                    .size_full()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .child(Headline::new("Database information").size(HeadlineSize::Small))
+                            .child(div().flex_1())
+                            .child(close),
+                    )
+                    .child(
+                        v_flex()
+                            .id("database-redis-info")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(body),
+                    )
+                    .into_any_element();
+            }
+            RightPanel::Key => {}
+        }
+        let detail = match &state.detail {
+            None | Some(Fetch::Loading) => {
                 return Label::new("Loading…")
                     .color(Color::Muted)
                     .into_any_element();
@@ -928,65 +1272,79 @@ impl DatabaseView {
             }
             Some(Fetch::Loaded(detail)) => detail,
         };
-        let (badge, color) = type_badge(&detail.info.kind);
         let more = match &detail.value {
             Value::Hash { cursor, .. } | Value::Set { cursor, .. } => cursor.is_some(),
             Value::List { next, .. } | Value::SortedSet { next, .. } => next.is_some(),
             Value::Stream { more, .. } => *more,
             _ => false,
         };
-        let loaded = match &detail.value {
-            Value::Hash { fields, .. } => Some(fields.len()),
-            Value::List { items, .. } => Some(items.len()),
-            Value::Set { members, .. } => Some(members.len()),
-            Value::SortedSet { members, .. } => Some(members.len()),
-            Value::Stream { entries, .. } => Some(entries.len()),
+        let header = match &detail.value {
+            Value::Hash { .. } => Some(("Field", "Value")),
+            Value::List { .. } => Some(("Index", "Element")),
+            Value::Set { .. } => Some(("Member", "")),
+            Value::SortedSet { .. } => Some(("Score", "Member")),
+            Value::Stream { .. } => Some(("Entry ID", "Fields")),
             _ => None,
         };
-        let format_button =
-            |id: &'static str, label: &'static str, format: Format, cx: &mut Context<Self>| {
-                Button::new(id, label)
+        let view = cx.entity().downgrade();
+        let current_format = state.format;
+        let formats = PopoverMenu::new("database-redis-format")
+            .trigger(
+                Button::new("database-redis-format-button", current_format.label())
                     .label_size(LabelSize::Small)
-                    .style(if state.format == format {
-                        ButtonStyle::Filled
-                    } else {
-                        ButtonStyle::Subtle
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(state) = this.redis_state() {
-                            state.format = format;
-                        }
-                        cx.notify();
-                    }))
-            };
-        let key_text = escape_bytes(&detail.key);
+                    .style(ButtonStyle::Outlined)
+                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+            )
+            .menu(move |window, cx| {
+                let view = view.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for format in [
+                        Format::Unicode,
+                        Format::Ascii,
+                        Format::Binary,
+                        Format::Hex,
+                        Format::Json,
+                    ] {
+                        let view = view.clone();
+                        menu = menu.entry(format.label(), None, move |_, cx| {
+                            view.update(cx, |this, cx| {
+                                if let Some(state) = this.redis_state() {
+                                    state.format = format;
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        });
+                    }
+                    for unavailable in [
+                        "Msgpack",
+                        "PHP serialized",
+                        "Java serialized",
+                        "Pickle",
+                        "Vector 32-bit",
+                        "Vector 64-bit",
+                    ] {
+                        menu = menu.label(format!("{unavailable} (not in Vilo yet)"));
+                    }
+                    menu
+                }))
+            });
         let copy_key = quote_bytes(&detail.key);
         let groups = match &detail.value {
             Value::Stream { groups, .. } if !groups.is_empty() => Some(groups.clone()),
             _ => None,
         };
+        let key = detail.key.clone();
         v_flex()
             .size_full()
-            .gap_2()
+            .gap_3()
             .child(
                 h_flex()
                     .gap_2()
+                    .child(badge(&detail.info.kind))
                     .child(
-                        div()
-                            .px_1p5()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(colors.border)
-                            .child(
-                                Label::new(badge)
-                                    .size(LabelSize::XSmall)
-                                    .weight(gpui::FontWeight::BOLD)
-                                    .color(color),
-                            ),
-                    )
-                    .child(
-                        Label::new(key_text)
-                            .buffer_font(cx)
+                        Label::new(escape_bytes(&detail.key))
+                            .size(LabelSize::Large)
                             .weight(gpui::FontWeight::SEMIBOLD)
                             .single_line()
                             .truncate(),
@@ -1004,20 +1362,22 @@ impl DatabaseView {
                         IconButton::new("database-redis-reload-key", IconName::RotateCw)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Refresh"))
-                            .on_click({
-                                let key = detail.key.clone();
-                                cx.listener(move |this, _, _, cx| this.open_key(key.clone(), cx))
-                            }),
-                    ),
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.open_key(key.clone(), cx)),
+                            ),
+                    )
+                    .child(close),
             )
             .child(
                 h_flex()
                     .gap_4()
-                    .child(
-                        Label::new(format!("TTL: {}", describe_ttl(detail.info.ttl_ms)))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
+                    .when_some(detail.size, |this, size| {
+                        this.child(
+                            Label::new(format!("Key Size: {}", describe_size(size)))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
                     .when_some(detail.length, |this, length| {
                         this.child(
                             Label::new(format!("Length: {length}"))
@@ -1025,43 +1385,17 @@ impl DatabaseView {
                                 .color(Color::Muted),
                         )
                     })
-                    .when_some(detail.memory, |this, memory| {
-                        this.child(
-                            Label::new(format!("Key Size: {}", describe_size(memory)))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                    })
-                    .when_some(loaded, |this, loaded| {
-                        this.child(
-                            Label::new(format!("Loaded: {loaded}"))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                    })
+                    .child(
+                        Label::new(format!("TTL: {}", describe_ttl(detail.info.ttl_ms)))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                     .child(div().flex_1())
-                    .child(format_button(
-                        "database-redis-format-text",
-                        "Unicode",
-                        Format::Text,
-                        cx,
-                    ))
-                    .child(format_button(
-                        "database-redis-format-json",
-                        "JSON",
-                        Format::Json,
-                        cx,
-                    ))
-                    .child(format_button(
-                        "database-redis-format-hex",
-                        "HEX",
-                        Format::Hex,
-                        cx,
-                    )),
+                    .child(formats),
             )
             .when_some(groups, |this, groups| {
                 this.child(
-                    Label::new("Consumer groups")
+                    Label::new("Consumer Groups")
                         .size(LabelSize::Small)
                         .weight(gpui::FontWeight::SEMIBOLD),
                 )
@@ -1071,11 +1405,32 @@ impl DatabaseView {
                             .into_iter()
                             .map(|(name, value)| format!("{name}: {value}"))
                             .collect::<Vec<_>>()
-                            .join(" · "),
+                            .join("  ·  "),
                     )
                     .size(LabelSize::Small)
                     .buffer_font(cx)
                 }))
+            })
+            .when_some(header, |this, (left, right)| {
+                this.child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .bg(colors.element_background)
+                        .rounded_sm()
+                        .child(
+                            div().w(px(220.)).flex_none().child(
+                                Label::new(left)
+                                    .size(LabelSize::Small)
+                                    .weight(gpui::FontWeight::SEMIBOLD),
+                            ),
+                        )
+                        .child(
+                            Label::new(right)
+                                .size(LabelSize::Small)
+                                .weight(gpui::FontWeight::SEMIBOLD),
+                        ),
+                )
             })
             .child(render_lines(
                 "database-redis-value",
@@ -1095,17 +1450,16 @@ impl DatabaseView {
             .into_any_element()
     }
 
-    fn render_browser(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
+    fn render_browse(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let view = cx.entity().downgrade();
         let kind_label = KEY_TYPES
             .iter()
             .find(|(_, kind)| *kind == state.kind_filter)
-            .map_or("All key types", |(label, _)| label);
+            .map_or("All Key Types", |(label, _)| label);
         let types = PopoverMenu::new("database-redis-types")
             .trigger(
                 Button::new("database-redis-types-button", kind_label)
-                    .label_size(LabelSize::Small)
                     .style(ButtonStyle::Outlined)
                     .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
             )
@@ -1127,15 +1481,15 @@ impl DatabaseView {
                     menu
                 }))
             });
-        let delimiter_view = cx.entity().downgrade();
-        let delimiter = PopoverMenu::new("database-redis-delimiter")
+        let settings_view = cx.entity().downgrade();
+        let settings = PopoverMenu::new("database-redis-settings")
             .trigger(
-                IconButton::new("database-redis-delimiter-button", IconName::Settings)
+                IconButton::new("database-redis-settings-button", IconName::Settings)
                     .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Tree view delimiter and columns")),
+                    .tooltip(Tooltip::text("Delimiter")),
             )
             .menu(move |window, cx| {
-                let view = delimiter_view.clone();
+                let view = settings_view.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     menu = menu.header("Delimiter");
                     for delimiter in [":", "/", ".", "-", "_"] {
@@ -1145,23 +1499,14 @@ impl DatabaseView {
                                 if let Some(state) = this.redis_state() {
                                     state.delimiter = delimiter.to_string();
                                     state.expanded.clear();
+                                    state.expanded_version += 1;
                                 }
                                 cx.notify();
                             })
                             .ok();
                         });
                     }
-                    let view = view.clone();
-                    menu.separator()
-                        .entry("Show key size (MEMORY USAGE)", None, move |_, cx| {
-                            view.update(cx, |this, cx| {
-                                if let Some(state) = this.redis_state() {
-                                    state.show_memory = !state.show_memory;
-                                }
-                                this.scan(true, cx);
-                            })
-                            .ok();
-                        })
+                    menu
                 }))
             });
         let view_icon = |id: &'static str,
@@ -1184,11 +1529,20 @@ impl DatabaseView {
                     cx.notify();
                 }))
         };
-        let scanned: u64 = state.nodes.iter().map(|node| node.scanned).sum();
         let done = state.nodes.iter().all(|node| node.cursor.is_none());
-        let coverage = if state.nodes.len() > 1 {
+        let total = state
+            .total
+            .map(group_thousands)
+            .unwrap_or_else(|| "…".into());
+        let last_refresh = match state.last_refresh.map(|at| at.elapsed().as_secs()) {
+            None => String::new(),
+            Some(0..60) => "now".into(),
+            Some(seconds) if seconds < 3600 => format!("{} min", seconds / 60),
+            Some(seconds) => format!("{} h", seconds / 3600),
+        };
+        let coverage = (state.nodes.len() > 1).then(|| {
             format!(
-                " · {} of {} nodes fully scanned",
+                "{} of {} nodes fully scanned",
                 state
                     .nodes
                     .iter()
@@ -1196,110 +1550,103 @@ impl DatabaseView {
                     .count(),
                 state.nodes.len()
             )
-        } else {
-            String::new()
-        };
-        h_flex()
+        });
+        v_flex()
             .size_full()
-            .gap_0()
+            .p_3()
+            .gap_3()
             .child(
-                v_flex()
-                    .w(px(520.))
-                    .flex_none()
-                    .h_full()
-                    .border_r_1()
-                    .border_color(colors.border)
+                h_flex()
+                    .gap_2()
                     .child(
                         h_flex()
-                            .p_2()
-                            .gap_2()
-                            .child(types)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| {
-                                        this.scan(true, cx)
-                                    }))
-                                    .child(crate::boxed(self.pattern.clone(), cx)),
-                            )
-                            .child(
-                                IconButton::new("database-redis-scan", IconName::MagnifyingGlass)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Search"))
-                                    .on_click(cx.listener(|this, _, _, cx| this.scan(true, cx))),
-                            )
-                            .child(delimiter)
-                            .child(view_icon(
-                                "database-redis-list",
-                                IconName::Menu,
-                                "List view",
-                                KeyView::List,
-                                cx,
-                            ))
-                            .child(view_icon(
-                                "database-redis-tree",
-                                IconName::ListTree,
-                                "Tree view",
-                                KeyView::Tree,
-                                cx,
-                            )),
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .child(IconButton::new("database-redis-filter-mode", IconName::Filter).style(ButtonStyle::Filled).tooltip(Tooltip::text("Filter by key name or pattern")))
+                            .child(IconButton::new("database-redis-search-mode", IconName::MagnifyingGlass).disabled(true).tooltip(Tooltip::text("Full-text search (RediSearch) is not in Vilo yet"))),
                     )
+                    .child(types)
                     .child(
                         h_flex()
+                            .flex_1()
+                            .min_w_0()
                             .px_2()
-                            .pb_1()
+                            .py_1()
                             .gap_2()
-                            .child(
-                                Label::new(format!(
-                                    "Results: {} · Scanned {scanned}{coverage}{}",
-                                    state.keys.len(),
-                                    if done { " · all scanned" } else { "" }
-                                ))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                            )
-                            .child(div().flex_1())
-                            .when(!done, |this| {
-                                this.child(
-                                    Button::new(
-                                        "database-redis-scan-more",
-                                        if state.scanning {
-                                            "Scanning…"
-                                        } else {
-                                            "Scan more"
-                                        },
-                                    )
-                                    .label_size(LabelSize::Small)
-                                    .style(ButtonStyle::Outlined)
-                                    .disabled(state.scanning)
-                                    .on_click(cx.listener(|this, _, _, cx| this.scan(false, cx))),
-                                )
-                            }),
-                    )
-                    .when_some(state.scan_error.clone(), |this, message| {
-                        this.child(
-                            div().px_2().child(
-                                Label::new(message)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Error),
-                            ),
-                        )
-                    })
-                    .child(self.render_key_list(state, cx)),
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.editor_background)
+                            .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.scan(true, cx)))
+                            .child(div().flex_1().min_w_0().child(self.pattern.clone()))
+                            .child(IconButton::new("database-redis-search", IconName::MagnifyingGlass).icon_size(IconSize::Small).on_click(cx.listener(|this, _, _, cx| this.scan(true, cx)))),
+                    ),
             )
             .child(
-                v_flex()
+                h_flex()
                     .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .p_3()
-                    .child(self.render_detail(state, cx)),
+                    .min_h_0()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .child(
+                                h_flex()
+                                    .px_3()
+                                    .py_1p5()
+                                    .gap_3()
+                                    .border_b_1()
+                                    .border_color(colors.border)
+                                    .child(Label::new(format!("Results: {}. Scanned {} / {total}", group_thousands(state.keys.len() as u64), group_thousands(state.scanned))).size(LabelSize::Small))
+                                    .when(!done, |this| {
+                                        this.child(
+                                            Button::new("database-redis-scan-more", if state.scanning { "Scanning…" } else { "Scan more" })
+                                                .label_size(LabelSize::Small)
+                                                .color(Color::Accent)
+                                                .disabled(state.scanning)
+                                                .tooltip(Tooltip::text("SCAN walks keys in rounds of 10 000; results may repeat and are not a snapshot"))
+                                                .on_click(cx.listener(|this, _, _, cx| this.scan(false, cx))),
+                                        )
+                                    })
+                                    .when_some(coverage, |this, coverage| this.child(Label::new(coverage).size(LabelSize::Small).color(Color::Muted)))
+                                    .child(settings)
+                                    .child(div().flex_1())
+                                    .child(Label::new(format!("Last refresh: {last_refresh}")).size(LabelSize::Small).color(Color::Muted))
+                                    .child(IconButton::new("database-redis-refresh", IconName::RotateCw).icon_size(IconSize::Small).tooltip(Tooltip::text("Refresh")).on_click(cx.listener(|this, _, _, cx| this.scan(true, cx))))
+                                    .child(
+                                        h_flex()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(colors.border)
+                                            .child(view_icon("database-redis-list", IconName::Menu, "List view", KeyView::List, cx))
+                                            .child(view_icon("database-redis-tree", IconName::ListTree, "Tree view", KeyView::Tree, cx)),
+                                    ),
+                            )
+                            .when_some(state.scan_error.clone(), |this, message| this.child(div().px_3().py_1().child(Label::new(message).size(LabelSize::Small).color(Color::Error))))
+                            .child(self.render_key_list(state, cx)),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .p_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .child(self.render_detail(state, cx)),
+                    ),
             )
             .into_any_element()
     }
 
-    fn render_workbench(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
+    fn workbench_lines(state: &RedisState) -> Vec<SharedString> {
         let mut lines = Vec::new();
         for (command, result) in &state.workbench {
             lines.push(SharedString::from(format!("> {command}")));
@@ -1311,84 +1658,48 @@ impl DatabaseView {
             }
             lines.push(SharedString::default());
         }
+        lines
+    }
+
+    fn render_command_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        h_flex()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .on_action(
+                cx.listener(|this, _: &menu::Confirm, window, cx| this.run_workbench(window, cx)),
+            )
+            .child(Label::new(">").buffer_font(cx).color(Color::Muted))
+            .child(div().flex_1().child(self.workbench_input.clone()))
+            .child(
+                Button::new("database-redis-run", "Run")
+                    .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                    .on_click(cx.listener(|this, _, window, cx| this.run_workbench(window, cx))),
+            )
+    }
+
+    fn render_workbench(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
+        let lines = Self::workbench_lines(state);
         v_flex()
             .size_full()
             .p_3()
             .gap_2()
+            .child(self.render_command_input(cx))
             .child(
-                h_flex()
-                    .gap_2()
-                    .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.run_workbench(window, cx)))
-                    .child(div().flex_1().child(crate::boxed(self.workbench_input.clone(), cx)))
-                    .child(Button::new("database-redis-run", "Run").style(ButtonStyle::Tinted(TintColor::Success)).on_click(cx.listener(|this, _, window, cx| this.run_workbench(window, cx)))),
+                Label::new("Read commands only in this release. Writes, KEYS, FLUSH*, CONFIG, MONITOR, scripts and risky subcommands are refused before sending.")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
             )
-            .child(Label::new("Read commands only in this release. Writes, KEYS, FLUSH*, CONFIG, MONITOR and scripts are refused before sending.").size(LabelSize::Small).color(Color::Muted))
             .child(if lines.is_empty() {
                 Label::new("Run a command such as HGETALL user:1 or XINFO GROUPS orders.").color(Color::Muted).into_any_element()
             } else {
                 render_lines("database-redis-workbench", lines, &state.value_scroll, cx)
             })
-            .into_any_element()
-    }
-
-    fn render_analysis(&self, state: &RedisState, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let body = match &state.info {
-            None | Some(Fetch::Loading) => Label::new("Loading…")
-                .color(Color::Muted)
-                .into_any_element(),
-            Some(Fetch::Failed(message)) => Label::new(message.clone())
-                .color(Color::Error)
-                .into_any_element(),
-            Some(Fetch::Loaded(info)) => {
-                let mut sections = v_flex().gap_3();
-                for (title, entries) in info_sections(info) {
-                    let mut table = v_flex()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border)
-                        .child(
-                            div().px_3().py_1().bg(colors.element_background).child(
-                                Label::new(title)
-                                    .size(LabelSize::Small)
-                                    .weight(gpui::FontWeight::SEMIBOLD),
-                            ),
-                        );
-                    for (key, value) in entries {
-                        table = table.child(
-                            h_flex()
-                                .px_3()
-                                .py_0p5()
-                                .gap_3()
-                                .border_t_1()
-                                .border_color(colors.border_variant)
-                                .child(div().w(px(260.)).flex_none().child(
-                                    Label::new(key).size(LabelSize::Small).color(Color::Muted),
-                                ))
-                                .child(div().flex_1().min_w_0().child(
-                                    Label::new(value).size(LabelSize::Small).buffer_font(cx),
-                                )),
-                        );
-                    }
-                    sections = sections.child(table);
-                }
-                sections.into_any_element()
-            }
-        };
-        v_flex()
-            .id("database-redis-analysis")
-            .size_full()
-            .p_3()
-            .gap_2()
-            .overflow_y_scroll()
-            .child(
-                h_flex().child(div().flex_1()).child(
-                    Button::new("database-redis-info", "Refresh")
-                        .style(ButtonStyle::Outlined)
-                        .on_click(cx.listener(|this, _, _, cx| this.load_info(cx))),
-                ),
-            )
-            .child(body)
             .into_any_element()
     }
 
@@ -1401,92 +1712,223 @@ impl DatabaseView {
         let Some(state) = &self.redis_state else {
             return div().into_any_element();
         };
-        let tab =
-            |id: &'static str, label: &'static str, target: RedisTab, cx: &mut Context<Self>| {
-                let selected = state.tab == target;
-                h_flex()
-                    .id(id)
-                    .h(px(38.))
-                    .px_4()
-                    .cursor_pointer()
-                    .border_b_2()
-                    .border_color(if selected {
-                        colors.text_accent
-                    } else {
-                        gpui::transparent_black()
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let needs_info = target == RedisTab::Analysis
-                            && this
-                                .redis_state
-                                .as_ref()
-                                .is_some_and(|state| state.info.is_none());
-                        if let Some(state) = this.redis_state() {
-                            state.tab = target;
-                        }
-                        if needs_info {
-                            this.load_info(cx);
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        Label::new(label)
-                            .weight(if selected {
-                                gpui::FontWeight::BOLD
-                            } else {
-                                gpui::FontWeight::NORMAL
-                            })
-                            .color(if selected {
-                                Color::Default
-                            } else {
-                                Color::Muted
-                            }),
-                    )
-            };
-        let body = match state.tab {
-            RedisTab::Browser => self.render_browser(state, cx),
-            RedisTab::Workbench => self.render_workbench(state, cx),
-            RedisTab::Analysis => self.render_analysis(state, cx),
+        let tab = |id: &'static str,
+                   label: &'static str,
+                   target: Option<RedisTab>,
+                   cx: &mut Context<Self>| {
+            let selected = target == Some(state.tab);
+            h_flex()
+                .id(id)
+                .h(px(44.))
+                .px_4()
+                .border_b_2()
+                .border_color(if selected {
+                    colors.text_accent
+                } else {
+                    gpui::transparent_black()
+                })
+                .when_some(target, |this, target| {
+                    this.cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(state) = this.redis_state() {
+                                state.tab = target;
+                            }
+                            cx.notify();
+                        }))
+                })
+                .when(target.is_none(), |this| {
+                    this.tooltip(Tooltip::text("Not in Vilo yet"))
+                })
+                .child(Label::new(label).size(LabelSize::Large).color(if selected {
+                    Color::Default
+                } else if target.is_none() {
+                    Color::Disabled
+                } else {
+                    Color::Muted
+                }))
         };
+        let stat = |icon: IconName, text: String, tip: &'static str| {
+            h_flex()
+                .id(tip)
+                .gap_1p5()
+                .px_3()
+                .border_r_1()
+                .border_color(colors.border)
+                .tooltip(Tooltip::text(tip))
+                .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                .child(Label::new(text))
+        };
+        let stats = &state.stats;
+        let body = match state.tab {
+            RedisTab::Browse => self.render_browse(state, cx),
+            RedisTab::Workbench => self.render_workbench(state, cx),
+        };
+        let cli_lines = Self::workbench_lines(state);
         v_flex()
             .size_full()
             .child(
                 h_flex()
-                    .px_3()
+                    .h(px(52.))
+                    .px_4()
+                    .gap_2()
                     .border_b_1()
                     .border_color(colors.border)
-                    .child(tab(
-                        "database-redis-browser",
-                        "Browser",
-                        RedisTab::Browser,
-                        cx,
-                    ))
-                    .child(tab(
-                        "database-redis-workbench-tab",
-                        "Workbench",
-                        RedisTab::Workbench,
-                        cx,
-                    ))
-                    .child(tab(
-                        "database-redis-analysis-tab",
-                        "Analysis",
-                        RedisTab::Analysis,
-                        cx,
-                    ))
-                    .child(div().flex_1())
-                    .child(Label::new(connection.name.clone()).weight(gpui::FontWeight::SEMIBOLD))
-                    .child(div().w(px(8.)))
+                    .child(Label::new("Databases").color(Color::Accent).underline())
+                    .child(Label::new("/").color(Color::Muted))
+                    .child(Label::new(connection.name.clone()))
                     .child(
-                        Label::new(connection.environment.clone())
-                            .size(LabelSize::XSmall)
-                            .color(if connection.production() {
-                                Color::Warning
-                            } else {
-                                Color::Muted
-                            }),
+                        Label::new(format!(
+                            "{} · {}",
+                            connection.site_label(),
+                            connection.environment
+                        ))
+                        .size(LabelSize::Small)
+                        .color(if connection.production() {
+                            Color::Warning
+                        } else {
+                            Color::Muted
+                        }),
+                    )
+                    .child(div().w(px(8.)))
+                    .child(Label::new("db0"))
+                    .child(
+                        IconButton::new("database-redis-info-button", IconName::Info)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Database information (INFO)"))
+                            .on_click(cx.listener(|this, _, _, cx| this.show_info(cx))),
+                    )
+                    .child(div().flex_1())
+                    .child(stat(
+                        IconName::Sparkle,
+                        stats
+                            .cpu_percent
+                            .map_or("Calculating…".into(), |cpu| format!("{cpu:.0} %")),
+                        "CPU",
+                    ))
+                    .child(stat(
+                        IconName::ArrowCircle,
+                        stats
+                            .ops_per_second
+                            .map_or("…".into(), |ops| ops.to_string()),
+                        "Commands per second",
+                    ))
+                    .child(stat(
+                        IconName::DatabaseZap,
+                        stats.memory.clone().unwrap_or_else(|| "…".into()),
+                        "Memory used",
+                    ))
+                    .child(stat(
+                        IconName::Hash,
+                        stats.keys.map_or("…".into(), short_number),
+                        "Total keys",
+                    ))
+                    .child(stat(
+                        IconName::Person,
+                        stats
+                            .clients
+                            .map_or("…".into(), |clients| clients.to_string()),
+                        "Connected clients",
+                    ))
+                    .child(div().flex_1()),
+            )
+            .child(
+                h_flex()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(div().flex_1())
+                    .child(tab(
+                        "database-redis-tab-browse",
+                        "Browse",
+                        Some(RedisTab::Browse),
+                        cx,
+                    ))
+                    .child(tab("database-redis-tab-search", "Search", None, cx))
+                    .child(tab(
+                        "database-redis-tab-workbench",
+                        "Workbench",
+                        Some(RedisTab::Workbench),
+                        cx,
+                    ))
+                    .child(tab("database-redis-tab-analyze", "Analyze", None, cx))
+                    .child(tab("database-redis-tab-pubsub", "Pub/Sub", None, cx))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("database-redis-bulk", "Bulk actions")
+                            .start_icon(Icon::new(IconName::Copy).size(IconSize::Small))
+                            .disabled(true)
+                            .tooltip(Tooltip::text(
+                                "Bulk actions come with writes, in the next release",
+                            )),
+                    )
+                    .child(
+                        Button::new("database-redis-add-key", "Add key")
+                            .style(ButtonStyle::Filled)
+                            .disabled(true)
+                            .tooltip(Tooltip::text(
+                                "Adding keys comes with writes, in the next release",
+                            )),
                     ),
             )
             .child(div().flex_1().min_h_0().child(body))
+            .when(state.cli_open, |this| {
+                this.child(
+                    v_flex()
+                        .h(px(220.))
+                        .p_2()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(colors.border)
+                        .child(if cli_lines.is_empty() {
+                            Label::new("Read-only CLI. Try INFO server or HGETALL user:1.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .into_any_element()
+                        } else {
+                            render_lines("database-redis-cli", cli_lines, &state.cli_scroll, cx)
+                        })
+                        .child(self.render_command_input(cx)),
+                )
+            })
+            .child(
+                h_flex()
+                    .h(px(30.))
+                    .px_3()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .child(
+                        Button::new("database-redis-cli-toggle", "CLI")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::Terminal).size(IconSize::XSmall))
+                            .style(if state.cli_open {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.redis_state() {
+                                    state.cli_open = !state.cli_open;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("database-redis-helper", "Command Helper")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::FileCode).size(IconSize::XSmall))
+                            .disabled(true),
+                    )
+                    .child(
+                        Button::new("database-redis-profiler", "Profiler")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::Rerun).size(IconSize::XSmall))
+                            .disabled(true)
+                            .tooltip(Tooltip::text(
+                                "The profiler uses MONITOR, which loads the server; not in Vilo",
+                            )),
+                    ),
+            )
             .into_any_element()
     }
 }
@@ -1524,23 +1966,26 @@ mod tests {
     }
 
     #[test]
-    fn test_formats_and_info() {
+    fn test_formats_numbers_and_info() {
         assert_eq!(escape_bytes(b"a\\x00"), "a\\\\x00");
         assert_ne!(escape_bytes(b"a\\x00"), escape_bytes(b"a\x00"));
         assert_eq!(formatted(br#"{"a":1}"#, Format::Json), "{\n  \"a\": 1\n}");
-        assert_eq!(formatted(b"\xff", Format::Text), "\\xff");
+        assert_eq!(formatted(b"\xff", Format::Unicode), "\\xff");
         assert_eq!(formatted(b"\x01\xab", Format::Hex), "01 ab");
+        assert_eq!(formatted(b"\x05", Format::Binary), "00000101");
         assert_eq!(describe_ttl(-1), "No limit");
         assert_eq!(describe_ttl(90_000), "1 min");
-        let sections = info_sections(
-            "# Server\r\nredis_version:7.4.0\r\n\r\n# Clients\r\nconnected_clients:3\r\n",
-        );
+        assert_eq!(group_thousands(36_300), "36 300");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(short_number(36_300), "36 K");
+        let info = "# Server\r\nredis_version:7.4.0\r\n\r\n# Clients\r\nconnected_clients:3\r\n";
         assert_eq!(
-            sections[1],
+            info_sections(info)[1],
             (
                 "Clients".to_string(),
                 vec![("connected_clients".to_string(), "3".to_string())]
             )
         );
+        assert_eq!(info_value(info, "connected_clients"), Some("3"));
     }
 }
