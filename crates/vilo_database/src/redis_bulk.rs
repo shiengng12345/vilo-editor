@@ -52,8 +52,9 @@ struct BulkRun {
     stop: Arc<AtomicBool>,
     running: bool,
     outcome: Option<(SharedString, Color)>,
-    /// The batch whose outcome is unknown and which holds the bulk lock, until the user checked it.
-    unknown: Option<String>,
+    /// The batch whose outcome is unknown and which holds the bulk lock, until the user checked
+    /// it, with the notice shown for it.
+    unknown: Option<(String, SharedString)>,
 }
 
 impl BulkForm {
@@ -395,11 +396,11 @@ impl DatabaseView {
             // Settled before touching the window, which may be closed by now.
             settle_operation_lock(&lock, &owner, unknown.is_some());
             this.update(cx, |this, cx| {
-                if let Some((_, summary, message)) = &unknown {
-                    this.write_notice = Some(
-                        format!("{summary} needs checking: {message}. Check its keys, then press I checked it in the bulk delete dialog.")
-                            .into(),
-                    );
+                let notice = unknown.as_ref().map(|(_, summary, message)| {
+                    SharedString::from(format!("{summary} needs checking: {message}. Check its keys, then press I checked it in the bulk delete dialog."))
+                });
+                if let Some(notice) = &notice {
+                    this.write_notice = Some(notice.clone());
                 }
                 if let Some(run) = this.bulk_delete.as_mut().and_then(|form| form.run.as_mut()) {
                     run.running = false;
@@ -415,7 +416,7 @@ impl DatabaseView {
                             Color::Success,
                         )
                     }));
-                    run.unknown = unknown.map(|(operation, _, _)| operation);
+                    run.unknown = unknown.map(|(operation, _, _)| operation).zip(notice);
                 }
                 this.close_redis_key();
                 this.scan(true, cx);
@@ -428,7 +429,7 @@ impl DatabaseView {
     }
 
     fn release_bulk_lock(&mut self, cx: &mut Context<Self>) {
-        let Some(operation) = self
+        let Some((operation, notice)) = self
             .bulk_delete
             .as_ref()
             .and_then(|form| form.run.as_ref())
@@ -461,6 +462,10 @@ impl DatabaseView {
                             .retain(|(known, _)| *known != operation);
                         this.unlogged_writes
                             .retain(|(known, _)| *known != operation);
+                        // Only its own notice; another write may have replaced it since.
+                        if this.write_notice.as_ref() == Some(&notice) {
+                            this.write_notice = None;
+                        }
                     }
                     Err(error) => {
                         if let Some(run) = run {
