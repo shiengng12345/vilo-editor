@@ -2072,6 +2072,9 @@ fn raw_unicode_escape(bytes: &[u8]) -> Option<Node> {
 struct Fingerprints {
     known: std::collections::HashMap<Id, Vec<u8>>,
     bytes: usize,
+    /// Values visited working fingerprints out, for the whole input; results shaped by the
+    /// depth limit are not remembered, so this bounds recomputing them.
+    visits: usize,
 }
 
 /// What a value is compared by as a dict key or set member. A key too large or too deeply
@@ -2097,6 +2100,10 @@ fn fingerprint_at(
 ) -> Result<Vec<u8>, String> {
     if let Some(known) = cache.known.get(&id) {
         return Ok(known.clone());
+    }
+    cache.visits += 1;
+    if cache.visits > MAX_VISITS {
+        return Err("too many dict keys to compare; not read further".into());
     }
     let mut shaped = false;
     let found = dict_key(arena, cache, id, depth, &mut shaped)?.unwrap_or_else(|| identity(id));
@@ -3181,6 +3188,25 @@ mod tests {
         let forged = decode(Decoder::Pickle, b"Vm\nVThing\\u000a  forged: 7\n\x93)R.").unwrap();
         assert!(!forged.contains("\n  forged"), "{forged}");
         assert!(forged.contains(r#"Thing\u{a}  forged: 7"#), "{forged}");
+    }
+
+    #[test]
+    fn test_deep_shared_keys_are_bounded() {
+        let mut data = b"K\x01".to_vec();
+        for _ in 0..17 {
+            data.extend_from_slice(b"2\x86");
+        }
+        data.extend_from_slice(b"q\x000}");
+        for _ in 0..20_000 {
+            data.extend_from_slice(b"h\x00K\x01s");
+        }
+        data.push(b'.');
+        let started = std::time::Instant::now();
+        let outcome = decode(Decoder::Pickle, &data);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{outcome:?}"
+        );
     }
 
     #[test]
