@@ -2,10 +2,11 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use futures::TryStreamExt as _;
+pub use mongodb::options::Hint;
 use mongodb::{
     Client,
     bson::{Bson, Document, doc},
-    options::ClientOptions,
+    options::{ClientOptions, Collation},
 };
 
 const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -38,6 +39,31 @@ pub struct FindRequest {
     pub page_size: u32,
     /// Execution budget the server enforces; it is set when the query is sent, not a way to cancel it later.
     pub max_time: Option<Duration>,
+    pub collation: Option<Document>,
+    pub hint: Option<Hint>,
+    /// At most this many documents from `skip` on, like Compass's Limit option.
+    pub limit: Option<u64>,
+}
+
+impl FindRequest {
+    /// The page's size after the Limit option, and whether documents past it may exist.
+    fn page_bounds(&self) -> (u64, bool) {
+        let page_size = u64::from(self.page_size.max(1));
+        match self.limit {
+            Some(limit) => (limit.min(page_size), limit > page_size),
+            None => (page_size, true),
+        }
+    }
+
+    fn collation(&self) -> Result<Option<Collation>> {
+        self.collation
+            .clone()
+            .map(|collation| {
+                mongodb::bson::from_document(collation)
+                    .context("Collation is not valid, e.g. { locale: 'simple' }")
+            })
+            .transpose()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,12 +155,25 @@ impl MongoSession {
             .client
             .database(&request.database)
             .collection::<Document>(&request.collection);
-        let page_size = request.page_size.max(1);
+        let (page_size, more_allowed) = request.page_bounds();
+        // Limit 0 means no limit to the server, so an exhausted Limit never reaches it.
+        if page_size == 0 {
+            return Ok(FindPage {
+                documents: Vec::new(),
+                has_more: false,
+            });
+        }
         // One extra document tells whether another page exists without counting.
         let mut find = collection
             .find(request.filter.clone())
             .skip(request.skip)
-            .limit(i64::from(page_size) + 1);
+            .limit(page_size as i64 + i64::from(more_allowed));
+        if let Some(collation) = request.collation()? {
+            find = find.collation(collation);
+        }
+        if let Some(hint) = request.hint.clone() {
+            find = find.hint(hint);
+        }
         if let Some(projection) = &request.projection {
             find = find.projection(projection.clone());
         }
@@ -238,7 +277,20 @@ pub fn write_stage(pipeline: &[Document]) -> Option<&'static str> {
 impl MongoSession {
     /// Runs the query with `executionStats`, which really executes it, so it carries the same time limit.
     pub async fn explain(&self, request: &FindRequest) -> Result<Document> {
-        let mut find = doc! { "find": &request.collection, "filter": request.filter.clone(), "skip": request.skip as i64, "limit": i64::from(request.page_size) };
+        let (page_size, _) = request.page_bounds();
+        let mut find = doc! { "find": &request.collection, "filter": request.filter.clone(), "skip": request.skip as i64, "limit": page_size as i64 };
+        if let Some(collation) = &request.collation {
+            find.insert("collation", collation.clone());
+        }
+        match &request.hint {
+            Some(Hint::Keys(keys)) => {
+                find.insert("hint", keys.clone());
+            }
+            Some(Hint::Name(name)) => {
+                find.insert("hint", name.clone());
+            }
+            _ => {}
+        }
         if let Some(projection) = &request.projection {
             find.insert("projection", projection.clone());
         }
@@ -360,6 +412,19 @@ impl MongoSession {
             }
             None => {
                 let mut find = collection.find(request.filter.clone()).skip(request.skip);
+                if let Some(collation) = request.collation()? {
+                    find = find.collation(collation);
+                }
+                if let Some(hint) = request.hint.clone() {
+                    find = find.hint(hint);
+                }
+                // An exported Limit of 0 would mean no limit to the server.
+                if let Some(limit) = request.limit {
+                    if limit == 0 {
+                        return Ok(());
+                    }
+                    find = find.limit(limit as i64);
+                }
                 if let Some(projection) = &request.projection {
                     find = find.projection(projection.clone());
                 }
@@ -482,6 +547,9 @@ mod tests {
             skip: 0,
             page_size: 2,
             max_time: Some(Duration::from_secs(5)),
+            collation: None,
+            hint: None,
+            limit: None,
         };
         let first = session.find_page(&request).await.unwrap();
         assert_eq!(first.documents.len(), 2);
@@ -493,6 +561,20 @@ mod tests {
         request.skip = 4;
         let last = session.find_page(&request).await.unwrap();
         assert_eq!((last.documents.len(), last.has_more), (1, false));
+        request.skip = 0;
+        request.limit = Some(3);
+        request.collation = Some(doc! { "locale": "simple" });
+        request.hint = Some(Hint::Name("_id_".into()));
+        let first = session.find_page(&request).await.unwrap();
+        assert_eq!((first.documents.len(), first.has_more), (2, true));
+        request.limit = Some(1);
+        let only = session.find_page(&request).await.unwrap();
+        assert_eq!((only.documents.len(), only.has_more), (1, false));
+        request.limit = Some(0);
+        let none = session.find_page(&request).await.unwrap();
+        assert_eq!((none.documents.len(), none.has_more), (0, false));
+        request.limit = None;
+        request.skip = 4;
         assert!(
             session
                 .databases()

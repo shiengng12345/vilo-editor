@@ -15,8 +15,8 @@ use anyhow::{Result, anyhow};
 use collections::{HashMap, HashSet};
 use editor::Editor;
 use gpui::{
-    ClipboardItem, Entity, ListHorizontalSizingBehavior, Task, UniformListScrollHandle, Window,
-    prelude::*, uniform_list,
+    ClipboardItem, ElementId, Entity, ListHorizontalSizingBehavior, Task, UniformListScrollHandle,
+    Window, prelude::*, rgb, uniform_list,
 };
 use serde::{Deserialize, Serialize};
 use ui::{
@@ -25,7 +25,7 @@ use ui::{
 use vilo_database_core::{
     bson::{Bson, Document},
     display::{Shown, ValueKind, human_date, show, to_canonical_json},
-    mongo::{ExplainSummary, FindRequest, summarize_explain, to_display_json},
+    mongo::{ExplainSummary, FindRequest, Hint, summarize_explain, to_display_json},
     shell::{parse_pipeline, parse_query},
 };
 
@@ -41,6 +41,8 @@ const ITEMS_SHOWN: usize = 100;
 const ROW_HEIGHT: f32 = 20.;
 const PAGE_SIZES: [u32; 6] = [10, 20, 25, 50, 75, 100];
 const HISTORY_PER_COLLECTION: usize = 30;
+/// Compass's Max Time MS default.
+const DEFAULT_MAX_TIME: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum DocumentView {
@@ -120,6 +122,10 @@ pub(crate) struct MongoTab {
     projection: Entity<Editor>,
     sort: Entity<Editor>,
     skip_editor: Entity<Editor>,
+    collation: Entity<Editor>,
+    hint: Entity<Editor>,
+    max_time: Entity<Editor>,
+    limit: Entity<Editor>,
     pipeline: Entity<Editor>,
     show_options: bool,
     view: DocumentView,
@@ -164,16 +170,14 @@ impl MongoTab {
             sub_tab: SubTab::Documents,
             panel: Panel::Results,
             code_language: CodeLanguage::Shell,
-            filter: editor(
-                "Type a query: { field: 'value' } or Generate query",
-                "",
-                false,
-                window,
-                cx,
-            ),
+            filter: editor("Type a query: { field: 'value' }", "", false, window, cx),
             projection: editor("{ field: 0 }", "", false, window, cx),
             sort: editor("{ field: -1 }", "", false, window, cx),
             skip_editor: editor("0", "", false, window, cx),
+            collation: editor("{ locale: 'simple' }", "", false, window, cx),
+            hint: editor("{ field: -1 } or \"indexName\"", "", false, window, cx),
+            max_time: editor("60000", "", false, window, cx),
+            limit: editor("0", "", false, window, cx),
             pipeline,
             show_options: false,
             view: DocumentView::List,
@@ -203,6 +207,19 @@ impl MongoTab {
         self.collection.clone()
     }
 
+    fn query_editors(&self) -> [&Entity<Editor>; 8] {
+        [
+            &self.filter,
+            &self.projection,
+            &self.sort,
+            &self.skip_editor,
+            &self.collation,
+            &self.hint,
+            &self.max_time,
+            &self.limit,
+        ]
+    }
+
     fn keep(&mut self, task: Task<()>) {
         self._tasks.push(task);
         // Only the latest few loads matter.
@@ -225,6 +242,14 @@ pub(crate) struct SavedQuery {
     #[serde(default)]
     skip: String,
     #[serde(default)]
+    collation: String,
+    #[serde(default)]
+    hint: String,
+    #[serde(default)]
+    max_time: String,
+    #[serde(default)]
+    limit: String,
+    #[serde(default)]
     favorite: bool,
 }
 
@@ -239,6 +264,10 @@ impl SavedQuery {
             ("project", &self.project),
             ("sort", &self.sort),
             ("skip", &self.skip),
+            ("collation", &self.collation),
+            ("hint", &self.hint),
+            ("max time", &self.max_time),
+            ("limit", &self.limit),
         ] {
             if !value.trim().is_empty() {
                 label.push_str(&format!(" · {name} {}", value.trim()));
@@ -248,23 +277,11 @@ impl SavedQuery {
     }
 
     fn same_query(&self, other: &SavedQuery) -> bool {
-        (
-            &self.connection,
-            &self.database,
-            &self.collection,
-            &self.filter,
-            &self.project,
-            &self.sort,
-            &self.skip,
-        ) == (
-            &other.connection,
-            &other.database,
-            &other.collection,
-            &other.filter,
-            &other.project,
-            &other.sort,
-            &other.skip,
-        )
+        let unstarred = |query: &SavedQuery| SavedQuery {
+            favorite: false,
+            ..query.clone()
+        };
+        unstarred(self) == unstarred(other)
     }
 }
 
@@ -516,6 +533,36 @@ fn index_properties(index: &Document) -> Vec<String> {
     properties
 }
 
+/// Compass's solid green button (Find, ADD DATA); the theme's buttons have no solid accent fill.
+fn compass_primary(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    icon: Option<IconName>,
+    disabled: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let text = Color::Custom(rgb(0xFFFFFF).into());
+    h_flex()
+        .id(id)
+        .h(px(26.))
+        .px_2p5()
+        .gap_1()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(0x00ED64))
+        .bg(rgb(0x00684A))
+        .when(disabled, |this| this.opacity(0.5))
+        .when(!disabled, |this| {
+            this.cursor_pointer().hover(|style| style.bg(rgb(0x00593F)))
+        })
+        .children(icon.map(|icon| Icon::new(icon).size(IconSize::XSmall).color(text)))
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .weight(gpui::FontWeight::SEMIBOLD)
+                .color(text),
+        )
+}
+
 fn compass_button(id: &'static str, label: &'static str, icon: IconName) -> Button {
     Button::new(id, label)
         .label_size(LabelSize::Small)
@@ -602,7 +649,7 @@ impl DatabaseView {
         let Some(tab) = self.tab_mut() else {
             return;
         };
-        for editor in [&tab.filter, &tab.projection, &tab.sort, &tab.skip_editor] {
+        for editor in tab.query_editors() {
             editor.update(cx, |editor, cx| editor.set_text("", window, cx));
         }
         tab.skip = 0;
@@ -621,6 +668,10 @@ impl DatabaseView {
             project: text(&tab.projection),
             sort: text(&tab.sort),
             skip: text(&tab.skip_editor),
+            collation: text(&tab.collation),
+            hint: text(&tab.hint),
+            max_time: text(&tab.max_time),
+            limit: text(&tab.limit),
             favorite: false,
         })
     }
@@ -699,11 +750,24 @@ impl DatabaseView {
             (&tab.projection, &query.project),
             (&tab.sort, &query.sort),
             (&tab.skip_editor, &query.skip),
+            (&tab.collation, &query.collation),
+            (&tab.hint, &query.hint),
+            (&tab.max_time, &query.max_time),
+            (&tab.limit, &query.limit),
         ] {
             editor.update(cx, |editor, cx| editor.set_text(text.clone(), window, cx));
         }
-        tab.show_options |=
-            !(query.project.is_empty() && query.sort.is_empty() && query.skip.is_empty());
+        tab.show_options |= [
+            &query.project,
+            &query.sort,
+            &query.skip,
+            &query.collation,
+            &query.hint,
+            &query.max_time,
+            &query.limit,
+        ]
+        .iter()
+        .any(|text| !text.is_empty());
         tab.skip = 0;
         self.find(cx);
     }
@@ -714,22 +778,33 @@ impl DatabaseView {
         let parse = |editor: &Entity<Editor>, label: &str, cx: &App| {
             parse_query(&editor.read(cx).text(cx)).map_err(|error| anyhow!("{label}: {error:#}"))
         };
-        let base_skip = tab.skip_editor.read(cx).text(cx).trim().to_string();
+        let number = |editor: &Entity<Editor>, label: &str, cx: &App| {
+            let text = editor.read(cx).text(cx).trim().to_string();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            text.parse::<u64>()
+                .map(Some)
+                .map_err(|_| anyhow!("{label} must be a whole number"))
+        };
         let parsed = (|| {
             let filter = parse(&tab.filter, "Filter", cx)?;
             let projection = parse(&tab.projection, "Project", cx)?;
             let sort = parse(&tab.sort, "Sort", cx)?;
-            let base_skip = if base_skip.is_empty() {
-                0
-            } else {
-                base_skip
-                    .parse::<u64>()
-                    .map_err(|_| anyhow!("Skip must be a whole number"))?
+            let collation = parse(&tab.collation, "Collation", cx)?;
+            let hint = tab.hint.read(cx).text(cx).trim().to_string();
+            let hint = match hint.strip_prefix(['"', '\'']) {
+                Some(name) => Some(Hint::Name(name.trim_end_matches(['"', '\'']).to_string())),
+                None => Some(parse(&tab.hint, "Index Hint", cx)?)
+                    .filter(|keys| !keys.is_empty())
+                    .map(Hint::Keys),
             };
-            anyhow::Ok((filter, projection, sort, base_skip))
-        })();
-        match parsed {
-            Ok((filter, projection, sort, base_skip)) => Some(FindRequest {
+            let base_skip = number(&tab.skip_editor, "Skip", cx)?.unwrap_or(0);
+            let max_time = number(&tab.max_time, "Max Time MS", cx)?
+                .map_or(DEFAULT_MAX_TIME, Duration::from_millis);
+            // Compass treats Limit 0 as no limit.
+            let limit = number(&tab.limit, "Limit", cx)?.filter(|limit| *limit > 0);
+            anyhow::Ok(FindRequest {
                 database: tab.database.clone(),
                 collection: tab.collection.clone(),
                 filter,
@@ -737,8 +812,14 @@ impl DatabaseView {
                 sort: (!sort.is_empty()).then_some(sort),
                 skip: base_skip,
                 page_size: tab.page_size,
-                max_time: Some(QUERY_TIME_LIMIT),
-            }),
+                max_time: Some(max_time),
+                collation: (!collation.is_empty()).then_some(collation),
+                hint,
+                limit,
+            })
+        })();
+        match parsed {
+            Ok(request) => Some(request),
             Err(error) => {
                 tab.panel = Panel::Results;
                 tab.page = Some(Fetch::Failed(format!("{error:#}").into()));
@@ -804,6 +885,7 @@ impl DatabaseView {
             }
         }
         request.skip += tab.skip;
+        request.limit = request.limit.map(|limit| limit.saturating_sub(tab.skip));
         tab.page = Some(Fetch::Loading);
         tab.expanded.clear();
         tab.show_all.clear();
@@ -1024,6 +1106,12 @@ impl DatabaseView {
             text(&tab.sort),
             text(&tab.skip_editor),
         );
+        let (collation, hint, max_time, limit) = (
+            text(&tab.collation),
+            text(&tab.hint),
+            text(&tab.max_time),
+            text(&tab.limit),
+        );
         let or_empty = |text: &str| {
             if text.is_empty() {
                 "{}".to_string()
@@ -1045,8 +1133,16 @@ impl DatabaseView {
                 if !sort.is_empty() {
                     code.push_str(&format!(".sort({sort})"));
                 }
-                if !skip.is_empty() {
-                    code.push_str(&format!(".skip({skip})"));
+                for (method, value) in [
+                    ("skip", &skip),
+                    ("limit", &limit),
+                    ("collation", &collation),
+                    ("hint", &hint),
+                    ("maxTimeMS", &max_time),
+                ] {
+                    if !value.is_empty() {
+                        code.push_str(&format!(".{method}({value})"));
+                    }
                 }
                 code
             }
@@ -1067,8 +1163,22 @@ impl DatabaseView {
                 if !sort.is_empty() {
                     options.push(format!("sort: BSON.EJSON.parse('{}')", json(&sort)?));
                 }
-                if !skip.is_empty() {
-                    options.push(format!("skip: {skip}"));
+                if !collation.is_empty() {
+                    options.push(format!(
+                        "collation: BSON.EJSON.parse('{}')",
+                        json(&collation)?
+                    ));
+                }
+                if hint.starts_with(['"', '\'']) {
+                    options.push(format!("hint: {hint}"));
+                } else if !hint.is_empty() {
+                    options.push(format!("hint: BSON.EJSON.parse('{}')", json(&hint)?));
+                }
+                for (name, value) in [("skip", &skip), ("limit", &limit), ("maxTimeMS", &max_time)]
+                {
+                    if !value.is_empty() {
+                        options.push(format!("{name}: {value}"));
+                    }
                 }
                 format!(
                     "import {{ MongoClient, BSON }} from 'mongodb';\n\nconst client = new MongoClient(process.env.MONGODB_URI);\nconst filter = BSON.EJSON.parse('{}');\nconst cursor = client\n  .db('{}')\n  .collection('{}')\n  .find(filter{});\nconst result = await cursor.toArray();\nawait client.close();",
@@ -1353,47 +1463,55 @@ impl DatabaseView {
                         .when(row.first, |this| this.border_t_1().rounded_t_md())
                         .when(row.last, |this| this.border_b_1().rounded_b_md());
                     // The card's expand toggle sits left of its first line, as in Compass.
-                    card = card.child(div().w(px(36.)).flex_none().flex().justify_center().when(
-                        row.first,
-                        |this| {
-                            let opened = opened_documents.contains(&document);
-                            let keys = containers.get(document).cloned().unwrap_or_default();
-                            let view = view.clone();
-                            this.child(
-                                IconButton::new(
-                                    ("database-expand-all", index),
-                                    if opened {
-                                        IconName::ChevronDown
+                    // Compass shows it only while the pointer is on the document.
+                    card = card.child(
+                        div()
+                            .w(px(36.))
+                            .flex_none()
+                            .flex()
+                            .justify_center()
+                            .visible_on_hover(group.clone())
+                            .when(row.first, |this| {
+                                let opened = opened_documents.contains(&document);
+                                let keys = containers.get(document).cloned().unwrap_or_default();
+                                let view = view.clone();
+                                this.child(
+                                    IconButton::new(
+                                        ("database-expand-all", index),
+                                        if opened {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        },
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .style(ButtonStyle::Outlined)
+                                    .tooltip(Tooltip::text(if opened {
+                                        "Collapse all"
                                     } else {
-                                        IconName::ChevronRight
-                                    },
-                                )
-                                .icon_size(IconSize::XSmall)
-                                .style(ButtonStyle::Outlined)
-                                .tooltip(Tooltip::text(if opened {
-                                    "Collapse all"
-                                } else {
-                                    "Expand all"
-                                }))
-                                .on_click(move |_, _, cx| {
-                                    let keys = keys.clone();
-                                    view.update(cx, |this, cx| {
-                                        if let Some(tab) = this.tab_mut() {
-                                            for key in keys {
-                                                if opened {
-                                                    tab.expanded.remove(&key);
-                                                } else {
-                                                    tab.expanded.insert(key);
+                                        "Expand all"
+                                    }))
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            let keys = keys.clone();
+                                            view.update(cx, |this, cx| {
+                                                if let Some(tab) = this.tab_mut() {
+                                                    for key in keys {
+                                                        if opened {
+                                                            tab.expanded.remove(&key);
+                                                        } else {
+                                                            tab.expanded.insert(key);
+                                                        }
+                                                    }
                                                 }
-                                            }
-                                        }
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                }),
-                            )
-                        },
-                    ));
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                        },
+                                    ),
+                                )
+                            }),
+                    );
                     let content = match row.kind {
                         RowKind::Gap => div().into_any_element(),
                         RowKind::MoreFields { hidden } => {
@@ -2044,19 +2162,37 @@ impl DatabaseView {
                         })
                 }))
             });
-        let option = |label: &'static str, editor: &Entity<Editor>, cx: &App| {
+        // Compass lays the options out as labelled lines, with the numbers boxed on the right.
+        let option = |label: &'static str, editor: &Entity<Editor>| {
             h_flex()
                 .flex_1()
-                .gap_2()
+                .min_w_0()
+                .h(px(28.))
+                .gap_3()
                 .child(
-                    div().w(px(56.)).child(
+                    div().w(px(88.)).flex_none().child(
                         Label::new(label)
                             .size(LabelSize::Small)
                             .weight(gpui::FontWeight::SEMIBOLD),
                     ),
                 )
-                .child(div().flex_1().child(boxed(editor.clone(), cx)))
+                .child(div().flex_1().min_w_0().child(editor.clone()))
         };
+        let number = |label: &'static str, editor: &Entity<Editor>, cx: &App| {
+            h_flex()
+                .flex_none()
+                .gap_2()
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD),
+                )
+                .child(div().w(px(180.)).child(boxed(editor.clone(), cx)))
+        };
+        let untouched = tab
+            .query_editors()
+            .iter()
+            .all(|editor| editor.read(cx).text(cx).trim().is_empty());
         let find = |this: &mut DatabaseView, cx: &mut Context<DatabaseView>| {
             if let Some(tab) = this.tab_mut() {
                 tab.skip = 0;
@@ -2095,19 +2231,19 @@ impl DatabaseView {
                     )
                     .child(
                         Button::new("database-explain", "Explain")
-                            .style(ButtonStyle::Outlined)
+                            .style(ButtonStyle::Filled)
                             .on_click(cx.listener(|this, _, _, cx| this.explain(cx))),
                     )
                     .child(
                         Button::new("database-reset", "Reset")
-                            .style(ButtonStyle::Outlined)
+                            .style(ButtonStyle::Filled)
+                            .disabled(untouched)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.reset_query(window, cx)),
                             ),
                     )
                     .child(
-                        Button::new("database-find", "Find")
-                            .style(ButtonStyle::Tinted(TintColor::Success))
+                        compass_primary("database-find", "Find", None, false)
                             .on_click(cx.listener(move |this, _, _, cx| find(this, cx))),
                     )
                     .child(
@@ -2131,18 +2267,21 @@ impl DatabaseView {
                     ),
             )
             .when(tab.show_options, |this| {
-                this.child(
-                    h_flex()
-                        .gap_4()
-                        .child(option("Project", &tab.projection, cx))
-                        .child(option("Sort", &tab.sort, cx)),
-                )
-                .child(
-                    h_flex()
-                        .gap_4()
-                        .child(option("Skip", &tab.skip_editor, cx))
-                        .child(div().flex_1()),
-                )
+                this.child(h_flex().child(option("Project", &tab.projection)))
+                    .child(
+                        h_flex()
+                            .gap_4()
+                            .child(option("Sort", &tab.sort))
+                            .child(number("Max Time MS", &tab.max_time, cx)),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_4()
+                            .child(option("Collation", &tab.collation))
+                            .child(number("Skip", &tab.skip_editor, cx))
+                            .child(number("Limit", &tab.limit, cx)),
+                    )
+                    .child(h_flex().child(option("Index Hint", &tab.hint)))
             })
             .into_any_element()
     }
@@ -2227,9 +2366,12 @@ impl DatabaseView {
         h_flex()
             .gap_2()
             .child(
-                compass_button("database-add-data", "ADD DATA", IconName::Plus)
-                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                    .disabled(true)
+                compass_primary("database-add-data", "ADD DATA", Some(IconName::Plus), true)
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Custom(rgb(0xFFFFFF).into())),
+                    )
                     .tooltip(Tooltip::text(
                         "Adding and editing documents comes with the next release",
                     )),
