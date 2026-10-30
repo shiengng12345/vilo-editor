@@ -209,6 +209,35 @@ fn check_shape(name: &str, args: &[Bytes]) -> Result<()> {
         );
         anyhow::Ok(())
     };
+    // Option words after the fixed arguments: flags, options taking one value, and groups of
+    // which at most one may appear.
+    let options = |rest: &[Bytes], flags: &[&str], valued: &[&str], apart: &[&[&str]]| {
+        let mut seen = Vec::new();
+        let mut rest = rest;
+        while let Some((first, tail)) = rest.split_first() {
+            let option = word(first);
+            rest = if flags.contains(&option.as_str()) {
+                tail
+            } else if valued.contains(&option.as_str()) {
+                tail.split_first()
+                    .map(|(_, tail)| tail)
+                    .with_context(|| format!("{name} needs a value after {option}."))?
+            } else {
+                bail!("{name} does not take {option} there.");
+            };
+            seen.push(option);
+        }
+        for group in apart {
+            let mut used = group
+                .iter()
+                .filter(|option| seen.iter().any(|seen| seen == *option))
+                .collect::<Vec<_>>();
+            if let [first, second, ..] = used.as_mut_slice() {
+                bail!("{name} cannot take {first} and {second} together.");
+            }
+        }
+        anyhow::Ok(())
+    };
     // The arguments after the key, past any leading option words.
     let after_options = |options: &[&str]| {
         let mut rest = args.get(1..).unwrap_or_default();
@@ -227,9 +256,27 @@ fn check_shape(name: &str, args: &[Bytes]) -> Result<()> {
         ),
         "LPOP" | "RPOP" | "SPOP" | "ZPOPMIN" | "ZPOPMAX" | "JSON.DEL" | "JSON.FORGET"
         | "JSON.CLEAR" => at_most(2)?,
-        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "JSON.STRAPPEND" | "JSON.ARRPOP" => {
-            at_most(3)?
-        }
+        "JSON.STRAPPEND" | "JSON.ARRPOP" => at_most(3)?,
+        // The option rules below are what Redis 7.4 refuses: unknown words, a missing value,
+        // and options that cannot go together. Repeating an option is allowed.
+        "SET" => options(
+            args.get(2..).unwrap_or_default(),
+            &["NX", "XX", "GET", "KEEPTTL"],
+            &["EX", "PX", "EXAT", "PXAT"],
+            &[&["NX", "XX"], &["EX", "PX", "EXAT", "PXAT", "KEEPTTL"]],
+        )?,
+        "GETEX" => options(
+            args.get(1..).unwrap_or_default(),
+            &["PERSIST"],
+            &["EX", "PX", "EXAT", "PXAT"],
+            &[&["EX", "PX", "EXAT", "PXAT", "PERSIST"]],
+        )?,
+        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => options(
+            args.get(2..).unwrap_or_default(),
+            &["NX", "XX", "GT", "LT"],
+            &[],
+            &[&["NX", "XX"], &["NX", "GT"], &["NX", "LT"], &["GT", "LT"]],
+        )?,
         "ZADD" => {
             let pairs = after_options(&["NX", "XX", "GT", "LT", "CH", "INCR"]);
             anyhow::ensure!(
@@ -379,6 +426,13 @@ mod tests {
             "XADD s MINID = 0-1 1-1 f v",
             "LPOP l 3",
             "EXPIRE k 10 GT",
+            "EXPIRE k 10 XX GT",
+            "PEXPIRE k 10 XX LT",
+            "EXPIRE k 10 XX XX",
+            "SET k v EX 10 EX 10",
+            "SET k v NX GET",
+            "SET k v KEEPTTL XX",
+            "GETEX k PERSIST",
         ] {
             assert!(plan(words(line)).is_ok(), "{line}");
         }
@@ -407,7 +461,21 @@ mod tests {
             ("JSON.SET doc $", "at least 3 arguments"),
             ("HSET h field value orphan", "in pairs after the key"),
             ("LPOP l 1 extra", "at most 2 arguments"),
-            ("EXPIRE k 10 NX extra", "at most 3 arguments"),
+            ("EXPIRE k 10 NX extra", "does not take EXTRA"),
+            ("EXPIRE k 10 NX GT", "cannot take NX and GT together"),
+            ("EXPIRE k 10 GT LT", "cannot take GT and LT together"),
+            ("SET b v EX", "needs a value after EX"),
+            ("SET k v NX XX", "cannot take NX and XX together"),
+            (
+                "SET k v EX 10 KEEPTTL",
+                "cannot take EX and KEEPTTL together",
+            ),
+            ("SET k v BOGUS", "does not take BOGUS"),
+            (
+                "GETEX k EX 10 PERSIST",
+                "cannot take EX and PERSIST together",
+            ),
+            ("GETEX k EX", "needs a value after EX"),
             ("ZADD z NX 1", "scores and members in pairs"),
             ("ZADD z 1 a 2", "scores and members in pairs"),
             ("GEOADD g 1 2 m 3", "in threes"),
