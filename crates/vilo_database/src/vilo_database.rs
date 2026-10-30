@@ -354,8 +354,6 @@ pub struct DatabaseView {
     command_history: Vec<String>,
     /// Where Up/Down stands in `command_history` while browsing it.
     history_position: Option<usize>,
-    /// Counts history saves so only the newest reaches the file.
-    history_saves: u64,
     /// Why the command history could not be read or saved.
     history_problem: Option<SharedString>,
     redis_state: Option<RedisState>,
@@ -509,7 +507,6 @@ impl DatabaseView {
             },
             command_history: Vec::new(),
             history_position: None,
-            history_saves: 0,
             history_problem: None,
             redis_state: None,
             doc_write: None,

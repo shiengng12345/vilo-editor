@@ -470,6 +470,9 @@ pub(crate) fn load_command_history() -> anyhow::Result<Vec<String>> {
     }
 }
 
+/// Numbers every history save in this process.
+static HISTORY_SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The newest history save that reached the file; saves can finish out of order.
 static HISTORY_SAVED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
 
@@ -578,12 +581,7 @@ impl editor::CompletionProvider for CommandCompletions {
 
 /// Commands that recreate the key as loaded, for pasting into redis-cli, and whether only part
 /// of the key is in them. `None` for types Vilo cannot rebuild or an empty value.
-fn rebuild_command(
-    key: &[u8],
-    value: &Value,
-    partial: bool,
-    ttl_ms: i64,
-) -> Option<(String, bool)> {
+fn rebuild_command(key: &[u8], value: &Value, ttl_ms: i64) -> Option<(String, bool)> {
     let key = quote_bytes(key);
     let join = |items: Vec<String>| items.join(" ");
     let (command, more) = match value {
@@ -648,7 +646,7 @@ fn rebuild_command(
     if ttl_ms > 0 {
         text.push_str(&format!("\nPEXPIRE {key} {ttl_ms}"));
     }
-    Some((text, partial || more))
+    Some((text, more))
 }
 
 /// A value in the chosen format; JSON pretty-prints only when the bytes are valid JSON.
@@ -2394,7 +2392,7 @@ impl DatabaseView {
         let searchable = matches!(detail.info.kind.as_str(), "hash" | "set" | "zset" | "list");
         // A list's filter only hides rows, so its command still holds every loaded item.
         let searched = detail.pattern.is_some();
-        let rebuilt = rebuild_command(&detail.key, &detail.value, false, detail.info.ttl_ms)
+        let rebuilt = rebuild_command(&detail.key, &detail.value, detail.info.ttl_ms)
             .map(|(command, more)| (command, searched, more));
         let note = match (&detail.pattern, &detail.local_filter) {
             (Some(pattern), _) => Some(format!(
@@ -2706,8 +2704,9 @@ impl DatabaseView {
         self.command_history.push(line.to_string());
         let excess = self.command_history.len().saturating_sub(COMMAND_HISTORY);
         self.command_history.drain(..excess);
-        self.history_saves += 1;
-        let (history, save) = (self.command_history.clone(), self.history_saves);
+        // Numbered across every window, so a newer save anywhere wins and temporary files differ.
+        let save = HISTORY_SAVES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let history = self.command_history.clone();
         let task = cx.background_spawn(async move { save_command_history(&history, save) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -3238,14 +3237,14 @@ mod tests {
     #[test]
     fn test_rebuild_command() {
         let (text, partial) =
-            rebuild_command(b"k", &Value::String(Some(b"a b".to_vec())), false, 5000).unwrap();
+            rebuild_command(b"k", &Value::String(Some(b"a b".to_vec())), 5000).unwrap();
         assert_eq!(text, "SET \"k\" \"a b\"\nPEXPIRE \"k\" 5000");
         assert!(!partial);
         let hash = Value::Hash {
             fields: vec![(b"f".to_vec(), b"v".to_vec())],
             cursor: Some("12".into()),
         };
-        let (text, partial) = rebuild_command(b"h", &hash, false, -1).unwrap();
+        let (text, partial) = rebuild_command(b"h", &hash, -1).unwrap();
         assert_eq!(text, "HSET \"h\" \"f\" \"v\"");
         assert!(partial, "more pages remain");
         let zset = Value::SortedSet {
@@ -3253,8 +3252,8 @@ mod tests {
             next: None,
         };
         assert_eq!(
-            rebuild_command(b"z", &zset, true, -1).unwrap(),
-            ("ZADD \"z\" 1.5 \"m\"".into(), true)
+            rebuild_command(b"z", &zset, -1).unwrap(),
+            ("ZADD \"z\" 1.5 \"m\"".into(), false)
         );
         assert_eq!(
             rebuild_command(
@@ -3263,7 +3262,6 @@ mod tests {
                     items: vec![b"x".to_vec()],
                     next: None
                 },
-                false,
                 -1
             )
             .unwrap()
@@ -3277,12 +3275,11 @@ mod tests {
                     members: Vec::new(),
                     cursor: None
                 },
-                false,
                 -1
             )
             .is_none()
         );
-        assert!(rebuild_command(b"o", &Value::Other, false, -1).is_none());
+        assert!(rebuild_command(b"o", &Value::Other, -1).is_none());
     }
 
     use super::*;
