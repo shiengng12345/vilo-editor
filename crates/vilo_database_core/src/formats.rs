@@ -21,6 +21,12 @@ const MAX_DEPTH: usize = 64;
 const MAX_NODES: usize = 200_000;
 /// Text shown for one value; past this it is cut and says so.
 const MAX_OUTPUT: usize = 1_000_000;
+/// Entries all containers of one input may hold together, references included, so a few memo
+/// references cannot stand for unbounded work.
+const MAX_ENTRIES: usize = 1_000_000;
+/// Values visited while showing one input; a value shared many times is shown each time, so
+/// this bounds the work, not just the text.
+const MAX_VISITS: usize = 1_000_000;
 
 type Id = usize;
 
@@ -52,6 +58,7 @@ enum Node {
 #[derive(Default)]
 struct Arena {
     nodes: Vec<Node>,
+    entries: usize,
 }
 
 impl Arena {
@@ -61,6 +68,15 @@ impl Arena {
         }
         self.nodes.push(node);
         Ok(self.nodes.len() - 1)
+    }
+
+    /// Counts entries added to containers against `MAX_ENTRIES`.
+    fn entries(&mut self, count: usize) -> Result<(), String> {
+        self.entries = self.entries.saturating_add(count);
+        if self.entries > MAX_ENTRIES {
+            return Err(format!("more than {MAX_ENTRIES} entries; not read further"));
+        }
+        Ok(())
     }
 
     fn get_mut(&mut self, id: Id) -> Result<&mut Node, String> {
@@ -109,6 +125,9 @@ fn floats(bytes: &[u8], width: usize) -> Result<String, String> {
     let mut out = Output::default();
     out.push("[");
     for (index, chunk) in bytes.chunks_exact(width).enumerate() {
+        if out.cut {
+            break;
+        }
         if index > 0 {
             out.push(", ");
         }
@@ -135,6 +154,7 @@ fn format_float(value: f64) -> String {
 struct Output {
     text: String,
     cut: bool,
+    visits: usize,
 }
 
 impl Output {
@@ -163,6 +183,11 @@ fn quoted(text: &str) -> String {
 }
 
 fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mut Output) {
+    out.visits += 1;
+    if out.cut || out.visits > MAX_VISITS {
+        out.cut = true;
+        return;
+    }
     let Some(node) = arena.nodes.get(id) else {
         out.push("<missing>");
         return;
@@ -208,7 +233,7 @@ fn render(arena: &Arena, id: Id, depth: usize, path: &mut BTreeSet<Id>, out: &mu
         Node::Custom(label, bytes) => out.push(&format!(
             "<{label}: {} bytes {}>",
             bytes.len(),
-            crate::redis::quote_bytes(&bytes[..bytes.len().min(64)])
+            crate::redis::quote_bytes(bytes)
         )),
         Node::Map(pairs) => {
             if pairs.is_empty() {
@@ -436,7 +461,11 @@ impl Php<'_> {
     fn sized(&mut self) -> Result<Vec<u8>, String> {
         let length = self.count(b':')?;
         self.expect(b'"')?;
-        let Some(text) = self.bytes.get(self.at..self.at + length) else {
+        let Some(text) = self
+            .at
+            .checked_add(length)
+            .and_then(|end| self.bytes.get(self.at..end))
+        else {
             return self.error("a string runs past the end");
         };
         let text = text.to_vec();
@@ -549,7 +578,11 @@ impl Php<'_> {
                 self.expect(b':')?;
                 let length = self.count(b':')?;
                 self.expect(b'{')?;
-                let Some(data) = self.bytes.get(self.at..self.at + length) else {
+                let Some(data) = self
+                    .at
+                    .checked_add(length)
+                    .and_then(|end| self.bytes.get(self.at..end))
+                else {
                     return self.error("custom data runs past the end");
                 };
                 let data = data.to_vec();
@@ -757,7 +790,15 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             }
             b'F' => {
                 let text = line!();
-                let value = text.parse().unwrap_or(f64::NAN);
+                let value = match text.trim() {
+                    "nan" => f64::NAN,
+                    "inf" => f64::INFINITY,
+                    "-inf" => f64::NEG_INFINITY,
+                    text => match text.parse() {
+                        Ok(value) => value,
+                        Err(_) => return fail(at, "a float that does not read"),
+                    },
+                };
                 push(arena, &mut stack, Node::Float(value))?
             }
             b'G' => {
@@ -766,11 +807,37 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             }
             b'S' => {
                 let text = line!();
-                let text = text.trim_matches(|c| c == '\'' || c == '"').to_string();
-                push(arena, &mut stack, Node::Text(text))?
+                let Some(inner) = text
+                    .strip_prefix('\'')
+                    .and_then(|rest| rest.strip_suffix('\''))
+                    .or_else(|| {
+                        text.strip_prefix('"')
+                            .and_then(|rest| rest.strip_suffix('"'))
+                    })
+                else {
+                    return fail(at, "a STRING that is not quoted");
+                };
+                let Some(bytes) = python_escapes(inner) else {
+                    return fail(at, "a STRING with a bad escape");
+                };
+                let node = match String::from_utf8(bytes) {
+                    Ok(text) => Node::Text(text),
+                    Err(error) => Node::Bytes(error.into_bytes()),
+                };
+                push(arena, &mut stack, node)?
             }
             b'V' => {
-                let text = line!();
+                let Some(length) = bytes
+                    .get(at..)
+                    .and_then(|rest| rest.iter().position(|b| *b == b'\n'))
+                else {
+                    return fail(at, "a line without its end");
+                };
+                let raw = &bytes[at..at + length];
+                at += length + 1;
+                let Some(text) = raw_unicode_escape(raw) else {
+                    return fail(at, "a UNICODE with a bad escape");
+                };
                 push(arena, &mut stack, Node::Text(text))?
             }
             b'T' | b'X' | b'B' => {
@@ -836,10 +903,10 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
             }
             b'd' => {
                 let items = pop_mark(&mut stack, at)?;
-                let pairs = items
-                    .chunks(2)
-                    .filter_map(|pair| Some((*pair.first()?, *pair.get(1)?)));
-                push(arena, &mut stack, Node::Map(pairs.collect()))?
+                let Some(pairs) = pairs_of(&items) else {
+                    return fail(at, "a dict with a key and no value");
+                };
+                push(arena, &mut stack, Node::Map(pairs))?
             }
             b'a' | b'e' | 0x90 => {
                 let items = if opcode == b'a' {
@@ -848,6 +915,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                     pop_mark(&mut stack, at)?
                 };
                 let target = top(&stack, at)?;
+                arena.entries(items.len())?;
                 match arena.get_mut(target)? {
                     Node::List(list) | Node::Set(list) => list.extend(items),
                     Node::Object { fields, .. } => {
@@ -865,10 +933,10 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                     pop_mark(&mut stack, at)?
                 };
                 let target = top(&stack, at)?;
-                let pairs = items
-                    .chunks(2)
-                    .filter_map(|pair| Some((*pair.first()?, *pair.get(1)?)))
-                    .collect::<Vec<_>>();
+                let Some(pairs) = pairs_of(&items) else {
+                    return fail(at, "a key with no value");
+                };
+                arena.entries(pairs.len())?;
                 match arena.get_mut(target)? {
                     Node::Map(map) => map.extend(pairs),
                     Node::Object { fields, .. } => fields.extend(
@@ -977,6 +1045,9 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                     )),
                     _ => memo.len() as u64,
                 };
+                if memo.len() >= MAX_NODES && !memo.contains_key(&key) {
+                    return fail(at, "too many memo entries");
+                }
                 memo.insert(key, top(&stack, at)?);
             }
             b'g' | b'h' | b'j' => {
@@ -990,6 +1061,7 @@ fn pickle(arena: &mut Arena, bytes: &[u8]) -> Result<Id, String> {
                 let Some(&id) = memo.get(&key) else {
                     return fail(at, "a memo entry that does not exist");
                 };
+                arena.entries(1)?;
                 stack.push(Slot::Value(id));
             }
             other => return fail(at - 1, &format!("unknown opcode 0x{other:02x}")),
@@ -1064,7 +1136,7 @@ impl Java<'_> {
         } else {
             usize::from(u16::from_be_bytes(self.array()?))
         };
-        Ok(String::from_utf8_lossy(self.take(length)?).to_string())
+        Ok(modified_utf8(self.take(length)?))
     }
 
     fn read_all(mut self) -> Result<Id, String> {
@@ -1139,7 +1211,10 @@ impl Java<'_> {
                 let slot = self.handle(Handle::Value(0));
                 let count = u32::from_be_bytes(self.array()?);
                 let mut names = Vec::new();
-                for _ in 0..count.min(1024) {
+                if count as usize > MAX_NODES {
+                    return self.error("a proxy with too many interfaces");
+                }
+                for _ in 0..count {
                     names.push(self.utf(false)?);
                 }
                 self.annotations(depth + 1)?;
@@ -1250,10 +1325,14 @@ impl Java<'_> {
                 if length > MAX_NODES {
                     return self.error("an array too long to read");
                 }
-                let element = class
+                // An array's class name is "[" and its element type: "[J", "[Ljava.lang.String;".
+                let Some(element) = class
                     .as_ref()
-                    .and_then(|class| class.name.as_bytes().get(1).copied())
-                    .unwrap_or(b'L');
+                    .and_then(|class| class.name.strip_prefix('['))
+                    .and_then(|element| element.bytes().next())
+                else {
+                    return self.error("an array whose class is not an array");
+                };
                 let mut items = Vec::new();
                 for _ in 0..length {
                     items.push(if element == b'L' || element == b'[' {
@@ -1322,17 +1401,147 @@ impl Java<'_> {
                 self.arena.add(Node::Custom("block data".into(), data))
             }
             0x7A => {
-                let length = u32::from_be_bytes(self.array()?) as usize;
+                let length = usize::try_from(u32::from_be_bytes(self.array()?))
+                    .or_else(|_| self.error("block data too long"))?;
                 let data = self.take(length)?.to_vec();
                 self.arena.add(Node::Custom("block data".into(), data))
             }
             0x79 => {
+                // Resets are skipped in a loop, so a run of them cannot nest calls.
                 self.handles.clear();
+                while self.bytes.get(self.at) == Some(&0x79) {
+                    self.at += 1;
+                }
                 self.content(depth)
             }
             other => self.error(&format!("unknown content 0x{other:02x}")),
         }
     }
+}
+
+/// Key and value pairs from a flat run of items; `None` when one is left over.
+fn pairs_of(items: &[Id]) -> Option<Vec<(Id, Id)>> {
+    if !items.len().is_multiple_of(2) {
+        return None;
+    }
+    Some(
+        items
+            .chunks_exact(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect(),
+    )
+}
+
+/// The bytes of a Python string literal's inside (protocol 0 STRING): \\, \', \", \n, \r, \t,
+/// \xHH and octal escapes.
+fn python_escapes(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            let mut buffer = [0; 4];
+            out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            continue;
+        }
+        match chars.next()? {
+            '\\' => out.push(b'\\'),
+            '\'' => out.push(b'\''),
+            '"' => out.push(b'"'),
+            'n' => out.push(b'\n'),
+            'r' => out.push(b'\r'),
+            't' => out.push(b'\t'),
+            'x' => {
+                let high = chars.next()?.to_digit(16)?;
+                let low = chars.next()?.to_digit(16)?;
+                out.push((high * 16 + low) as u8);
+            }
+            digit @ '0'..='7' => {
+                let mut value = digit.to_digit(8)?;
+                for _ in 0..2 {
+                    match chars.peek().and_then(|next| next.to_digit(8)) {
+                        Some(next) => {
+                            value = value * 8 + next;
+                            chars.next();
+                        }
+                        None => break,
+                    }
+                }
+                out.push(u8::try_from(value).ok()?);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Python's raw-unicode-escape (protocol 0 UNICODE): bytes are Latin-1 characters except
+/// \uXXXX and \UXXXXXXXX.
+fn raw_unicode_escape(bytes: &[u8]) -> Option<String> {
+    let mut out = String::new();
+    let mut at = 0;
+    while let Some(&byte) = bytes.get(at) {
+        let width = match (byte, bytes.get(at + 1)) {
+            (b'\\', Some(b'u')) => 4,
+            (b'\\', Some(b'U')) => 8,
+            _ => 0,
+        };
+        if width == 0 {
+            out.push(char::from(byte));
+            at += 1;
+            continue;
+        }
+        let digits = std::str::from_utf8(bytes.get(at + 2..at + 2 + width)?).ok()?;
+        out.push(char::from_u32(u32::from_str_radix(digits, 16).ok()?)?);
+        at += 2 + width;
+    }
+    Some(out)
+}
+
+/// Java's modified UTF-8: NUL as C0 80, characters outside the BMP as two 3-byte surrogates.
+/// A lone surrogate or a broken sequence is kept visible as \u{…} rather than replaced.
+fn modified_utf8(bytes: &[u8]) -> String {
+    let mut units = Vec::new();
+    let mut at = 0;
+    while let Some(&first) = bytes.get(at) {
+        let continuation = |index: usize| {
+            bytes
+                .get(index)
+                .filter(|byte| *byte & 0xC0 == 0x80)
+                .copied()
+        };
+        let unit = match first {
+            0x01..=0x7F => {
+                at += 1;
+                Some(u16::from(first))
+            }
+            0xC0..=0xDF => continuation(at + 1).map(|second| {
+                at += 2;
+                (u16::from(first & 0x1F) << 6) | u16::from(second & 0x3F)
+            }),
+            0xE0..=0xEF => continuation(at + 1)
+                .zip(continuation(at + 2))
+                .map(|(second, third)| {
+                    at += 3;
+                    (u16::from(first & 0x0F) << 12)
+                        | (u16::from(second & 0x3F) << 6)
+                        | u16::from(third & 0x3F)
+                }),
+            _ => None,
+        };
+        match unit {
+            Some(unit) => units.push(unit),
+            None => {
+                units.push(0xFFFD);
+                at += 1;
+            }
+        }
+    }
+    char::decode_utf16(units.iter().copied())
+        .map(|decoded| match decoded {
+            Ok(character) => character.to_string(),
+            Err(error) => format!("\\u{{{:x}}}", error.unpaired_surrogate()),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1499,6 +1708,69 @@ mod tests {
             "ends early"
         );
         assert!(decode(Decoder::Java, b"plain").is_err());
+    }
+
+    #[test]
+    fn test_hostile_and_exact_inputs() {
+        // Python 3: pickle.dumps("é😀\n", protocol=0) uses raw-unicode-escape.
+        let text = decode(
+            Decoder::Pickle,
+            &hex("56e95c5530303031663630305c75303030610a70300a2e"),
+        )
+        .unwrap();
+        assert_eq!(text, quoted("é😀\n"), "{text}");
+        assert_eq!(
+            decode(Decoder::Pickle, b"S'a\\n\\x41\\'b'\n.").unwrap(),
+            quoted("a\nA'b"),
+            "protocol 0 STRING escapes"
+        );
+        assert!(
+            decode(Decoder::Pickle, b"(K\x01d.").is_err(),
+            "a dict key without a value"
+        );
+        assert!(decode(Decoder::Pickle, b"Fnot-a-float\n.").is_err());
+        // Successive lists that each hold the previous one twice grow exponentially when shown;
+        // the work stops at the visit limit.
+        let mut doubling = b"\x80\x04]\x94".to_vec();
+        for index in 0..40_u8 {
+            doubling.extend_from_slice(&[b'h', index, b'h', index, 0x86, 0x94]);
+        }
+        doubling.push(b'.');
+        let started = std::time::Instant::now();
+        let text = decode(Decoder::Pickle, &doubling).unwrap();
+        assert!(
+            text.ends_with("KB of text"),
+            "{}",
+            &text[text.len().saturating_sub(80)..]
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            decode(Decoder::Php, b"s:18446744073709551615:\"\";").is_err(),
+            "no overflow"
+        );
+        assert!(decode(Decoder::Php, b"C:1:\"A\":18446744073709551615:{}").is_err());
+        // A long run of Java resets does not nest calls.
+        let mut resets = b"\xac\xed\x00\x05".to_vec();
+        resets.extend(std::iter::repeat_n(0x79, 200_000));
+        resets.push(0x70);
+        assert_eq!(decode(Decoder::Java, &resets).unwrap(), "null");
+        // Java's modified UTF-8: NUL as C0 80 and 😀 as two surrogates.
+        assert_eq!(modified_utf8(b"a\xc0\x80\xed\xa0\xbd\xed\xb8\x80"), "a\0😀");
+        assert_eq!(
+            modified_utf8(b"\xed\xa0\xbd"),
+            "\\u{d83d}",
+            "a lone surrogate stays visible"
+        );
+        // An array class must name an array.
+        let not_array = b"\xac\xed\x00\x05\x75\x72\x00\x01X\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x78\x70\x00\x00\x00\x01";
+        assert!(decode(Decoder::Java, not_array).is_err());
+        // Recorded custom data is shown whole.
+        let long = format!("C:1:\"A\":100:{{{}}}", "z".repeat(100));
+        assert!(
+            decode(Decoder::Php, long.as_bytes())
+                .unwrap()
+                .contains(&"z".repeat(100))
+        );
     }
 
     #[test]
