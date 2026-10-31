@@ -40,9 +40,18 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
         })
         .and_then(|()| std::fs::rename(&temporary, path));
     if let Err(error) = written {
-        // Nothing half-written is left behind; the original error is what matters.
-        std::fs::remove_file(&temporary).ok();
-        return Err(error).with_context(|| format!("Could not write {}", path.display()));
+        let error =
+            anyhow::Error::from(error).context(format!("Could not write {}", path.display()));
+        // The temporary file may hold secrets; if it cannot be removed, say where it is.
+        return match std::fs::remove_file(&temporary) {
+            Err(cleanup) if cleanup.kind() != std::io::ErrorKind::NotFound => {
+                Err(error.context(format!(
+                    "and {} (private to you) could not be removed: {cleanup}",
+                    temporary.display()
+                )))
+            }
+            _ => Err(error),
+        };
     }
     Ok(())
 }
