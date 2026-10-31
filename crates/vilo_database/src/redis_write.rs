@@ -1085,15 +1085,19 @@ mod tests {
     use vilo_database_core::redis::RedisSession;
 
     /// One inline command to a test server, for what the session API does not send (CLIENT PAUSE).
-    fn send_inline(address: &str, line: &str) -> String {
+    fn send_inline(address: &str, line: &str) -> std::io::Result<String> {
         use std::io::{BufRead as _, Write as _};
-        let mut stream = std::net::TcpStream::connect(address).unwrap();
-        stream.write_all(format!("{line}\r\n").as_bytes()).unwrap();
+        let limit = std::time::Duration::from_secs(5);
+        let address = address
+            .parse()
+            .map_err(|error| std::io::Error::other(format!("{address}: {error}")))?;
+        let mut stream = std::net::TcpStream::connect_timeout(&address, limit)?;
+        stream.set_read_timeout(Some(limit))?;
+        stream.set_write_timeout(Some(limit))?;
+        stream.write_all(format!("{line}\r\n").as_bytes())?;
         let mut reply = String::new();
-        std::io::BufReader::new(stream)
-            .read_line(&mut reply)
-            .unwrap();
-        reply.trim_end().to_string()
+        std::io::BufReader::new(stream).read_line(&mut reply)?;
+        Ok(reply.trim_end().to_string())
     }
 
     /// Pumps the test executor while Tokio does the network work, until `done` or a minute passes.
@@ -1116,6 +1120,32 @@ mod tests {
         }
     }
 
+    /// Undoes what the test did to the server, the shared lock table and the disk, also when an
+    /// assertion fails halfway.
+    struct Cleanup {
+        address: String,
+        key: String,
+        lock: String,
+        data_dir: std::path::PathBuf,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for line in ["CLIENT UNPAUSE".to_string(), format!("DEL {}", self.key)] {
+                if let Err(error) = send_inline(&self.address, &line) {
+                    eprintln!("cleanup `{line}` failed: {error}");
+                }
+            }
+            let locks = crate::shared_unknown_writes();
+            if let Some(version) = locks.version(&self.lock) {
+                locks.remove_if(&self.lock, version);
+            }
+            if let Err(error) = std::fs::remove_dir_all(&self.data_dir) {
+                eprintln!("cleanup of {:?} failed: {error}", self.data_dir);
+            }
+        }
+    }
+
     #[gpui::test]
     async fn test_an_unknown_write_locks_the_key_in_every_window_even_after_its_window_closed(
         app: &mut gpui::TestAppContext,
@@ -1128,21 +1158,10 @@ mod tests {
             .trim_start_matches("redis://")
             .trim_end_matches('/')
             .to_string();
-        static DATA_DIR: std::sync::Once = std::sync::Once::new();
-        DATA_DIR.call_once(|| {
-            let dir = std::env::temp_dir().join(format!("vilo-ui-test-{}", std::process::id()));
-            paths::set_custom_data_dir(&dir.to_string_lossy());
-        });
-        app.executor().allow_parking();
-        app.update(|cx| {
-            workspace::AppState::test(cx);
-            editor::init(cx);
-            gpui_tokio::init(cx);
-        });
-        let project = project::Project::test(fs::FakeFs::new(app.executor()), [], app).await;
+        let data_dir = std::env::temp_dir().join(format!("vilo-ui-test-{}", std::process::id()));
+        // The write log goes here, not into the real config directory.
+        paths::set_custom_data_dir(&data_dir.to_string_lossy());
         let key = format!("vilo_test:ui_unknown:{}", std::process::id());
-        assert_eq!(send_inline(&address, &format!("SET {key} before")), "+OK");
-
         let connection = Connection {
             id: "ui-test-pausable".into(),
             name: "UI test".into(),
@@ -1153,23 +1172,46 @@ mod tests {
             redis_tls: None,
             redis_ssh: None,
         };
-        // Two views, as two Vilo windows hold; one test window, since a second test workspace
-        // would register its collaboration handlers again.
-        let window = app.add_window({
+        let lock = lock_key(&connection.id, 0, key.as_bytes());
+        let _cleanup = Cleanup {
+            address: address.clone(),
+            key: key.clone(),
+            lock: lock.clone(),
+            data_dir,
+        };
+        assert_eq!(
+            send_inline(&address, &format!("SET {key} before EX 600")).unwrap(),
+            "+OK"
+        );
+        app.executor().allow_parking();
+        app.update(|cx| {
+            workspace::AppState::test(cx);
+            editor::init(cx);
+            gpui_tokio::init(cx);
+        });
+        let project = project::Project::test(fs::FakeFs::new(app.executor()), [], app).await;
+        // Window B is a workspace window; window A is a window of its own holding only the
+        // database page, since a second test workspace would register its collaboration
+        // handlers again.
+        let workspace_window = app.add_window({
             let project = project.clone();
             |window, cx| workspace::MultiWorkspace::test_new(project, window, cx)
         });
-        let workspace = window
+        let workspace = workspace_window
             .read_with(app, |multi_workspace, _| {
                 multi_workspace.workspace().clone()
             })
             .unwrap();
-        let mut cx = gpui::VisualTestContext::from_window(window.into(), app);
-        let mut views = Vec::new();
-        for _ in 0..2 {
-            let view = cx.update(|window, cx| {
-                cx.new(|cx| DatabaseView::new(workspace.downgrade(), window, cx))
-            });
+        let window_a = app.add_window({
+            let workspace = workspace.downgrade();
+            |window, cx| DatabaseView::new(workspace, window, cx)
+        });
+        let view_a = window_a.root(app).unwrap();
+        let mut cx_a = gpui::VisualTestContext::from_window(window_a.into(), app);
+        let mut cx_b = gpui::VisualTestContext::from_window(workspace_window.into(), app);
+        let view_b = cx_b
+            .update(|window, cx| cx.new(|cx| DatabaseView::new(workspace.downgrade(), window, cx)));
+        for (view, cx) in [(&view_a, &mut cx_a), (&view_b, &mut cx_b)] {
             let session = cx
                 .update(|_, cx| {
                     let url = url.clone();
@@ -1178,18 +1220,15 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            view.update(&mut cx, |view, cx| {
+            view.update(cx, |view, cx| {
                 view.connections.push(connection.clone());
                 view.active = Some(connection.id.clone());
                 view.session_opened(Session::Redis(Arc::new(session)), cx);
             });
-            views.push(view);
         }
-        let view_b = views.pop().unwrap();
-        let view_a = views.pop().unwrap();
 
         // Window A edits the string and confirms; the server then holds every write.
-        view_a.update_in(&mut cx, |view, window, cx| {
+        view_a.update_in(&mut cx_a, |view, window, cx| {
             view.start_redis_write(
                 RedisOp::EditString,
                 key.clone().into_bytes(),
@@ -1199,36 +1238,44 @@ mod tests {
                 cx,
             );
         });
-        view_a.update_in(&mut cx, |view, window, cx| {
+        view_a.update_in(&mut cx_a, |view, window, cx| {
             let form = view.redis_write.as_ref().expect("the edit form opened");
             form.inputs[0]
                 .1
                 .update(cx, |editor, cx| editor.set_text("after", window, cx));
             view.review_redis_write(cx);
         });
-        wait_until(&mut cx, "the write was reviewed", |cx| {
+        wait_until(&mut cx_a, "the write was reviewed", |cx| {
             view_a.read_with(cx, |view, _| {
                 view.redis_write
                     .as_ref()
                     .is_some_and(|form| form.planned.is_some())
             })
         });
-        assert_eq!(send_inline(&address, "CLIENT PAUSE 40000 WRITE"), "+OK");
-        view_a.update(&mut cx, |view, cx| view.send_redis_write(cx));
-        assert!(view_a.read_with(&cx, |view, _| {
+        // Far longer than the 30 s command timeout; the test unpauses it itself.
+        assert_eq!(
+            send_inline(&address, "CLIENT PAUSE 120000 WRITE").unwrap(),
+            "+OK"
+        );
+        view_a.update(&mut cx_a, |view, cx| view.send_redis_write(cx));
+        assert!(view_a.read_with(&cx_a, |view, _| {
             view.redis_write.as_ref().is_some_and(|form| form.sending)
         }));
 
-        // View A goes, as when its window closes, while its write waits for an answer.
+        // Window A closes while its write waits for an answer.
+        cx_a.update(|window, _| window.remove_window());
         drop(view_a);
-        cx.run_until_parked();
-        let lock = lock_key(&connection.id, 0, key.as_bytes());
-        wait_until(&mut cx, "the write timed out as unknown", |_| {
+        cx_b.run_until_parked();
+        assert!(
+            window_a.update(app, |_, _, _| ()).is_err(),
+            "window A is closed"
+        );
+        wait_until(&mut cx_b, "the write timed out as unknown", |_| {
             crate::shared_unknown_writes().contains(&lock)
         });
 
         // Window B may not edit the key until it has read it again.
-        view_b.update_in(&mut cx, |view, window, cx| {
+        view_b.update_in(&mut cx_b, |view, window, cx| {
             view.start_redis_write(
                 RedisOp::EditString,
                 key.clone().into_bytes(),
@@ -1238,7 +1285,7 @@ mod tests {
                 cx,
             );
         });
-        view_b.read_with(&cx, |view, _| {
+        view_b.read_with(&cx_b, |view, _| {
             assert!(
                 view.redis_write.is_none(),
                 "the locked key opened an edit form"
@@ -1252,14 +1299,14 @@ mod tests {
             );
         });
 
-        assert_eq!(send_inline(&address, "CLIENT UNPAUSE"), "+OK");
-        view_b.update(&mut cx, |view, cx| {
+        assert_eq!(send_inline(&address, "CLIENT UNPAUSE").unwrap(), "+OK");
+        view_b.update(&mut cx_b, |view, cx| {
             view.open_key_matching(key.clone().into_bytes(), None, None, cx)
         });
-        wait_until(&mut cx, "reading the key again cleared its lock", |_| {
+        wait_until(&mut cx_b, "reading the key again cleared its lock", |_| {
             !crate::shared_unknown_writes().contains(&lock)
         });
-        view_b.update_in(&mut cx, |view, window, cx| {
+        view_b.update_in(&mut cx_b, |view, window, cx| {
             view.start_redis_write(
                 RedisOp::EditString,
                 key.clone().into_bytes(),
@@ -1269,13 +1316,12 @@ mod tests {
                 cx,
             );
         });
-        view_b.read_with(&cx, |view, _| {
+        view_b.read_with(&cx_b, |view, _| {
             assert!(
                 view.redis_write.is_some(),
                 "after the read the key can be edited"
             );
         });
-        assert_eq!(send_inline(&address, &format!("DEL {key}")), ":1");
     }
 
     fn values(texts: &[&str]) -> Vec<String> {
