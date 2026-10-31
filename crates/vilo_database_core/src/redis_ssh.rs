@@ -137,7 +137,9 @@ impl Drop for Askpass {
             // writer when ssh never asked, a helper still reading when ssh asked twice. Either
             // open fails when nobody waits, which is fine.
             let reader = end(false).ok();
+            // Without the reading end the writer could wait forever; it is left to the process.
             if let Some(writer) = self.writer.take()
+                && reader.is_some()
                 && writer.join().is_err()
             {
                 log::error!("the SSH password writer panicked");
@@ -155,7 +157,7 @@ impl Drop for Askpass {
 }
 
 /// Removes askpass directories a Vilo that exited while signing in left behind: this user's,
-/// older than a minute, which no sign-in still running uses.
+/// older than ten minutes, far past the time a sign-in may take.
 fn remove_stale_askpass(ours: &std::path::Path) {
     #[cfg(unix)]
     {
@@ -178,7 +180,7 @@ fn remove_stale_askpass(ours: &std::path::Path) {
                             .modified()
                             .ok()
                             .and_then(|modified| modified.elapsed().ok())
-                            .is_some_and(|age| age > Duration::from_secs(60))
+                            .is_some_and(|age| age > Duration::from_secs(600))
                 });
             if stale && let Err(error) = std::fs::remove_dir_all(&path) {
                 log::error!("could not remove a stale SSH password at {path:?}: {error}");
@@ -583,7 +585,7 @@ mod tests {
             std::fs::create_dir_all(dir).unwrap();
             std::fs::write(dir.join("password"), "left behind").unwrap();
         }
-        let old = std::time::SystemTime::now() - Duration::from_secs(600);
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
         std::fs::File::open(&stale)
             .unwrap()
             .set_modified(old)

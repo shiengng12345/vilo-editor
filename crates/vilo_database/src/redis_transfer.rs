@@ -297,8 +297,14 @@ impl DatabaseView {
                             if let (Some(ssh), Ok(password)) =
                                 (connection.redis_ssh.as_mut(), String::from_utf8(password))
                             {
-                                ssh.password =
-                                    Some(vilo_database_core::redis_ssh::SshPassword(password));
+                                // Without passwords only the fact that it has one is kept.
+                                ssh.password = Some(vilo_database_core::redis_ssh::SshPassword(
+                                    if with_secrets {
+                                        password
+                                    } else {
+                                        String::new()
+                                    },
+                                ));
                             }
                         }
                         Ok(None) => {}

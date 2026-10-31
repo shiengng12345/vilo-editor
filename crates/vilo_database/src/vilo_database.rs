@@ -3373,6 +3373,20 @@ mod tests {
         assert_eq!(save(Some(id.clone()), direct, &mut cx), None);
         assert_eq!(ssh_entry(&id), None, "turning SSH off forgets the password");
 
+        // Turning SSH back on with a password, when the keychain then refuses the connection
+        // string: the password just stored is taken away again, as there was none before.
+        gpui_test::failing().insert(format!("vilo-database://{id}"));
+        let refused = save(Some(id.clone()), through_password(&password), &mut cx);
+        gpui_test::failing().clear();
+        assert!(
+            refused
+                .as_ref()
+                .is_some_and(|message| message.contains("connection string")),
+            "{refused:?}"
+        );
+        assert_eq!(ssh_entry(&id), None, "no SSH password was there before");
+        view.update(&mut cx, |view, _| view.form = None);
+
         // Deleting the connection removes both of its keychain entries.
         assert_eq!(
             save(Some(id.clone()), through_password(&password), &mut cx),
