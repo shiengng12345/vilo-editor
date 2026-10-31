@@ -98,11 +98,12 @@ impl Askpass {
             .mode(0o700)
             .open(askpass.program())
             .context("Could not prepare the SSH password")?;
-        // ssh passes its prompt: "Enter passphrase for key …" for a key, "…'s password:" for
-        // the password. A secret not given has no pipe, so that ask fails at once.
+        // ssh passes its prompt. Only its own prompt for unlocking a key, which starts so, gets
+        // the passphrase; a host name or a server's prompt saying "passphrase" elsewhere does not.
+        // A secret not given has no pipe, so that ask fails at once.
         helper
             .write_all(
-                b"#!/bin/sh\nd=$(dirname \"$0\")\ncase \"$1\" in\n*passphrase*) exec cat \"$d/passphrase\" ;;\n*) exec cat \"$d/password\" ;;\nesac\n",
+                b"#!/bin/sh\nd=$(dirname \"$0\")\ncase \"$1\" in\n\"Enter passphrase for key '\"*) exec cat \"$d/passphrase\" ;;\n*) exec cat \"$d/password\" ;;\nesac\n",
             )
             .context("Could not prepare the SSH password")?;
         drop(helper);
@@ -297,6 +298,11 @@ impl SshTunnel {
             None
         };
         let mut master = Command::new("ssh");
+        if passphrase.is_some() {
+            // A server's keyboard-interactive prompts reach the helper too; with a passphrase in
+            // it, only ssh's own password prompt may ask, so no server can word one to get it.
+            master.args(["-o", "KbdInteractiveAuthentication=no"]);
+        }
         if let Some(askpass) = &askpass {
             // ssh takes the first value it is given for an option, so these win over the
             // shared BatchMode=yes for the master alone; control commands still never ask.
@@ -579,11 +585,23 @@ mod tests {
                 "nothing of {name} is on disk"
             );
         }
-        let password = ask(&askpass, "vboth@bastion's password: ")
+        let password = ask(&askpass, "vboth@passphrase-bastion's password: ")
             .output()
             .await
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&password.stdout), "s3cret pass");
+        assert_eq!(
+            String::from_utf8_lossy(&password.stdout),
+            "s3cret pass",
+            "a host name with \"passphrase\" in it still gets the password"
+        );
+        // A server could word a prompt like this; it never gets the key's passphrase.
+        let worded = Askpass::create(Some("server pw"), Some("key phrase")).unwrap();
+        let phished = ask(&worded, "Type your key passphrase: ")
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&phished.stdout), "server pw");
+        drop(worded);
         let passphrase = ask(&askpass, "Enter passphrase for key '/k/id': ")
             .output()
             .await

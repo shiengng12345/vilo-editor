@@ -205,7 +205,7 @@ impl DatabaseView {
                             if !secrets.is_empty() {
                                 let url = connection.ssh_credential_url();
                                 let saved = match secrets.to_bytes() {
-                                    Ok(secrets) => match cx.update(|_, cx| crate::write_credential(cx, &url, "SSH", &secrets)) {
+                                    Ok(secrets) => match cx.update(|_, cx| crate::write_credential(cx, &url, crate::SshSecrets::ACCOUNT, &secrets)) {
                                         Ok(task) => task.await,
                                         Err(_) => return,
                                     },
@@ -297,10 +297,10 @@ impl DatabaseView {
                         return;
                     };
                     match saved.await {
-                        Ok(Some((_, secrets))) => {
+                        Ok(Some((account, secrets))) => {
                             if let (Some(ssh), Ok(mut secrets)) = (
                                 connection.redis_ssh.as_mut(),
-                                crate::SshSecrets::from_bytes(secrets),
+                                crate::SshSecrets::from_entry(&account, secrets),
                             ) {
                                 // Without passwords only the fact that there are some is kept.
                                 if !with_secrets {
@@ -311,7 +311,7 @@ impl DatabaseView {
                                         secret.clear();
                                     }
                                 }
-                                secrets.apply(ssh);
+                                secrets.fill_missing(ssh);
                             }
                         }
                         Ok(None) => {}
