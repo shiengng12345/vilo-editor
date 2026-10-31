@@ -977,7 +977,7 @@ impl DatabaseView {
         state.switching = Some(database);
         state.switch_error = None;
         let generation = self.generation;
-        let read = cx.read_credentials(&connection.credential_url());
+        let read = crate::read_credential(cx, &connection.credential_url());
         cx.spawn(async move |this, cx| {
             let result = async {
                 let (_, uri) = read

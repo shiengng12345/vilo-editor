@@ -882,6 +882,11 @@ mod tests {
             "certificates are not secrets"
         );
         assert!(notes.iter().any(|note| note.contains("agent")), "{notes:?}");
+        assert_eq!(
+            notes.iter().filter(|note| note.contains("agent")).count(),
+            1,
+            "a password connection is not reported as using the agent: {notes:?}"
+        );
 
         let (full, _) = export(&connections, true).unwrap();
         let back = parse_export(&full).unwrap();

@@ -194,7 +194,7 @@ impl DatabaseView {
                 };
                 let url = connection.credential_url();
                 let saved = cx
-                    .update(|_, cx| cx.write_credentials(&url, Kind::Redis.label(), imported.uri.as_bytes()))
+                    .update(|_, cx| crate::write_credential(cx, &url, Kind::Redis.label(), imported.uri.as_bytes()))
                     .ok();
                 // A connection whose string cannot be kept is not added: it could not connect.
                 match saved {
@@ -203,7 +203,7 @@ impl DatabaseView {
                             notes.extend(imported.notes.iter().map(|note| format!("{}: {note}", imported.name)));
                             if let Some(password) = imported.ssh.as_ref().and_then(|ssh| ssh.password.clone()) {
                                 let url = connection.ssh_credential_url();
-                                let saved = match cx.update(|_, cx| cx.write_credentials(&url, "SSH", password.0.as_bytes())) {
+                                let saved = match cx.update(|_, cx| crate::write_credential(cx, &url, "SSH", password.0.as_bytes())) {
                                     Ok(task) => task.await,
                                     Err(_) => return,
                                 };
@@ -279,15 +279,17 @@ impl DatabaseView {
             let mut uris = Vec::new();
             let mut notes = Vec::new();
             for connection in &connections {
-                let Ok(read) = cx.update(|_, cx| cx.read_credentials(&connection.credential_url()))
+                let Ok(read) =
+                    cx.update(|_, cx| crate::read_credential(cx, &connection.credential_url()))
                 else {
                     return;
                 };
                 let mut connection = connection.clone();
-                // Only an export with passwords carries the SSH one.
-                if with_secrets && connection.redis_ssh.is_some() {
+                // Read even without passwords, so the notes say how it signs in; only an export
+                // with passwords writes it out.
+                if connection.redis_ssh.is_some() {
                     let url = connection.ssh_credential_url();
-                    let Ok(saved) = cx.update(|_, cx| cx.read_credentials(&url)) else {
+                    let Ok(saved) = cx.update(|_, cx| crate::read_credential(cx, &url)) else {
                         return;
                     };
                     match saved.await {

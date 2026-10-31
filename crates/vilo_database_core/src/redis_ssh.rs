@@ -54,6 +54,11 @@ struct Askpass {
 impl Askpass {
     fn create(password: &str) -> Result<Self> {
         use std::io::Write as _;
+        // Elsewhere the file could not be kept to this user.
+        anyhow::ensure!(
+            cfg!(unix),
+            "SSH passwords are only supported on macOS and Linux; use a key or the agent."
+        );
         // Short and fixed in shape, so the helper's path needs no quoting in ssh's environment.
         let dir = std::env::temp_dir().join(format!(
             "vilo-askpass-{}",
@@ -72,7 +77,7 @@ impl Askpass {
             #[cfg(unix)]
             std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
             #[cfg(not(unix))]
-            let _ = mode;
+            drop(mode);
             let mut file = options.open(askpass.dir.join(name))?;
             file.write_all(contents)?;
             Ok(())
@@ -426,7 +431,7 @@ mod tests {
         })
     }
 
-    fn askpass_dirs() -> Vec<PathBuf> {
+    fn askpass_dirs() -> std::collections::BTreeSet<PathBuf> {
         std::fs::read_dir(std::env::temp_dir())
             .map(|entries| {
                 entries
@@ -473,6 +478,8 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
+        // Compared with what was there before, so a leftover of another run cannot fail this.
+        let before = askpass_dirs();
         let (host, port) = address.rsplit_once(':').unwrap();
         let known_hosts =
             std::env::temp_dir().join(format!("vilo-known-hosts-pw-{}", std::process::id()));
@@ -489,10 +496,10 @@ mod tests {
             .unwrap();
         let pong = session.call("PING", Vec::new()).await.unwrap();
         assert_eq!(pong.as_string().as_deref(), Some("PONG"));
-        assert!(
-            askpass_dirs().is_empty(),
-            "the password is off the disk once signed in: {:?}",
-            askpass_dirs()
+        assert_eq!(
+            askpass_dirs(),
+            before,
+            "the password is off the disk once signed in"
         );
         let tunnel = session.tunnel.clone().unwrap();
         assert!(
@@ -518,7 +525,7 @@ mod tests {
             format!("{refused:#}").contains("Permission denied"),
             "{refused:#}"
         );
-        assert!(askpass_dirs().is_empty(), "removed after a refusal too");
+        assert_eq!(askpass_dirs(), before, "removed after a refusal too");
 
         let no_password = SshSettings {
             password: None,

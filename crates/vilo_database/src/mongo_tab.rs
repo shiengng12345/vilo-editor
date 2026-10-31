@@ -1818,7 +1818,7 @@ impl DatabaseView {
         let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |_, cx| {
             let credential = cx
-                .update(|_, cx| cx.read_credentials(&connection.credential_url()))?
+                .update(|_, cx| crate::read_credential(cx, &connection.credential_url()))?
                 .await?;
             let (_, uri) = credential.ok_or_else(|| anyhow!("No connection string saved"))?;
             let uri = String::from_utf8(uri)?;
