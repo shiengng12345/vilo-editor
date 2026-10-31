@@ -458,6 +458,7 @@ impl DatabaseView {
             // Released before touching the window, which may be closed by now.
             if result.is_ok() {
                 acknowledge_publishes(std::slice::from_ref(&operation));
+                crate::shared_unlogged_writes().retain(|(known, _)| *known != operation);
             }
             this.update(cx, |this, cx| {
                 let run = this.bulk_delete.as_mut().and_then(|form| form.run.as_mut());
@@ -471,8 +472,6 @@ impl DatabaseView {
                             ));
                         }
                         this.dangling_writes
-                            .retain(|(known, _)| *known != operation);
-                        this.unlogged_writes
                             .retain(|(known, _)| *known != operation);
                         // Only its own notice; another write may have replaced it since.
                         if this.write_notice.as_ref() == Some(&notice) {

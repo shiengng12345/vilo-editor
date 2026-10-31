@@ -2572,14 +2572,13 @@ impl DatabaseView {
                                         // Released before touching the window, which may be closed by now.
                                         if result.is_ok() {
                                             redis_pubsub::acknowledge_publishes(&operations);
+                                            shared_unlogged_writes()
+                                                .retain(|(operation, _)| !operations.contains(operation));
                                         }
                                         this.update(cx, |this, cx| {
                                             match result {
                                                 Ok(()) => {
                                                     this.dangling_writes.retain(|(operation, _)| {
-                                                        !operations.contains(operation)
-                                                    });
-                                                    this.unlogged_writes.retain(|(operation, _)| {
                                                         !operations.contains(operation)
                                                     });
                                                     this.audit_problem = None;

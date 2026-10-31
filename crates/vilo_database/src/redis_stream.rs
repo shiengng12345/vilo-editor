@@ -121,13 +121,12 @@ impl DatabaseView {
             // Released before touching the window, which may be closed by now.
             if result.is_ok() {
                 redis_pubsub::acknowledge_publishes(std::slice::from_ref(&operation));
+                crate::shared_unlogged_writes().retain(|(known, _)| *known != operation);
             }
             this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
                         this.dangling_writes
-                            .retain(|(known, _)| *known != operation);
-                        this.unlogged_writes
                             .retain(|(known, _)| *known != operation);
                     }
                     Err(error) => {
