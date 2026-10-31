@@ -3282,6 +3282,33 @@ mod tests {
             "the SSH password is not in the saved connections:\n{saved}"
         );
 
+        // After a restart the saved settings hold no password; switching databases on the open
+        // connection reads it from the keychain, as connecting does.
+        gpui_test::wait_until(&mut cx, "the saved connection connected", |cx| {
+            view.read_with(cx, |view, _| view.redis().is_some())
+        });
+        view.update(&mut cx, |view, cx| {
+            if let Some(ssh) = view.connections[0].redis_ssh.as_mut() {
+                ssh.password = None;
+            }
+            view.switch_redis_database(1, cx);
+        });
+        gpui_test::wait_until(&mut cx, "the database switch finished", |cx| {
+            view.read_with(cx, |view, _| {
+                view.redis_state
+                    .as_ref()
+                    .is_some_and(|state| !state.switching_database())
+            })
+        });
+        view.read_with(&cx, |view, _| {
+            let error = view
+                .redis_state
+                .as_ref()
+                .and_then(|state| state.switch_error.clone());
+            assert_eq!(error, None);
+            assert_eq!(view.redis().map(|session| session.database()), Some(1));
+        });
+
         // Editing shows it again; saving unchanged keeps it.
         view.update_in(&mut cx, |view, window, cx| {
             view.open_form(Some(id.clone()), window, cx)

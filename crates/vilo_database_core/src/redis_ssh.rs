@@ -62,6 +62,11 @@ impl Askpass {
     #[cfg(unix)]
     fn create(password: &str) -> Result<Self> {
         use std::io::Write as _;
+        // Fits any pipe's buffer, so the writer never waits on a reader once one has opened.
+        anyhow::ensure!(
+            password.len() <= MAX_PASSWORD_BYTES,
+            "The SSH password is longer than {MAX_PASSWORD_BYTES} bytes."
+        );
         use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
         // Short and fixed in shape, so the helper's path needs no quoting in ssh's environment.
         let dir = std::env::temp_dir().join(format!(
@@ -182,6 +187,8 @@ fn remove_stale_askpass(ours: &std::path::Path) {
     }
 }
 
+/// POSIX guarantees pipes at least 4 KiB of buffer.
+const MAX_PASSWORD_BYTES: usize = 1024;
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// One readiness check of the master; it answers at once once it is up.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -555,7 +562,9 @@ mod tests {
     #[tokio::test]
     async fn test_an_askpass_never_asked_is_removed_without_waiting() {
         let _serial = ASKPASS_TESTS.lock().await;
-        let askpass = Askpass::create("unused").unwrap();
+        assert!(Askpass::create(&"x".repeat(MAX_PASSWORD_BYTES + 1)).is_err());
+        // The longest password allowed, so its write cannot outgrow the pipe nobody reads.
+        let askpass = Askpass::create(&"x".repeat(MAX_PASSWORD_BYTES)).unwrap();
         let dir = askpass.dir.clone();
         let dropped = tokio::task::spawn_blocking(move || drop(askpass));
         tokio::time::timeout(Duration::from_secs(5), dropped)

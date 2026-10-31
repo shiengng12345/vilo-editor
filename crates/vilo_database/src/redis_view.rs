@@ -952,7 +952,7 @@ impl DatabaseView {
 
     /// SELECT is per connection, so a switch is a new session on the other database; the old one
     /// stays until the new one is up, and everything read or pending on the old one is dropped.
-    fn switch_redis_database(&mut self, database: u8, cx: &mut Context<Self>) {
+    pub(crate) fn switch_redis_database(&mut self, database: u8, cx: &mut Context<Self>) {
         let Some(connection) = self.active_connection().cloned() else {
             return;
         };
@@ -980,6 +980,9 @@ impl DatabaseView {
         let read = crate::read_credential(cx, &connection.credential_url());
         cx.spawn(async move |this, cx| {
             let result = async {
+                // Saved settings never hold the SSH password; it is in the keychain.
+                let mut connection = connection;
+                crate::fill_ssh_password(&mut connection, cx).await?;
                 let (_, uri) = read
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("No connection string saved."))?;
