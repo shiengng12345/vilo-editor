@@ -3115,6 +3115,49 @@ broken line";
         let before = session.slowlog_config().await;
         assert!(before.failures.is_empty(), "{:?}", before.failures);
         let threshold = before.items[0].1.unwrap();
+        let max_len = session
+            .call("CONFIG", vec!["GET".into(), "slowlog-max-len".into()])
+            .await
+            .unwrap()
+            .into_array()
+            .get(1)
+            .and_then(Value::as_string)
+            .unwrap();
+        // Put back even if an assertion fails, or every later run would log every command.
+        struct Restore {
+            url: String,
+            settings: [(&'static str, String); 2],
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let (url, settings) = (self.url.clone(), self.settings.clone());
+                let restored = std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    runtime.block_on(async {
+                        let session = RedisSession::connect(&url).await?;
+                        for (name, value) in settings {
+                            session
+                                .call("CONFIG", vec!["SET".into(), name.into(), value.into()])
+                                .await?;
+                        }
+                        anyhow::Ok(())
+                    })
+                })
+                .join();
+                if !matches!(restored, Ok(Ok(()))) {
+                    eprintln!("could not restore the slow log settings of {}", self.url);
+                }
+            }
+        }
+        let _restore = Restore {
+            url: url.to_string(),
+            settings: [
+                ("slowlog-log-slower-than", threshold.to_string()),
+                ("slowlog-max-len", max_len.clone()),
+            ],
+        };
         session
             .admin_write(&node, &AdminWrite::SlowlogReset)
             .await
@@ -3123,19 +3166,32 @@ broken line";
             .admin_write(&node, &AdminWrite::SlowlogThreshold { micros: 0 })
             .await
             .unwrap();
+        // Other tests run commands on this server meanwhile, and a threshold of 0 logs them all:
+        // the log keeps room for them and this test looks for its own command by its key.
         session
-            .call("GET", vec!["vilo_test:slow".into()])
+            .call(
+                "CONFIG",
+                vec!["SET".into(), "slowlog-max-len".into(), "1024".into()],
+            )
             .await
             .unwrap();
-        let report = session.slowlog(10).await;
+        let key = format!("vilo_test:slow:{}", std::process::id());
+        session.call("GET", vec![key.clone().into()]).await.unwrap();
+        let report = session.slowlog(1024).await;
+        session
+            .call(
+                "CONFIG",
+                vec!["SET".into(), "slowlog-max-len".into(), max_len.into()],
+            )
+            .await
+            .unwrap();
         assert!(report.failures.is_empty());
         assert!(
-            report
-                .items
-                .iter()
-                .any(|entry| entry.args.first().map(Vec::as_slice) == Some(b"GET")),
-            "{:?}",
-            report.items
+            report.items.iter().any(|entry| {
+                entry.args.first().map(Vec::as_slice) == Some(b"GET")
+                    && entry.args.get(1) == Some(&key.clone().into_bytes())
+            }),
+            "this test's GET is in the slow log"
         );
         assert!(
             report
