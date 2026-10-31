@@ -129,7 +129,13 @@ fn import_one(item: &Value) -> Result<Imported> {
     let name = text(item, &["name", "connectionName"]).unwrap_or_else(|| format!("{host}:{port}"));
     let username = text(item, &["username"]);
     let password = text(item, &["password", "auth"]);
-    let database = number(item, &["db"]).unwrap_or(0);
+    // Only an absent database means 0; one given must be a database Vilo can open.
+    let database = match field(item, &["db"]) {
+        None => 0,
+        Some(_) => number(item, &["db"])
+            .and_then(|database| u8::try_from(database).ok())
+            .context("its database is not a number from 0 to 255")?,
+    };
     let sentinel_master = text(
         item,
         &[
@@ -739,6 +745,10 @@ mod tests {
             r#"[{"port":1}]"#,
             r#"[{"host":"h","port":0}]"#,
             r#"[{"host":"h","connectionType":"SENTINEL"}]"#,
+            r#"[{"host":"h","db":-1}]"#,
+            r#"[{"host":"h","db":1.5}]"#,
+            r#"[{"host":"h","db":256}]"#,
+            r#"[{"host":"h","db":"two"}]"#,
         ] {
             assert!(parse_export(bad).is_err(), "{bad}");
         }
