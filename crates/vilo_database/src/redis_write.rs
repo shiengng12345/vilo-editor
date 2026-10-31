@@ -1131,10 +1131,21 @@ mod tests {
 
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            for line in ["CLIENT UNPAUSE".to_string(), format!("DEL {}", self.key)] {
-                if let Err(error) = send_inline(&self.address, &line) {
-                    eprintln!("cleanup `{line}` failed: {error}");
+            if let Err(error) = send_inline(&self.address, "CLIENT UNPAUSE") {
+                eprintln!("cleanup `CLIENT UNPAUSE` failed: {error}");
+            }
+            // A write still in flight logs its result once it is answered; removing the data
+            // directory before that would let the late log line create it again.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            while !mongo_write::read_dangling_writes().is_ok_and(|open| open.is_empty()) {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("cleanup: a write had no logged result after 40 s");
+                    break;
                 }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if let Err(error) = send_inline(&self.address, &format!("DEL {}", self.key)) {
+                eprintln!("cleanup `DEL {}` failed: {error}", self.key);
             }
             let locks = crate::shared_unknown_writes();
             if let Some(version) = locks.version(&self.lock) {
