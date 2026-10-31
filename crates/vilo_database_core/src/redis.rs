@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use fred::{
     cmd,
     interfaces::ClusterInterface as _,
-    prelude::{Builder, Client, ClientLike as _, Config, Server, Value},
+    prelude::{Builder, Client, ClientLike as _, Config, ReconnectPolicy, Server, Value},
 };
 
 /// How long any one command may take before its outcome is reported as unknown.
@@ -27,6 +27,19 @@ pub struct RedisSession {
     clustered: bool,
     /// The logical database every connection of this session selects, also after a reconnect.
     database: u8,
+    /// Where the connection is closed when the session is dropped.
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl Drop for RedisSession {
+    fn drop(&mut self) {
+        // fred keeps a client's connection open until it is told to quit, so a dropped session
+        // would otherwise stay connected, and keep reconnecting, until Vilo exits.
+        if let Some(runtime) = &self.runtime {
+            let client = self.client.clone();
+            runtime.spawn(async move { client.quit().await.ok() });
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -938,6 +951,10 @@ impl RedisSession {
         builder.with_performance_config(|performance| {
             performance.default_command_timeout = COMMAND_TIMEOUT;
         });
+        // Without a policy fred stops after the first dropped connection (a restart, a failover,
+        // an idle timeout) and every later command waits out its timeout. Reconnecting asks
+        // Sentinel again, so a failover is followed; unsent commands wait, a lost one is not resent.
+        builder.set_policy(ReconnectPolicy::new_exponential(0, 100, 5_000, 2));
         let client = builder.build()?;
         if let Some(tunnel) = &tunnel {
             through(&client, tunnel).await;
@@ -951,6 +968,7 @@ impl RedisSession {
             notice: None,
             clustered,
             database: selected,
+            runtime: tokio::runtime::Handle::try_current().ok(),
         })
     }
 
@@ -2400,6 +2418,7 @@ mod tests {
         ) else {
             return;
         };
+        let _serial = crate::CLUSTER_TESTS.lock().await;
         let before = tcp_port(&RedisSession::connect(&url).await.unwrap()).await;
         assert!(before.is_some(), "the master reports its port");
         let sentinel = RedisSession::connect(&sentinel_url).await.unwrap();
@@ -2449,6 +2468,145 @@ mod tests {
         );
     }
 
+    async fn client_id(session: &RedisSession) -> String {
+        session
+            .call("CLIENT", vec!["ID".into()])
+            .await
+            .unwrap()
+            .as_string()
+            .unwrap()
+    }
+
+    async fn connected(admin: &RedisSession, id: &str) -> bool {
+        let list = admin
+            .call("CLIENT", vec!["LIST".into(), "ID".into(), id.into()])
+            .await
+            .unwrap();
+        !list.as_string().unwrap_or_default().trim().is_empty()
+    }
+
+    #[tokio::test]
+    async fn test_a_dropped_session_closes_its_connection() {
+        let Ok(url) = std::env::var("VILO_TEST_REDIS") else {
+            return;
+        };
+        let admin = RedisSession::connect(&url).await.unwrap();
+        let session = RedisSession::connect(&url).await.unwrap();
+        let id = client_id(&session).await;
+        assert!(connected(&admin, &id).await);
+        drop(session);
+        let mut closed = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !connected(&admin, &id).await {
+                closed = true;
+                break;
+            }
+        }
+        assert!(
+            closed,
+            "the server still lists the dropped session's connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_session_reconnects_after_its_connection_is_killed() {
+        let Ok(url) = std::env::var("VILO_TEST_REDIS") else {
+            return;
+        };
+        let admin = RedisSession::connect(&url).await.unwrap();
+        let session = RedisSession::connect_with(&url, Some(2), None, None)
+            .await
+            .unwrap();
+        let id = client_id(&session).await;
+        admin
+            .call(
+                "CLIENT",
+                vec!["KILL".into(), "ID".into(), id.clone().into()],
+            )
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut answered = None;
+        while started.elapsed() < std::time::Duration::from_secs(10) {
+            if let Ok(reply) = session.call("CLIENT", vec!["INFO".into()]).await {
+                answered = reply.as_string();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let info = answered.expect("the session answers again after a reconnect");
+        assert!(
+            !info.contains(&format!("id={id} ")),
+            "a new connection: {info}"
+        );
+        assert!(
+            info.contains(" db=2 "),
+            "the reconnect selects the same database: {info}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "reconnecting took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_open_session_follows_a_sentinel_failover() {
+        let (Ok(url), Ok(sentinel_url)) = (
+            std::env::var("VILO_TEST_NATIVE_SENTINEL"),
+            std::env::var("VILO_TEST_NATIVE_SENTINEL_ADMIN"),
+        ) else {
+            return;
+        };
+        let _serial = crate::CLUSTER_TESTS.lock().await;
+        let session = RedisSession::connect(&url).await.unwrap();
+        let before = tcp_port(&session).await;
+        assert!(before.is_some(), "the master reports its port");
+        let sentinel = RedisSession::connect(&sentinel_url).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while let Err(error) = sentinel
+            .call("SENTINEL", vec!["FAILOVER".into(), "native".into()])
+            .await
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Sentinel keeps refusing the failover: {error:#}"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let key = format!("vilo_test:open_failover:{}", std::process::id());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let after = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the open session never reached the promoted master"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let port = tcp_port(&session).await;
+            if port.is_none() || port == before {
+                continue;
+            }
+            let write = vec![key.clone().into(), "1".into(), "PX".into(), "10000".into()];
+            if session.call("SET", write).await.is_ok() {
+                session.call("DEL", vec![key.clone().into()]).await.unwrap();
+                break port;
+            }
+        };
+        let announced = sentinel
+            .call(
+                "SENTINEL",
+                vec!["GET-MASTER-ADDR-BY-NAME".into(), "native".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            announced.into_array().get(1).and_then(Value::as_string),
+            after,
+            "the open session's master is the one Sentinel announces"
+        );
+    }
+
     async fn tcp_port(session: &RedisSession) -> Option<String> {
         session
             .call("INFO", vec!["server".into()])
@@ -2464,6 +2622,8 @@ mod tests {
         let Ok(url) = std::env::var("VILO_TEST_REDIS_SENTINEL") else {
             return;
         };
+        // The Sentinel test moves the master; these must not overlap.
+        let _serial = crate::CLUSTER_TESTS.lock().await;
         let session = RedisSession::connect(&url).await.unwrap();
         assert!(!session.is_clustered());
         session
@@ -2479,13 +2639,6 @@ mod tests {
             Some("master"),
             "writes go to the master Sentinel names"
         );
-        let node = session.scan_nodes().remove(0);
-        let error = session
-            .monitor(&node, 5)
-            .await
-            .err()
-            .expect("the profiler does not go through Sentinel");
-        assert!(format!("{error:#}").contains("Sentinel"), "{error:#}");
         session
             .call("DEL", vec!["vilo_test:sentinel".into()])
             .await

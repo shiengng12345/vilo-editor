@@ -636,6 +636,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_an_ipv6_certificate_name_is_checked() {
+        use crate::redis::RedisSession;
+        // `VILO_TEST_IPV6_NAMED_TLS_PORT` serves a certificate naming ::1;
+        // `VILO_TEST_IPV6_TLS_PORT` serves one naming only 127.0.0.1 and localhost.
+        let (Some(dir), Ok(named), Ok(unnamed)) = (
+            test_files(),
+            std::env::var("VILO_TEST_IPV6_NAMED_TLS_PORT"),
+            std::env::var("VILO_TEST_IPV6_TLS_PORT"),
+        ) else {
+            return;
+        };
+        let settings = RedisTls {
+            ca_file: Some(dir.join("ca.crt")),
+            cert_file: Some(dir.join("client.crt")),
+            key_file: Some(dir.join("client.key")),
+            ..RedisTls::default()
+        };
+        let session = RedisSession::connect_with(
+            &format!("rediss://[::1]:{named}"),
+            None,
+            Some(&settings),
+            None,
+        )
+        .await
+        .unwrap();
+        let pong = session.call("PING", Vec::new()).await.unwrap();
+        assert_eq!(pong.as_string().as_deref(), Some("PONG"));
+        let refused = RedisSession::connect_with(
+            &format!("rediss://[::1]:{unnamed}"),
+            None,
+            Some(&settings),
+            None,
+        )
+        .await;
+        let error = format!(
+            "{:#}",
+            refused
+                .err()
+                .expect("a certificate for another name is refused")
+        );
+        assert!(error.contains("NotValidForName"), "{error}");
+    }
+
+    #[tokio::test]
     async fn test_a_plain_cluster_is_found_from_one_node() {
         use crate::redis::RedisSession;
         let Ok(url) = std::env::var("VILO_TEST_REDIS_CLUSTER") else {

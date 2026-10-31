@@ -745,6 +745,9 @@ mod tests {
             nulls[0].uri, "redis://h:6379",
             "null is how RedisInsight writes unset fields"
         );
+        // RedisInsight's fourth ConnectionType value; Vilo detects the kind on connecting.
+        let unknown = parse_export(r#"[{"host":"h","connectionType":"NOT CONNECTED"}]"#).unwrap();
+        assert_eq!(unknown[0].uri, "redis://h:6379");
         let unnamed = parse_export(r#"[{"host":"h"}]"#).unwrap();
         assert_eq!(
             (unnamed[0].name.as_str(), unnamed[0].uri.as_str()),

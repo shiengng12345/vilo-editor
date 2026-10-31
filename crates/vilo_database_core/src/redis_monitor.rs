@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use fred::types::config::ServerConfig;
+use fred::{prelude::ClientLike as _, types::config::ServerConfig};
 use futures::channel::oneshot;
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
@@ -340,9 +340,15 @@ impl RedisSession {
         let server = match (&node.server, &self.config.server) {
             (Some(server), _) => server.clone(),
             (None, ServerConfig::Centralized { server }) => server.clone(),
-            _ => bail!(
-                "The profiler does not work through Sentinel yet; connect to the master directly to profile it."
-            ),
+            // The master Sentinel named when the session last connected; after a failover the
+            // session reconnects and this follows.
+            (None, ServerConfig::Sentinel { .. }) => self
+                .client
+                .active_connections()
+                .into_iter()
+                .next()
+                .context("Not connected to the master right now; try again in a moment.")?,
+            (None, _) => bail!("Choose a cluster node to profile."),
         };
         let host = server.host.to_string();
         let port = server.port;
@@ -632,6 +638,45 @@ mod tests {
         assert_eq!(ended, Some(Ok("Stopped after 1 s.".to_string())));
         assert!(session.monitor(&node, 0).await.is_err());
         assert!(session.monitor(&node, MAX_SECONDS + 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_monitor_through_sentinel_watches_the_master() {
+        let Ok(url) = std::env::var("VILO_TEST_REDIS_SENTINEL") else {
+            return;
+        };
+        // The Sentinel test moves the master; these must not overlap.
+        let _serial = crate::CLUSTER_TESTS.lock().await;
+        let session = RedisSession::connect(&url).await.unwrap();
+        let node = session.scan_nodes().remove(0);
+        let monitor = session.monitor(&node, 30).await.unwrap();
+        opened(&monitor).await.unwrap();
+        let key = format!("vilo_test:sentinel_monitor:{}", std::process::id()).into_bytes();
+        session
+            .call(
+                "SET",
+                vec![
+                    Value::Bytes(key.clone().into()),
+                    "1".into(),
+                    "PX".into(),
+                    "10000".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        wait_for(&monitor, &mut seen, |seen| {
+            seen.iter().any(|line| line.args.get(1) == Some(&key))
+        })
+        .await;
+        assert!(
+            seen.iter().any(|line| line.args.get(1) == Some(&key)),
+            "a write through Sentinel shows up in the master's MONITOR"
+        );
+        session
+            .call("DEL", vec![Value::Bytes(key.into())])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
