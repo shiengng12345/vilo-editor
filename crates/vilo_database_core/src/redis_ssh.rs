@@ -71,6 +71,7 @@ impl Askpass {
             .create(&dir)
             .context("Could not prepare the SSH password")?;
         let askpass = Self { dir };
+        remove_stale_askpass(&askpass.dir);
         let write = |name: &str, mode: u32, contents: &[u8]| -> Result<()> {
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -82,19 +83,54 @@ impl Askpass {
             file.write_all(contents)?;
             Ok(())
         };
-        write("password", 0o600, password.as_bytes())
-            .context("Could not prepare the SSH password")?;
+        // The helper deletes the password as it hands it over, so it is on disk only until ssh
+        // asks, even if Vilo exits before this directory is removed.
         write(
             "askpass",
             0o700,
-            b"#!/bin/sh\nexec cat \"$(dirname \"$0\")/password\"\n",
+            b"#!/bin/sh\nd=$(dirname \"$0\")\ncat \"$d/password\" && rm -f \"$d/password\"\n",
         )
         .context("Could not prepare the SSH password")?;
+        write("password", 0o600, password.as_bytes())
+            .context("Could not prepare the SSH password")?;
         Ok(askpass)
     }
 
     fn program(&self) -> PathBuf {
         self.dir.join("askpass")
+    }
+}
+
+/// Removes askpass directories a Vilo that exited while signing in left behind: this user's,
+/// older than a minute, which no sign-in still running uses.
+fn remove_stale_askpass(ours: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let (Some(parent), Ok(own)) = (ours.parent(), std::fs::metadata(ours)) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+            let stale = path != ours
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("vilo-askpass-"))
+                && std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                    metadata.is_dir()
+                        && metadata.uid() == own.uid()
+                        && metadata
+                            .modified()
+                            .ok()
+                            .and_then(|modified| modified.elapsed().ok())
+                            .is_some_and(|age| age > Duration::from_secs(60))
+                });
+            if stale && let Err(error) = std::fs::remove_dir_all(&path) {
+                log::error!("could not remove a stale SSH password at {path:?}: {error}");
+            }
+        }
     }
 }
 
@@ -431,6 +467,9 @@ mod tests {
         })
     }
 
+    /// Tests that create or count askpass directories in the shared temp dir take turns.
+    static ASKPASS_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn askpass_dirs() -> std::collections::BTreeSet<PathBuf> {
         std::fs::read_dir(std::env::temp_dir())
             .map(|entries| {
@@ -443,6 +482,44 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_the_askpass_helper_hands_the_password_over_once() {
+        let _serial = ASKPASS_TESTS.lock().await;
+        let askpass = Askpass::create("s3cret pass").unwrap();
+        let first = Command::new(askpass.program()).output().await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&first.stdout), "s3cret pass");
+        assert!(
+            !askpass.dir.join("password").exists(),
+            "the password is gone from disk once handed over"
+        );
+        let second = Command::new(askpass.program()).output().await.unwrap();
+        assert!(!second.status.success() && second.stdout.is_empty());
+        let dir = askpass.dir.clone();
+        drop(askpass);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn test_stale_askpass_directories_are_removed() {
+        let _serial = ASKPASS_TESTS.blocking_lock();
+        let stale = std::env::temp_dir().join(format!("vilo-askpass-stale{}", std::process::id()));
+        let fresh = std::env::temp_dir().join(format!("vilo-askpass-fresh{}", std::process::id()));
+        for dir in [&stale, &fresh] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("password"), "left behind").unwrap();
+        }
+        let old = std::time::SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let askpass = Askpass::create("new").unwrap();
+        assert!(!stale.exists(), "one left by an exited Vilo goes");
+        assert!(fresh.exists(), "one a sign-in may still use stays");
+        drop(askpass);
+        std::fs::remove_dir_all(&fresh).unwrap();
     }
 
     #[test]
@@ -478,6 +555,7 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
+        let _serial = ASKPASS_TESTS.lock().await;
         // Compared with what was there before, so a leftover of another run cannot fail this.
         let before = askpass_dirs();
         let (host, port) = address.rsplit_once(':').unwrap();
