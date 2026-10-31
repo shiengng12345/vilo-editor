@@ -87,7 +87,7 @@ impl DocWrite {
 }
 
 /// One key per document, for in-flight and unknown-outcome locks.
-fn target_key(connection: &str, database: &str, collection: &str, id: &Bson) -> String {
+pub(crate) fn target_key(connection: &str, database: &str, collection: &str, id: &Bson) -> String {
     format!(
         "{connection}/{database}/{collection}/{}",
         id.clone().into_canonical_extjson()

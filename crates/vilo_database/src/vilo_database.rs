@@ -269,8 +269,8 @@ impl SharedChecks<std::collections::BTreeSet<String>> {
         self.with(|keys| keys.remove(key));
     }
 
-    pub(crate) fn retain(&self, keep: impl FnMut(&String) -> bool) {
-        self.with(|keys| keys.retain(keep));
+    pub(crate) fn snapshot(&self) -> std::collections::BTreeSet<String> {
+        self.with(|keys| keys.clone())
     }
 }
 

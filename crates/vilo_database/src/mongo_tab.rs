@@ -1201,6 +1201,9 @@ impl DatabaseView {
         };
         let query = self.current_query(cx);
         let connection = self.generation;
+        let active = self.active.clone();
+        // Only locks taken before this read started can be cleared by what it shows.
+        let locked_before = crate::shared_unknown_writes().snapshot();
         let Some(mut request) = self.request(cx) else {
             return;
         };
@@ -1269,15 +1272,26 @@ impl DatabaseView {
                 if let Some(tab) = this.tab_at(&database, &collection)
                     && tab.generation == generation
                 {
-                    let loaded = result.is_ok();
+                    let mut unlocked = false;
                     if let Ok(page) = &result {
                         tab.learn_fields(&page.documents);
+                        // A fresh read shows what an unknown write did to the documents it
+                        // returned, so only their locks can go.
+                        if let Some(active) = &active {
+                            for key in locks_cleared_by(
+                                &locked_before,
+                                active,
+                                &database,
+                                &collection,
+                                &page.documents,
+                            ) {
+                                crate::shared_unknown_writes().remove(&key);
+                                unlocked = true;
+                            }
+                        }
                     }
                     tab.page = Some(fetched(result));
-                    // A fresh read shows what an unknown write did, so its lock can go.
-                    if loaded && let Some(active) = this.active.clone() {
-                        let prefix = format!("{active}/{database}/{collection}/");
-                        this.unknown_writes.retain(|key| !key.starts_with(&prefix));
+                    if unlocked {
                         this.write_notice = None;
                     }
                     cx.notify();
@@ -1834,6 +1848,22 @@ impl DatabaseView {
         })
         .detach_and_log_err(cx);
     }
+}
+
+/// The unknown-write locks a read clears: those of documents it returned, taken before it started.
+fn locks_cleared_by(
+    locked_before: &std::collections::BTreeSet<String>,
+    connection: &str,
+    database: &str,
+    collection: &str,
+    documents: &[Document],
+) -> Vec<String> {
+    documents
+        .iter()
+        .filter_map(|document| document.get("_id"))
+        .map(|id| crate::mongo_write::target_key(connection, database, collection, id))
+        .filter(|key| locked_before.contains(key))
+        .collect()
 }
 
 fn page_view(documents: Vec<Document>, has_more: bool) -> MongoPage {
@@ -3885,6 +3915,26 @@ fn short_count(count: u64) -> String {
 mod tests {
     use super::*;
     use vilo_database_core::bson::doc;
+
+    #[test]
+    fn test_a_read_clears_only_locks_of_documents_it_returned() {
+        let key = |id: i32| crate::mongo_write::target_key("c", "db", "coll", &Bson::Int32(id));
+        let locked_before = [key(1), key(2)].into_iter().collect();
+        let documents = [
+            doc! { "_id": 1 },
+            doc! { "_id": 3 },
+            doc! { "name": "no id" },
+        ];
+        assert_eq!(
+            locks_cleared_by(&locked_before, "c", "db", "coll", &documents),
+            vec![key(1)],
+            "2 was not returned, and 3 was locked only after the read started"
+        );
+        assert!(
+            locks_cleared_by(&locked_before, "c", "db", "other", &documents).is_empty(),
+            "a read of another collection clears nothing"
+        );
+    }
 
     #[test]
     fn test_paths_columns_and_cells() {
