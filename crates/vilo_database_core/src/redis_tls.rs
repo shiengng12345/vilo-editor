@@ -578,6 +578,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_node_whose_cluster_cannot_be_used_stays_single() {
+        // A node saying cluster_enabled:1 whose CLUSTER command does not answer, as behind
+        // some managed cluster proxies.
+        let Ok(url) = std::env::var("VILO_TEST_REDIS_CLUSTER_PROXY") else {
+            return;
+        };
+        let session = crate::redis::RedisSession::connect(&url).await.unwrap();
+        assert!(!session.is_clustered());
+        assert!(
+            session
+                .notice()
+                .is_some_and(|notice| notice.contains("cluster proxy")),
+            "{:?}",
+            session.notice()
+        );
+        session
+            .call("SET", vec!["vilo_test:proxy".into(), "1".into()])
+            .await
+            .unwrap();
+        session
+            .call("DEL", vec!["vilo_test:proxy".into()])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_a_plain_cluster_is_found_from_one_node() {
         use crate::redis::RedisSession;
         let Ok(url) = std::env::var("VILO_TEST_REDIS_CLUSTER") else {

@@ -870,13 +870,12 @@ impl RedisSession {
             fred::types::config::ServerConfig::Centralized { server } if cluster => server.clone(),
             _ => return Ok(session),
         };
-        anyhow::ensure!(
-            session.database == 0,
-            "This server is a cluster node, and a cluster only has database 0."
-        );
+        // A real cluster node refuses SELECT; one that took it is a proxy in front of a cluster
+        // (as managed Redis often is), which is used as the single server it acts as.
+        if session.database != 0 {
+            return Ok(session);
+        }
         let mut cluster = session.config.clone();
-        // The single connection is replaced either way; dropping the session closes it.
-        session.quit().await.ok();
         // The same seed, so its TLS name (an IPv6 address without brackets) is kept.
         cluster.server = fred::types::config::ServerConfig::Clustered {
             hosts: vec![seed],
@@ -886,7 +885,22 @@ impl RedisSession {
         if tls_config.is_some() {
             unbracket_tls_names(&mut cluster);
         }
-        Self::open(cluster, None, tls_pair, tunnel).await
+        // The working single connection is kept until the cluster one is up: proxies and some
+        // managed services say cluster_enabled:1 but do not answer cluster discovery.
+        match Self::open(cluster, None, tls_pair, tunnel).await {
+            Ok(clustered) => {
+                // Replaced; dropping the session closes it either way.
+                session.quit().await.ok();
+                Ok(clustered)
+            }
+            Err(error) => {
+                let mut session = session;
+                session.notice = Some(format!(
+                    "This server says it runs in cluster mode, but Vilo could not use it as a cluster ({error:#}), so it is used as a single server, as through a cluster proxy."
+                ));
+                Ok(session)
+            }
+        }
     }
 
     /// Whether the server this single connection reached runs in cluster mode.
