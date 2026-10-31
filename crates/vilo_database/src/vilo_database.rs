@@ -221,6 +221,64 @@ fn write_names(level: Level, names: Vec<String>, cx: &mut App) {
     .detach_and_log_err(cx);
 }
 
+static UNKNOWN_WRITES: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static UNLOGGED_WRITES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+static ADMIN_TO_CHECK: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Write checks every window of this process shares, so a write locked or left to check in one
+/// window is locked in all of them.
+pub(crate) struct SharedChecks<T: 'static>(&'static std::sync::Mutex<T>);
+
+impl<T> SharedChecks<T> {
+    fn with<R>(&self, change: impl FnOnce(&mut T) -> R) -> R {
+        // Every change is a single insert, push or retain, so the data stays usable after a panic.
+        change(
+            &mut self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
+impl SharedChecks<std::collections::BTreeSet<String>> {
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.with(|keys| keys.contains(key))
+    }
+
+    pub(crate) fn insert(&self, key: String) {
+        self.with(|keys| keys.insert(key));
+    }
+
+    pub(crate) fn remove(&self, key: &str) {
+        self.with(|keys| keys.remove(key));
+    }
+
+    pub(crate) fn retain(&self, keep: impl FnMut(&String) -> bool) {
+        self.with(|keys| keys.retain(keep));
+    }
+}
+
+impl SharedChecks<Vec<(String, String)>> {
+    pub(crate) fn push(&self, write: (String, String)) {
+        self.with(|writes| writes.push(write));
+    }
+
+    pub(crate) fn retain(&self, keep: impl FnMut(&(String, String)) -> bool) {
+        self.with(|writes| writes.retain(keep));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.with(|writes| writes.is_empty())
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<(String, String)> {
+        self.with(|writes| writes.clone())
+    }
+}
+
 /// This run's unlogged writes first, keeping their reason, then the log's other dangling writes.
 fn writes_to_check(
     unlogged: &[(String, String)],
@@ -493,7 +551,7 @@ pub struct DatabaseView {
     /// Production connections with writes switched on for this run of Vilo only.
     session_writes: collections::HashSet<String>,
     /// Documents whose last write has an unknown outcome; writing to them waits for a refresh.
-    unknown_writes: collections::HashSet<String>,
+    unknown_writes: SharedChecks<std::collections::BTreeSet<String>>,
     /// The write log was read since start, so locks of unsettled publishes are restored.
     write_log_checked: bool,
     write_notice: Option<SharedString>,
@@ -501,10 +559,10 @@ pub struct DatabaseView {
     dangling_writes: Vec<(String, String)>,
     /// Writes of this run whose result line could not be saved. Kept apart from the list read
     /// back from the log, because a line can be readable even though saving it failed.
-    unlogged_writes: Vec<(String, String)>,
+    unlogged_writes: SharedChecks<Vec<(String, String)>>,
     /// Operation ids in `unlogged_writes` that are administration writes; until they are checked
     /// no new administration write starts.
-    admin_to_check: collections::HashSet<String>,
+    admin_to_check: SharedChecks<std::collections::BTreeSet<String>>,
     /// Why the write log could not be read or updated, shown until it works again.
     audit_problem: Option<SharedString>,
     /// While a page is open the site, environment and connection columns fold away; hovering the
@@ -676,12 +734,12 @@ impl DatabaseView {
             bulk_delete: None,
             workbench_run: None,
             session_writes: Default::default(),
-            unknown_writes: Default::default(),
+            unknown_writes: SharedChecks(&UNKNOWN_WRITES),
             write_log_checked: false,
             write_notice: None,
             dangling_writes: Vec::new(),
-            unlogged_writes: Vec::new(),
-            admin_to_check: Default::default(),
+            unlogged_writes: SharedChecks(&UNLOGGED_WRITES),
+            admin_to_check: SharedChecks(&ADMIN_TO_CHECK),
             audit_problem: None,
             rail_peek: false,
             query_language: None,
@@ -2414,7 +2472,7 @@ impl DatabaseView {
     /// Writes to check: those of this run that could not be logged, then those the log has no
     /// result for.
     fn writes_to_check(&self) -> Vec<(String, String)> {
-        writes_to_check(&self.unlogged_writes, &self.dangling_writes)
+        writes_to_check(&self.unlogged_writes.snapshot(), &self.dangling_writes)
     }
 
     fn render_dangling_writes(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2718,6 +2776,39 @@ impl Render for DatabaseView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_write_checks_are_shared_by_every_window() {
+        // What two DatabaseViews hold: handles to the same process-wide tables.
+        let (first, second) = (SharedChecks(&UNKNOWN_WRITES), SharedChecks(&UNKNOWN_WRITES));
+        let key = format!("shared-test/{}/0/key", std::process::id());
+        first.insert(key.clone());
+        assert!(
+            second.contains(&key),
+            "a lock taken in one window holds in another"
+        );
+        second.remove(&key);
+        assert!(
+            !first.contains(&key),
+            "a lock cleared in one window is gone everywhere"
+        );
+
+        let (first, second) = (
+            SharedChecks(&UNLOGGED_WRITES),
+            SharedChecks(&UNLOGGED_WRITES),
+        );
+        let operation = format!("shared-test-{}", std::process::id());
+        first.push((operation.clone(), "reason".into()));
+        let checks = writes_to_check(&second.snapshot(), &[]);
+        assert!(checks.iter().any(|(known, _)| *known == operation));
+        second.retain(|(known, _)| *known != operation);
+        assert!(
+            !first
+                .snapshot()
+                .iter()
+                .any(|(known, _)| *known == operation)
+        );
+    }
 
     #[test]
     fn test_writes_to_check_keep_unlogged_reasons() {
