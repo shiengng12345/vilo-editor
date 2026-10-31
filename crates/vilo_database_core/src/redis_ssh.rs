@@ -109,8 +109,8 @@ impl Askpass {
             .open(askpass.program())
             .context("Could not prepare the SSH password")?;
         // ssh passes its prompt. Only its prompt for unlocking this key, word for word, gets the
-        // passphrase: it names the key's local path, which a server's keyboard-interactive
-        // prompt cannot know to copy. Any other key prompt gets nothing, so the password is never
+        // passphrase; ssh puts "(user@host)" before a server's keyboard-interactive prompts, so
+        // none can read the same. Any other key prompt gets nothing, so the password is never
         // spent on a key; everything else gets the password. A secret not given has no pipe, so
         // that ask fails at once. If Vilo exits before handing a secret over, nothing ever
         // writes to the pipe, so a watchdog ends the reading after a while and ssh fails and
