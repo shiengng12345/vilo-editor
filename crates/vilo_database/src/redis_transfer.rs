@@ -47,13 +47,22 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// The files `store_files` may have written for a connection, removed when it is not added.
-fn remove_files(id: &str) {
+/// Removes the files `store_files` may have written for a connection that is not added, and
+/// says which could not be removed. Most were never written; a missing one is fine.
+fn remove_files(id: &str) -> Vec<String> {
     let folder = paths::config_dir().join("database_certificates");
-    for suffix in ["ca", "client", "client-key", "ssh-key"] {
-        // Most of these were never written; a missing file is the usual case.
-        std::fs::remove_file(folder.join(format!("{id}-{suffix}.pem"))).ok();
-    }
+    ["ca", "client", "client-key", "ssh-key"]
+        .into_iter()
+        .filter_map(|suffix| {
+            let path = folder.join(format!("{id}-{suffix}.pem"));
+            match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    Some(format!("{} could not be removed ({error})", path.display()))
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Stores an imported connection's PEM texts as files and points its settings at them.
@@ -131,7 +140,20 @@ impl DatabaseView {
                     let mut ready = Vec::new();
                     for mut connection in imported {
                         let id = uuid::Uuid::new_v4().simple().to_string();
-                        store_files(&id, &mut connection)?;
+                        if let Err(error) = store_files(&id, &mut connection) {
+                            // Nothing is imported, so no key file written so far is kept.
+                            let left = std::iter::once(id.as_str())
+                                .chain(ready.iter().map(|(id, _): &(String, Imported)| id.as_str()))
+                                .flat_map(remove_files)
+                                .collect::<Vec<_>>();
+                            if left.is_empty() {
+                                return Err(error);
+                            }
+                            return Err(error.context(format!(
+                                "and some files written for it remain: {}",
+                                left.join("; ")
+                            )));
+                        }
                         ready.push((id, connection));
                     }
                     anyhow::Ok(ready)
@@ -173,11 +195,11 @@ impl DatabaseView {
                             added.push(connection);
                         }
                         Err(error) => {
-                            remove_files(&connection.id);
                             notes.push(format!(
                                 "{}: not imported, the keychain refused its connection string ({error:#})",
                                 imported.name
-                            ))
+                            ));
+                            notes.extend(remove_files(&connection.id));
                         }
                     },
                     None => return,

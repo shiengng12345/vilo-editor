@@ -356,11 +356,11 @@ impl RedisParts {
         port.parse::<u16>().context("Port must be a number")?;
         let mut url = url::Url::parse(&format!("{scheme}://{}:{port}", self.host))
             .context("Host is not valid")?;
-        // The url crate percent-encodes, so passwords with @ or / survive.
-        url.set_username(&self.username)
+        // Encoded here, as the url crate leaves `%` alone; so @, / and % all survive.
+        url.set_username(&urlencoding::encode(&self.username))
             .map_err(|_| anyhow!("Username is not valid"))?;
         if !self.password.is_empty() {
-            url.set_password(Some(&self.password))
+            url.set_password(Some(&urlencoding::encode(&self.password)))
                 .map_err(|_| anyhow!("Password is not valid"))?;
         }
         if !self.database.is_empty() {
@@ -2791,6 +2791,18 @@ mod tests {
             .to_uri()
             .is_err(),
             "the master group name is needed"
+        );
+        let percent = RedisParts {
+            host: "h".into(),
+            username: "a%25b".into(),
+            password: "p%40ss".into(),
+            ..Default::default()
+        };
+        let again = RedisParts::from_uri(&percent.to_uri().unwrap()).unwrap();
+        assert_eq!(
+            (again.username.as_str(), again.password.as_str()),
+            ("a%25b", "p%40ss"),
+            "a literal % in a credential stays literal"
         );
         let spaced = RedisParts {
             host: "h".into(),

@@ -264,7 +264,13 @@ fn import_one(item: &Value) -> Result<Imported> {
     );
     let mut url = url::Url::parse(&format!("{scheme}://placeholder"))
         .context("could not build its connection string")?;
-    url.set_host(Some(&host)).context("its host is not valid")?;
+    // An IPv6 address needs its brackets here, or it is cut at its first colon.
+    let bracketed = match host.trim_matches(['[', ']']).parse::<std::net::Ipv6Addr>() {
+        Ok(address) => format!("[{address}]"),
+        Err(_) => host.clone(),
+    };
+    url.set_host(Some(&bracketed))
+        .context("its host is not valid")?;
     url.set_port(Some(port)).ok();
     // Behind Sentinel RedisInsight keeps the master's sign-in under sentinelMaster and the
     // Sentinel's at the top; Vilo's string has the master's in the URL and the Sentinel's in
@@ -284,10 +290,11 @@ fn import_one(item: &Value) -> Result<Imported> {
         _ => (username.clone(), password.clone()),
     };
     if let Some(username) = &data_username {
-        url.set_username(username).ok();
+        // Encoded first: the setter leaves `%` as it is, which decoding would then read as an escape.
+        url.set_username(&urlencoding::encode(username)).ok();
     }
     if let Some(password) = &data_password {
-        url.set_password(Some(password)).ok();
+        url.set_password(Some(&urlencoding::encode(password))).ok();
     }
     if database > 0 {
         url.set_path(&format!("/{database}"));
@@ -630,6 +637,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_imported_credentials_sign_in() {
+        let Ok(url) = std::env::var("VILO_TEST_REDIS") else {
+            return;
+        };
+        let admin = crate::redis::RedisSession::connect(&url).await.unwrap();
+        let (user, password) = ("vilo%25import", "p%40ss@+&x");
+        admin
+            .call(
+                "ACL",
+                [
+                    "SETUSER",
+                    user,
+                    "reset",
+                    "on",
+                    &format!(">{password}"),
+                    "~*",
+                    "+@all",
+                ]
+                .into_iter()
+                .map(fred::prelude::Value::from)
+                .collect(),
+            )
+            .await
+            .unwrap();
+        let address = url::Url::parse(&url).unwrap();
+        let file = json!([{
+            "host": address.host_str().unwrap(),
+            "port": address.port().unwrap(),
+            "username": user,
+            "password": password,
+        }])
+        .to_string();
+        let imported = parse_export(&file).unwrap();
+        let who = match crate::redis::RedisSession::connect(&imported[0].uri).await {
+            Ok(session) => session
+                .call("ACL", vec!["WHOAMI".into()])
+                .await
+                .map(|who| who.as_string()),
+            Err(error) => Err(error),
+        };
+        // Deleting the user disconnects its clients, so only after asking.
+        admin
+            .call("ACL", vec!["DELUSER".into(), user.into()])
+            .await
+            .unwrap();
+        assert_eq!(who.unwrap().as_deref(), Some(user));
+    }
+
     #[test]
     fn test_other_names_and_shapes_are_read() {
         let base64 = base64::engine::general_purpose::STANDARD.encode(
@@ -643,6 +699,34 @@ mod tests {
             imported[0].tls.as_ref().and_then(|tls| tls.ca_file.clone()),
             Some("/etc/ca.pem".into())
         );
+        let escapes =
+            parse_export(r#"[{"host":"h","username":"a%25b","password":"p%40ss"}]"#).unwrap();
+        let url = url::Url::parse(&escapes[0].uri).unwrap();
+        assert_eq!(
+            (
+                urlencoding::decode(url.username()).unwrap().as_ref(),
+                urlencoding::decode(url.password().unwrap())
+                    .unwrap()
+                    .as_ref()
+            ),
+            ("a%25b", "p%40ss"),
+            "a literal % stays literal"
+        );
+        for host in ["::1", "[::1]", "2001:db8::1"] {
+            let imported = parse_export(&format!(r#"[{{"host":"{host}","port":6380}}]"#)).unwrap();
+            let url = url::Url::parse(&imported[0].uri).unwrap();
+            assert_eq!(
+                url.host_str()
+                    .unwrap()
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::Ipv6Addr>()
+                    .ok(),
+                host.trim_matches(['[', ']']).parse().ok(),
+                "{host} -> {}",
+                imported[0].uri
+            );
+            assert_eq!(url.port(), Some(6380));
+        }
         let unnamed = parse_export(r#"[{"host":"h"}]"#).unwrap();
         assert_eq!(
             (unnamed[0].name.as_str(), unnamed[0].uri.as_str()),
