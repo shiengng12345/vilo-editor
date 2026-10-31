@@ -2514,6 +2514,14 @@ impl DatabaseView {
     fn render_dangling_writes(&self, cx: &mut Context<Self>) -> AnyElement {
         let writes = self.writes_to_check();
         let count = writes.len();
+        // Only what this banner shows is marked checked: another window may add writes before
+        // this one renders again, and those are not checked yet.
+        // Consumer group acknowledgements and claims are checked in their group.
+        let shown = writes
+            .iter()
+            .map(|(operation, _)| operation.clone())
+            .filter(|operation| !redis_pubsub::group_operation(operation))
+            .collect::<Vec<_>>();
         v_flex()
             .m_2()
             .p_2()
@@ -2554,14 +2562,8 @@ impl DatabaseView {
                             Button::new("database-dangling-checked", "I checked them")
                                 .label_size(LabelSize::Small)
                                 .style(ButtonStyle::Outlined)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    // Consumer group acknowledgements and claims are checked in their group.
-                                    let operations = this
-                                        .writes_to_check()
-                                        .into_iter()
-                                        .map(|(operation, _)| operation)
-                                        .filter(|operation| !redis_pubsub::group_operation(operation))
-                                        .collect::<Vec<_>>();
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    let operations = shown.clone();
                                     let task = cx.background_spawn({
                                         let operations = operations.clone();
                                         async move { mongo_write::acknowledge_writes(&operations) }
