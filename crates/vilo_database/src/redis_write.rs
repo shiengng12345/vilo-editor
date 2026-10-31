@@ -1125,6 +1125,7 @@ mod tests {
     struct Cleanup {
         address: String,
         key: String,
+        connection: String,
         lock: String,
         data_dir: std::path::PathBuf,
         /// Set once a write was sent; until its result is logged the data must stay.
@@ -1132,7 +1133,7 @@ mod tests {
     }
 
     impl Cleanup {
-        /// The sent write logged both its intent and a result, whatever the result was.
+        /// This connection's sent write logged both its intent and a result, whatever the result was.
         fn sent_write_finished(&self) -> bool {
             let Ok(log) = std::fs::read_to_string(mongo_write::audit_path()) else {
                 return false;
@@ -1141,15 +1142,16 @@ mod tests {
                 .lines()
                 .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
                 .collect::<Vec<_>>();
-            let phase_of = |phase: &str| {
+            let operations = |phase: &str| {
                 entries
                     .iter()
                     .filter(|entry| entry["phase"] == phase)
+                    .filter(|entry| phase != "intent" || entry["connection"] == self.connection)
                     .filter_map(|entry| entry["operation"].as_str())
                     .collect::<std::collections::BTreeSet<_>>()
             };
-            let intents = phase_of("intent");
-            !intents.is_empty() && intents.is_subset(&phase_of("result"))
+            let intents = operations("intent");
+            !intents.is_empty() && intents.is_subset(&operations("result"))
         }
     }
 
@@ -1160,13 +1162,22 @@ mod tests {
             }
             // A sent write logs its intent and then its result from its own task; removing the
             // key or the data directory before both are written would let them come back.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
-            while self.sent.get() && !self.sent_write_finished() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut finished = !self.sent.get();
+            while !finished {
                 if std::time::Instant::now() >= deadline {
-                    eprintln!("cleanup: the sent write logged no result within 40 s");
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
+                finished = self.sent_write_finished();
+            }
+            if !finished {
+                // Removing them now could race the late write; leaving them is the safe side.
+                eprintln!(
+                    "cleanup: the sent write logged no result within 60 s; left {} and {:?}",
+                    self.key, self.data_dir
+                );
+                return;
             }
             if let Err(error) = send_inline(&self.address, &format!("DEL {}", self.key)) {
                 eprintln!("cleanup `DEL {}` failed: {error}", self.key);
@@ -1191,7 +1202,9 @@ mod tests {
         };
         let address = url
             .trim_start_matches("redis://")
-            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or_default()
             .to_string();
         let data_dir = std::env::temp_dir().join(format!("vilo-ui-test-{}", std::process::id()));
         // The write log goes here, not into the real config directory.
@@ -1211,6 +1224,7 @@ mod tests {
         let cleanup = Cleanup {
             address: address.clone(),
             key: key.clone(),
+            connection: connection.id.clone(),
             lock: lock.clone(),
             data_dir,
             sent: std::cell::Cell::new(false),
@@ -1292,6 +1306,10 @@ mod tests {
         assert_eq!(
             send_inline(&address, "CLIENT PAUSE 120000 WRITE").unwrap(),
             "+OK"
+        );
+        assert!(
+            !crate::shared_unknown_writes().contains(&lock),
+            "no lock before the write, so the wait below needs this write's timeout"
         );
         cleanup.sent.set(true);
         view_a.update(&mut cx_a, |view, cx| view.send_redis_write(cx));
