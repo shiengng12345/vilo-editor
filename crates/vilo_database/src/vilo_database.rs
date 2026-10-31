@@ -684,7 +684,10 @@ async fn connect(connection: &Connection, uri: String, cx: &AsyncApp) -> Result<
 pub(crate) fn read_credential(cx: &App, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
     #[cfg(test)]
     {
-        Task::ready(Ok(gpui_test::keychain().get(url).cloned()))
+        Task::ready(Ok(gpui_test::keychain()
+            .get(url)
+            .and_then(|entries| entries.first())
+            .cloned()))
     }
     #[cfg(not(test))]
     cx.read_credentials(url)
@@ -702,7 +705,12 @@ pub(crate) fn write_credential(
         if gpui_test::failing().contains(url) {
             return Task::ready(Err(anyhow!("the test keychain refused {url}")));
         }
-        gpui_test::keychain().insert(url.to_string(), (username.to_string(), secret.to_vec()));
+        let mut keychain = gpui_test::keychain();
+        let entries = keychain.entry(url.to_string()).or_default();
+        match entries.iter_mut().find(|(account, _)| account == username) {
+            Some(entry) => entry.1 = secret.to_vec(),
+            None => entries.push((username.to_string(), secret.to_vec())),
+        }
         Task::ready(Ok(()))
     }
     #[cfg(not(test))]
@@ -1747,6 +1755,16 @@ impl DatabaseView {
                     .map(SshSecrets::of)
                     .unwrap_or_default();
                 if !secrets.is_empty() {
+                    // Some keychains key entries by account too, so one saved under the old
+                    // account would stay beside the new one.
+                    if previous_ssh
+                        .as_ref()
+                        .is_some_and(|(account, _)| account != SshSecrets::ACCOUNT)
+                    {
+                        forget_credential(&ssh_url, cx)
+                            .await
+                            .context("Vilo could not replace the saved SSH password")?;
+                    }
                     let secrets = secrets.to_bytes()?;
                     cx.update(|cx| {
                         crate::write_credential(cx, &ssh_url, SshSecrets::ACCOUNT, &secrets)
@@ -3138,7 +3156,9 @@ impl Render for DatabaseView {
 pub(crate) mod gpui_test {
     pub(crate) static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    type Entries = std::collections::BTreeMap<String, (String, Vec<u8>)>;
+    /// By URL, then account, as Linux's secret service keys them: one URL can hold entries of
+    /// several accounts, and a read gets the first.
+    type Entries = std::collections::BTreeMap<String, Vec<(String, Vec<u8>)>>;
 
     /// The keychain while testing, shared like the real one by every view of the process.
     /// Keychain entries whose writes and deletions fail while testing, to test what follows.
@@ -3354,6 +3374,7 @@ mod tests {
         let ssh_secrets = |id: &str| {
             gpui_test::keychain()
                 .get(&format!("vilo-database-ssh://{id}"))
+                .and_then(|entries| entries.first())
                 .map(|(account, secrets)| SshSecrets::from_entry(account, secrets.clone()).unwrap())
         };
         let ssh_entry = |id: &str| ssh_secrets(id).and_then(|secrets| secrets.password);
@@ -3414,6 +3435,25 @@ mod tests {
             assert_eq!(error, None);
             assert_eq!(view.redis().map(|session| session.database()), Some(1));
         });
+
+        // An entry saved before passphrases were kept is replaced, not left beside the new one.
+        gpui_test::keychain().insert(
+            format!("vilo-database-ssh://{id}"),
+            vec![("SSH".into(), password.as_bytes().to_vec())],
+        );
+        assert_eq!(
+            save(Some(id.clone()), through_password(&password), &mut cx),
+            None
+        );
+        let accounts = gpui_test::keychain()
+            .get(&format!("vilo-database-ssh://{id}"))
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(account, _)| account.clone())
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(accounts, Some(vec![SshSecrets::ACCOUNT.to_string()]));
 
         // Editing shows it again; saving unchanged keeps it.
         view.update_in(&mut cx, |view, window, cx| {
