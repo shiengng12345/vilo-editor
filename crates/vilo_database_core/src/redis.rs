@@ -896,7 +896,7 @@ impl RedisSession {
             Err(error) => {
                 let mut session = session;
                 session.notice = Some(format!(
-                    "This server says it runs in cluster mode, but Vilo could not use it as a cluster ({error:#}), so it is used as a single server, as through a cluster proxy."
+                    "Connected as a single server: it reports cluster mode but does not answer cluster discovery, as a cluster proxy does ({error:#})."
                 ));
                 Ok(session)
             }

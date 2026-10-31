@@ -1851,10 +1851,15 @@ impl DatabaseView {
                             .child(cell(value.clone(), None, Color::Default)),
                     );
                 }
+                // How the session came to be single, when there is more to it than a plain server.
+                let note = self
+                    .redis()
+                    .and_then(|session| session.notice().map(str::to_string))
+                    .unwrap_or_else(|| "Single server (not a cluster).".into());
                 v_flex()
                     .gap_2()
                     .child(
-                        Label::new("Single server (not a cluster). Replication:")
+                        Label::new(format!("{note} Replication:"))
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
@@ -3826,23 +3831,6 @@ impl DatabaseView {
                                 }))
                             })
                     }),
-            )
-            .when_some(
-                self.redis()
-                    .and_then(|session| session.notice().map(SharedString::from)),
-                |this, notice| {
-                    this.child(
-                        h_flex()
-                            .mx_4()
-                            .mt_2()
-                            .p_2()
-                            .gap_2()
-                            .rounded_md()
-                            .bg(cx.theme().status().warning_background)
-                            .child(Icon::new(IconName::Warning).size(IconSize::Small).color(Color::Warning))
-                            .child(Label::new(notice).size(LabelSize::Small)),
-                    )
-                },
             )
             .when_some(self.write_notice.clone(), |this, notice| {
                 this.child(
