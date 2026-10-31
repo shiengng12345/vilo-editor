@@ -9,6 +9,7 @@ use fred::{
 
 /// How long any one command may take before its outcome is reported as unknown.
 pub(crate) const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Keys and values stay bytes end to end; text, hex and base64 are display choices made elsewhere.
 pub type Bytes = Vec<u8>;
@@ -28,17 +29,24 @@ pub struct RedisSession {
     /// The logical database every connection of this session selects, also after a reconnect.
     database: u8,
     /// Where the connection is closed when the session is dropped.
-    runtime: Option<tokio::runtime::Handle>,
+    runtime: tokio::runtime::Handle,
+    /// fred's connection task, stopped when the session is dropped.
+    router: Option<fred::types::ConnectHandle>,
 }
 
 impl Drop for RedisSession {
     fn drop(&mut self) {
         // fred keeps a client's connection open until it is told to quit, so a dropped session
-        // would otherwise stay connected, and keep reconnecting, until Vilo exits.
-        if let Some(runtime) = &self.runtime {
-            let client = self.client.clone();
-            runtime.spawn(async move { client.quit().await.ok() });
-        }
+        // would otherwise stay connected, and keep reconnecting, until Vilo exits. A reconnect
+        // that is mid-handshake does not see QUIT, so the task is stopped afterwards either way.
+        let client = self.client.clone();
+        let router = self.router.take();
+        self.runtime.spawn(async move {
+            tokio::time::timeout(QUIT_TIMEOUT, client.quit()).await.ok();
+            if let Some(router) = router {
+                router.abort();
+            }
+        });
     }
 }
 
@@ -959,7 +967,9 @@ impl RedisSession {
         if let Some(tunnel) = &tunnel {
             through(&client, tunnel).await;
         }
-        client.init().await.context("Could not reach Redis")?;
+        let runtime = tokio::runtime::Handle::try_current()
+            .context("Redis connections need the Tokio runtime")?;
+        let router = client.init().await.context("Could not reach Redis")?;
         Ok(Self {
             client,
             config,
@@ -968,7 +978,8 @@ impl RedisSession {
             notice: None,
             clustered,
             database: selected,
-            runtime: tokio::runtime::Handle::try_current().ok(),
+            runtime,
+            router: Some(router),
         })
     }
 
@@ -2552,6 +2563,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_command_in_flight_when_the_connection_drops_is_not_resent() {
+        let Ok(url) = std::env::var("VILO_TEST_REDIS") else {
+            return;
+        };
+        let admin = RedisSession::connect(&url).await.unwrap();
+        let session = Arc::new(RedisSession::connect(&url).await.unwrap());
+        let id = client_id(&session).await;
+        let key = format!("vilo_test:in_flight:{}", std::process::id());
+        admin.call("DEL", vec![key.clone().into()]).await.unwrap();
+        let waiting = tokio::spawn({
+            let session = session.clone();
+            let key = key.clone();
+            async move { session.call("BLPOP", vec![key.into(), "5".into()]).await }
+        });
+        let mut blocked = false;
+        for _ in 0..50 {
+            let list = admin
+                .call(
+                    "CLIENT",
+                    vec!["LIST".into(), "ID".into(), id.clone().into()],
+                )
+                .await
+                .unwrap();
+            if list.as_string().unwrap_or_default().contains("cmd=blpop") {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(blocked, "the BLPOP reached the server");
+        admin
+            .call("CLIENT", vec!["KILL".into(), "ID".into(), id.into()])
+            .await
+            .unwrap();
+        assert!(
+            waiting.await.unwrap().is_err(),
+            "a command whose connection dropped is reported, not answered"
+        );
+        admin
+            .call("RPUSH", vec![key.clone().into(), "x".into()])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let length = admin.call("LLEN", vec![key.clone().into()]).await.unwrap();
+        assert_eq!(length.as_i64(), Some(1), "the BLPOP was not sent again");
+        admin.call("DEL", vec![key.into()]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_session_dropped_while_reconnecting_stops_trying() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let Ok(url) = std::env::var("VILO_TEST_REDIS") else {
+            return;
+        };
+        let target = url
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stall = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let proxy = tokio::spawn({
+            let stall = stall.clone();
+            let attempts = attempts.clone();
+            async move {
+                let mut held = Vec::new();
+                loop {
+                    let Ok((mut downstream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    if stall.load(Ordering::SeqCst) {
+                        // Accepted but never answered, so the handshake hangs.
+                        held.push(downstream);
+                        continue;
+                    }
+                    let target = target.clone();
+                    tokio::spawn(async move {
+                        let mut upstream = tokio::net::TcpStream::connect(target).await.unwrap();
+                        tokio::io::copy_bidirectional(&mut downstream, &mut upstream)
+                            .await
+                            .ok();
+                    });
+                }
+            }
+        });
+        let admin = RedisSession::connect(&url).await.unwrap();
+        let session = RedisSession::connect(&format!("redis://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let id = client_id(&session).await;
+        stall.store(true, Ordering::SeqCst);
+        admin
+            .call("CLIENT", vec!["KILL".into(), "ID".into(), id.into()])
+            .await
+            .unwrap();
+        let mut reconnecting = false;
+        for _ in 0..100 {
+            if attempts.load(Ordering::SeqCst) >= 2 {
+                reconnecting = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(reconnecting, "the session started reconnecting");
+        drop(session);
+        tokio::time::sleep(QUIT_TIMEOUT + std::time::Duration::from_millis(500)).await;
+        let stopped_at = attempts.load(Ordering::SeqCst);
+        // Longer than fred's connection timeout plus the longest backoff.
+        tokio::time::sleep(std::time::Duration::from_secs(17)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            stopped_at,
+            "a dropped session made no further connection attempts"
+        );
+        proxy.abort();
+    }
+
+    #[tokio::test]
     async fn test_an_open_session_follows_a_sentinel_failover() {
         let (Ok(url), Ok(sentinel_url)) = (
             std::env::var("VILO_TEST_NATIVE_SENTINEL"),
@@ -2605,6 +2736,23 @@ mod tests {
             after,
             "the open session's master is the one Sentinel announces"
         );
+        let node = session.scan_nodes().remove(0);
+        let monitor = session.monitor(&node, 5).await.unwrap();
+        let mut watching = false;
+        for _ in 0..100 {
+            let clients = session.clients().await;
+            if clients
+                .items
+                .iter()
+                .any(|client| client.get("flags").contains('O'))
+            {
+                watching = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(watching, "the profiler runs on the promoted master");
+        drop(monitor);
     }
 
     async fn tcp_port(session: &RedisSession) -> Option<String> {
