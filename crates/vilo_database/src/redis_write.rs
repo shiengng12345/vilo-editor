@@ -1100,26 +1100,6 @@ mod tests {
         Ok(reply.trim_end().to_string())
     }
 
-    /// Pumps the test executor while Tokio does the network work, until `done` or a minute passes.
-    fn wait_until(
-        cx: &mut gpui::VisualTestContext,
-        what: &str,
-        mut done: impl FnMut(&mut gpui::VisualTestContext) -> bool,
-    ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            cx.run_until_parked();
-            if done(cx) {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting: {what}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-
     /// Undoes what the test did to the server, the shared lock table and the disk, also when an
     /// assertion fails halfway.
     struct Cleanup {
@@ -1192,6 +1172,8 @@ mod tests {
         }
     }
 
+    // The lock only makes these tests take turns; each runs on a thread of its own.
+    #[allow(clippy::await_holding_lock)]
     #[gpui::test]
     async fn test_an_unknown_write_locks_the_key_in_every_window_even_after_its_window_closed(
         app: &mut gpui::TestAppContext,
@@ -1206,9 +1188,11 @@ mod tests {
             .next()
             .unwrap_or_default()
             .to_string();
-        let data_dir = std::env::temp_dir().join(format!("vilo-ui-test-{}", std::process::id()));
+        let _serial = crate::gpui_test::SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The write log goes here, not into the real config directory.
-        paths::set_custom_data_dir(&data_dir.to_string_lossy());
+        let data_dir = crate::gpui_test::data_dir();
         let key = format!("vilo_test:ui_unknown:{}", std::process::id());
         let connection = Connection {
             id: "ui-test-pausable".into(),
@@ -1233,12 +1217,7 @@ mod tests {
             send_inline(&address, &format!("SET {key} before EX 600")).unwrap(),
             "+OK"
         );
-        app.executor().allow_parking();
-        app.update(|cx| {
-            workspace::AppState::test(cx);
-            editor::init(cx);
-            gpui_tokio::init(cx);
-        });
+        crate::gpui_test::init(app);
         let project = project::Project::test(fs::FakeFs::new(app.executor()), [], app).await;
         // Window B is a workspace window; window A is a window of its own holding only the
         // database page, since a second test workspace would register its collaboration
@@ -1295,7 +1274,7 @@ mod tests {
                 .update(cx, |editor, cx| editor.set_text("after", window, cx));
             view.review_redis_write(cx);
         });
-        wait_until(&mut cx_a, "the write was reviewed", |cx| {
+        crate::gpui_test::wait_until(&mut cx_a, "the write was reviewed", |cx| {
             view_a.read_with(cx, |view, _| {
                 view.redis_write
                     .as_ref()
@@ -1325,7 +1304,7 @@ mod tests {
             window_a.update(app, |_, _, _| ()).is_err(),
             "window A is closed"
         );
-        wait_until(&mut cx_b, "the write timed out as unknown", |_| {
+        crate::gpui_test::wait_until(&mut cx_b, "the write timed out as unknown", |_| {
             crate::shared_unknown_writes().contains(&lock)
         });
 
@@ -1358,7 +1337,7 @@ mod tests {
         view_b.update(&mut cx_b, |view, cx| {
             view.open_key_matching(key.clone().into_bytes(), None, None, cx)
         });
-        wait_until(&mut cx_b, "reading the key again cleared its lock", |_| {
+        crate::gpui_test::wait_until(&mut cx_b, "reading the key again cleared its lock", |_| {
             !crate::shared_unknown_writes().contains(&lock)
         });
         view_b.update_in(&mut cx_b, |view, window, cx| {

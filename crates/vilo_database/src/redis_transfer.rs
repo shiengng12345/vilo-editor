@@ -201,6 +201,19 @@ impl DatabaseView {
                     Some(task) => match task.await {
                         Ok(()) => {
                             notes.extend(imported.notes.iter().map(|note| format!("{}: {note}", imported.name)));
+                            if let Some(password) = imported.ssh.as_ref().and_then(|ssh| ssh.password.clone()) {
+                                let url = connection.ssh_credential_url();
+                                let saved = match cx.update(|_, cx| cx.write_credentials(&url, "SSH", password.0.as_bytes())) {
+                                    Ok(task) => task.await,
+                                    Err(_) => return,
+                                };
+                                if let Err(error) = saved {
+                                    notes.push(format!(
+                                        "{}: its SSH password could not be kept ({error:#}); type it in the connection",
+                                        imported.name
+                                    ));
+                                }
+                            }
                             added.push(connection);
                         }
                         Err(error) => {
@@ -270,9 +283,32 @@ impl DatabaseView {
                 else {
                     return;
                 };
+                let mut connection = connection.clone();
+                // Only an export with passwords carries the SSH one.
+                if with_secrets && connection.redis_ssh.is_some() {
+                    let url = connection.ssh_credential_url();
+                    let Ok(saved) = cx.update(|_, cx| cx.read_credentials(&url)) else {
+                        return;
+                    };
+                    match saved.await {
+                        Ok(Some((_, password))) => {
+                            if let (Some(ssh), Ok(password)) =
+                                (connection.redis_ssh.as_mut(), String::from_utf8(password))
+                            {
+                                ssh.password =
+                                    Some(vilo_database_core::redis_ssh::SshPassword(password));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => notes.push(format!(
+                            "{}: its SSH password could not be read ({error:#})",
+                            connection.name
+                        )),
+                    }
+                }
                 match read.await {
                     Ok(Some((_, uri))) => match String::from_utf8(uri) {
-                        Ok(uri) => uris.push((connection.clone(), uri)),
+                        Ok(uri) => uris.push((connection, uri)),
                         Err(_) => notes.push(format!(
                             "{}: its connection string is unreadable",
                             connection.name

@@ -109,6 +109,11 @@ impl Connection {
         format!("vilo-database://{}", self.id)
     }
 
+    /// The SSH password, kept apart from the connection string.
+    fn ssh_credential_url(&self) -> String {
+        format!("vilo-database-ssh://{}", self.id)
+    }
+
     fn at(&self, level: Level) -> &str {
         match level {
             Level::Site => self.site.trim(),
@@ -365,6 +370,10 @@ struct RedisFields {
     ssh_port: Entity<Editor>,
     ssh_user: Entity<Editor>,
     ssh_key: Entity<Editor>,
+    ssh_password: Entity<Editor>,
+    /// The saved SSH password was read into its field (or there is none), so an empty field
+    /// means no password rather than one not loaded yet.
+    ssh_password_loaded: bool,
 }
 
 impl RedisFields {
@@ -373,6 +382,8 @@ impl RedisFields {
         let text = |editor: &Entity<Editor>| editor.read(cx).text(cx).trim().to_string();
         let port = text(&self.ssh_port);
         let key = text(&self.ssh_key);
+        // Not trimmed: spaces can be part of a password.
+        let password = self.ssh_password.read(cx).text(cx);
         let settings = vilo_database_core::redis_ssh::SshSettings {
             host: text(&self.ssh_host),
             port: if port.is_empty() {
@@ -383,6 +394,8 @@ impl RedisFields {
             user: text(&self.ssh_user),
             key_file: (!key.is_empty()).then(|| PathBuf::from(key)),
             known_hosts: None,
+            password: (!password.is_empty())
+                .then(|| vilo_database_core::redis_ssh::SshPassword(password)),
         };
         anyhow::ensure!(!settings.host.is_empty(), "Fill in the SSH host.");
         anyhow::ensure!(settings.port != Some(0), "SSH port must be from 1 to 65535");
@@ -658,6 +671,27 @@ async fn connect(connection: &Connection, uri: String, cx: &AsyncApp) -> Result<
         }
     };
     handle_task.await
+}
+
+/// Fills in the SSH password saved in the keychain when the connection has none in hand.
+async fn fill_ssh_password(connection: &mut Connection, cx: &mut AsyncApp) -> Result<()> {
+    let url = connection.ssh_credential_url();
+    let Some(ssh) = connection.redis_ssh.as_mut() else {
+        return Ok(());
+    };
+    if ssh.password.is_some() {
+        return Ok(());
+    }
+    let saved = cx
+        .update(|cx| cx.read_credentials(&url))
+        .await
+        .context("Could not read the SSH password from the keychain")?;
+    if let Some((_, password)) = saved {
+        let password =
+            String::from_utf8(password).context("The saved SSH password is unreadable")?;
+        ssh.password = Some(vilo_database_core::redis_ssh::SshPassword(password));
+    }
+    Ok(())
 }
 
 impl DatabaseView {
@@ -1053,6 +1087,8 @@ impl DatabaseView {
         let generation = self.generation;
         self.tasks.push(cx.spawn(async move |this, cx| {
             let result = async {
+                let mut connection = connection;
+                fill_ssh_password(&mut connection, cx).await?;
                 let credential = cx
                     .update(|cx| cx.read_credentials(&connection.credential_url()))
                     .await
@@ -1284,6 +1320,14 @@ impl DatabaseView {
                         window,
                         cx,
                     ),
+                    ssh_password: editor(
+                        "Only for a jump host that takes a password",
+                        "",
+                        true,
+                        window,
+                        cx,
+                    ),
+                    ssh_password_loaded: saved_ssh.is_none(),
                     ssh_key: editor(
                         "Private key file; empty uses the agent and ~/.ssh/config",
                         &saved_ssh
@@ -1313,6 +1357,44 @@ impl DatabaseView {
             checking: false,
             _task: None,
         });
+        // Editing shows the saved SSH password too, so saving keeps it unless it is cleared.
+        if let Some(connection) = existing.as_ref().filter(|c| c.redis_ssh.is_some()) {
+            let id = connection.id.clone();
+            let read = cx.read_credentials(&connection.ssh_credential_url());
+            self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+                let saved = read.await;
+                this.update_in(cx, |this, window, cx| {
+                    let Some(form) = this
+                        .form
+                        .as_mut()
+                        .filter(|form| form.editing.as_ref() == Some(&id))
+                    else {
+                        return;
+                    };
+                    match saved {
+                        Ok(saved) => {
+                            if let Some(redis) = form.redis.as_mut() {
+                                if let Some((_, password)) = saved {
+                                    let password = String::from_utf8_lossy(&password).to_string();
+                                    redis.ssh_password.update(cx, |editor, cx| {
+                                        editor.set_text(password, window, cx)
+                                    });
+                                }
+                                redis.ssh_password_loaded = true;
+                            }
+                        }
+                        Err(error) => {
+                            form.message = Some(
+                                format!("Vilo could not read the saved SSH password: {error:#}")
+                                    .into(),
+                            )
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
         // Editing shows the saved connection string so it can be checked or changed in place.
         if let Some(connection) = existing
             && let Some(form) = &mut self.form
@@ -1428,6 +1510,14 @@ impl DatabaseView {
             cx.notify();
             return;
         }
+        // A cleared password field forgets the saved one, but only once it was read into it.
+        let forget_ssh_password = match &form.redis {
+            Some(redis) if redis.ssh => {
+                redis.ssh_password_loaded && redis.ssh_password.read(cx).text(cx).is_empty()
+            }
+            Some(_) => true,
+            None => false,
+        };
         // The SSH fields are filled when the form opens, so they always hold what applies.
         let redis_ssh = match &form.redis {
             Some(redis) if redis.ssh => match redis.ssh_settings(cx) {
@@ -1474,6 +1564,10 @@ impl DatabaseView {
         form.message = Some("Connecting…".into());
         form._task = Some(cx.spawn(async move |this, cx| {
             let result: Result<()> = async {
+                let mut connection = connection.clone();
+                if !forget_ssh_password {
+                    fill_ssh_password(&mut connection, cx).await?;
+                }
                 if !uri.is_empty() {
                     let expected = match connection.kind {
                         Kind::MongoDb => {
@@ -1493,6 +1587,24 @@ impl DatabaseView {
                     })
                     .await
                     .context("Vilo could not save the connection string to the keychain")?;
+                }
+                let ssh_url = connection.ssh_credential_url();
+                match connection
+                    .redis_ssh
+                    .as_ref()
+                    .and_then(|ssh| ssh.password.clone())
+                {
+                    Some(password) => cx
+                        .update(|cx| cx.write_credentials(&ssh_url, "SSH", password.0.as_bytes()))
+                        .await
+                        .context("Vilo could not save the SSH password to the keychain")?,
+                    // Nothing may be saved; failing to remove nothing is no problem.
+                    None if forget_ssh_password => {
+                        cx.update(|cx| cx.delete_credentials(&ssh_url))
+                            .await
+                            .log_err();
+                    }
+                    None => {}
                 }
                 let persist = this.update(cx, |this, cx| {
                     match this.connections.iter_mut().find(|c| c.id == connection.id) {
@@ -1536,6 +1648,11 @@ impl DatabaseView {
         let persist = self.persist(cx);
         cx.spawn(async move |_, cx| {
             persist.await?;
+            if connection.redis_ssh.is_some() {
+                cx.update(|cx| cx.delete_credentials(&connection.ssh_credential_url()))
+                    .await
+                    .log_err();
+            }
             cx.update(|cx| cx.delete_credentials(&connection.credential_url()))
                 .await
                 .context("Vilo could not remove the connection string from the keychain")
@@ -2340,7 +2457,7 @@ impl DatabaseView {
                             .style(if redis.ssh { ButtonStyle::Filled } else { ButtonStyle::Outlined })
                             .start_icon(Icon::new(if redis.ssh { IconName::Check } else { IconName::Circle }).size(IconSize::XSmall))
                             .toggle_state(redis.ssh)
-                            .tooltip(Tooltip::text("Host and port above are the server as the jump host reaches it; signs in with a key or the agent, never a password prompt"))
+                            .tooltip(Tooltip::text("Host and port above are the server as the jump host reaches it; signs in with a key, the agent or the password given here, never a prompt"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(redis) = this.form.as_mut().and_then(|form| form.redis.as_mut()) {
                                     redis.ssh = !redis.ssh;
@@ -2356,7 +2473,12 @@ impl DatabaseView {
                                 .child(div().w(px(100.)).child(input("SSH port", &redis.ssh_port, cx)))
                                 .child(div().flex_1().child(input("SSH user", &redis.ssh_user, cx))),
                         )
-                        .child(input("SSH private key", &redis.ssh_key, cx))
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .child(div().flex_1().child(input("SSH private key", &redis.ssh_key, cx)))
+                                .child(div().flex_1().child(input("SSH password", &redis.ssh_password, cx))),
+                        )
                     })
                     .when(redis.tls, |this| {
                         this.child(input("CA certificate", &redis.ca_file, cx))
@@ -2812,9 +2934,197 @@ impl Render for DatabaseView {
     }
 }
 
+/// What every GPUI test of this crate shares: they run one at a time in a data directory of
+/// their own, since the config directory can be set only once per process.
+#[cfg(test)]
+pub(crate) mod gpui_test {
+    pub(crate) static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The test data directory; a test removes it when done, and the next creates it again.
+    pub(crate) fn data_dir() -> std::path::PathBuf {
+        static SET: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        SET.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("vilo-ui-test-{}", std::process::id()));
+            paths::set_custom_data_dir(&dir.to_string_lossy());
+            dir
+        })
+        .clone()
+    }
+
+    pub(crate) fn init(app: &mut gpui::TestAppContext) {
+        app.executor().allow_parking();
+        app.update(|cx| {
+            workspace::AppState::test(cx);
+            editor::init(cx);
+            gpui_tokio::init(cx);
+        });
+    }
+
+    /// Pumps the test executor while Tokio does the network work, until `done` or a minute passes.
+    pub(crate) fn wait_until(
+        cx: &mut gpui::VisualTestContext,
+        what: &str,
+        mut done: impl FnMut(&mut gpui::VisualTestContext) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting: {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The lock only makes these tests take turns; each runs on a thread of its own.
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn test_a_redis_connection_through_a_jump_host_that_takes_a_password(
+        app: &mut gpui::TestAppContext,
+    ) {
+        let (Ok(address), Ok(user), Ok(password_file), Ok(redis)) = (
+            std::env::var("VILO_TEST_SSH_PASSWORD_HOST"),
+            std::env::var("VILO_TEST_SSH_PASSWORD_USER"),
+            std::env::var("VILO_TEST_SSH_PASSWORD_FILE"),
+            std::env::var("VILO_TEST_SSH_REDIS"),
+        ) else {
+            return;
+        };
+        let _serial = gpui_test::SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let data_dir = gpui_test::data_dir();
+        // The form has no known_hosts field, so ssh remembers the test host in the user's file;
+        // the lines it adds are taken out again when the test ends.
+        struct KnownHosts {
+            path: std::path::PathBuf,
+            before: std::collections::BTreeSet<String>,
+            data_dir: std::path::PathBuf,
+        }
+        impl Drop for KnownHosts {
+            fn drop(&mut self) {
+                if let Ok(now) = std::fs::read_to_string(&self.path) {
+                    let kept = now
+                        .lines()
+                        .filter(|line| self.before.contains(*line))
+                        .map(|line| format!("{line}\n"))
+                        .collect::<String>();
+                    if kept != now
+                        && let Err(error) = std::fs::write(&self.path, kept)
+                    {
+                        eprintln!("could not restore {:?}: {error}", self.path);
+                    }
+                }
+                if let Err(error) = std::fs::remove_dir_all(&self.data_dir)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!("cleanup of {:?} failed: {error}", self.data_dir);
+                }
+            }
+        }
+        let known_hosts = paths::home_dir().join(".ssh").join("known_hosts");
+        let _cleanup = KnownHosts {
+            before: std::fs::read_to_string(&known_hosts)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            path: known_hosts,
+            data_dir,
+        };
+        let password = std::fs::read_to_string(password_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        let (ssh_host, ssh_port) = address.rsplit_once(':').unwrap();
+        let (redis_host, redis_port) = redis
+            .trim_start_matches("redis://")
+            .rsplit_once(':')
+            .unwrap();
+        gpui_test::init(app);
+        let project = project::Project::test(fs::FakeFs::new(app.executor()), [], app).await;
+        let window =
+            app.add_window(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(app, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), app);
+        let view = cx
+            .update(|window, cx| cx.new(|cx| DatabaseView::new(workspace.downgrade(), window, cx)));
+
+        // The form as the user fills it: the server as the jump host sees it, then the SSH fields.
+        let fill = |typed_password: &str, cx: &mut gpui::VisualTestContext| {
+            view.update_in(cx, |view, window, cx| {
+                view.kind_view = Kind::Redis;
+                view.names = [vec!["Site".into()], vec!["TEST".into()]];
+                view.selected = [Some("Site".into()), Some("TEST".into())];
+                view.open_form(None, window, cx);
+                let form = view.form.as_mut().expect("the form opened");
+                let redis = form.redis.as_mut().expect("Redis fields");
+                redis.ssh = true;
+                for (editor, text) in [
+                    (&form.name, "Through a password"),
+                    (&redis.host, redis_host),
+                    (&redis.port, redis_port),
+                    (&redis.ssh_host, ssh_host),
+                    (&redis.ssh_port, ssh_port),
+                    (&redis.ssh_user, user.as_str()),
+                    (&redis.ssh_password, typed_password),
+                ] {
+                    editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
+                }
+                view.save_form(cx);
+            });
+        };
+
+        fill("not-the-password", &mut cx);
+        gpui_test::wait_until(&mut cx, "a wrong password was refused", |cx| {
+            view.read_with(cx, |view, _| {
+                view.form.as_ref().is_some_and(|form| !form.checking)
+            })
+        });
+        view.read_with(&cx, |view, _| {
+            let message = view.form.as_ref().and_then(|form| form.message.clone());
+            assert!(
+                message
+                    .as_ref()
+                    .is_some_and(|message| message.contains("Permission denied")),
+                "{message:?}"
+            );
+            assert!(view.connections.is_empty(), "nothing was saved");
+        });
+
+        fill(&password, &mut cx);
+        // Saving checks the connection first; then the form closes and the connection is kept.
+        gpui_test::wait_until(&mut cx, "the connection was checked and saved", |cx| {
+            view.read_with(cx, |view, _| {
+                view.form.is_none() && !view.connections.is_empty()
+            })
+        });
+        let saved =
+            std::fs::read_to_string(paths::config_dir().join("database_connections.json")).unwrap();
+        assert!(
+            saved.contains("redis_ssh") && saved.contains(ssh_host),
+            "{saved}"
+        );
+        assert!(
+            !saved.contains(&password),
+            "the SSH password is not in the saved connections:\n{saved}"
+        );
+        drop(view);
+        cx.run_until_parked();
+    }
 
     #[test]
     fn test_write_checks_are_shared_by_every_window() {

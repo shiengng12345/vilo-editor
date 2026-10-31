@@ -1,7 +1,8 @@
 //! SSH tunnels for Redis, as RedisInsight's: the connection goes through a jump host. The
 //! system's ssh does the work, so keys, the agent and ~/.ssh/config apply as the user has them;
-//! it never prompts. One master connection carries a local forward for every Redis node Vilo
-//! reaches, so the nodes a cluster reports go through the tunnel too.
+//! it never prompts the user, and a password, when given, is answered by Vilo itself. One master
+//! connection carries a local forward for every Redis node Vilo reaches, so the nodes a cluster
+//! reports go through the tunnel too.
 
 use std::{
     collections::HashMap,
@@ -28,9 +29,84 @@ pub struct SshSettings {
     /// time is remembered, a changed one is refused.
     #[serde(default)]
     pub known_hosts: Option<PathBuf>,
+    /// Kept in the keychain, never in the saved settings.
+    #[serde(skip)]
+    pub password: Option<SshPassword>,
+}
+
+/// An SSH password; its Debug output does not show it.
+#[derive(Clone, Default, PartialEq)]
+pub struct SshPassword(pub String);
+
+impl std::fmt::Debug for SshPassword {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SshPassword(..)")
+    }
+}
+
+/// ssh's askpass helper and the password it answers with, in a directory only this user can
+/// open. Removed once the master has signed in, so the password is never on ssh's command line
+/// or in its environment, and does not stay on disk.
+struct Askpass {
+    dir: PathBuf,
+}
+
+impl Askpass {
+    fn create(password: &str) -> Result<Self> {
+        use std::io::Write as _;
+        // Short and fixed in shape, so the helper's path needs no quoting in ssh's environment.
+        let dir = std::env::temp_dir().join(format!(
+            "vilo-askpass-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&dir)
+            .context("Could not prepare the SSH password")?;
+        let askpass = Self { dir };
+        let write = |name: &str, mode: u32, contents: &[u8]| -> Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+            #[cfg(not(unix))]
+            let _ = mode;
+            let mut file = options.open(askpass.dir.join(name))?;
+            file.write_all(contents)?;
+            Ok(())
+        };
+        write("password", 0o600, password.as_bytes())
+            .context("Could not prepare the SSH password")?;
+        write(
+            "askpass",
+            0o700,
+            b"#!/bin/sh\nexec cat \"$(dirname \"$0\")/password\"\n",
+        )
+        .context("Could not prepare the SSH password")?;
+        Ok(askpass)
+    }
+
+    fn program(&self) -> PathBuf {
+        self.dir.join("askpass")
+    }
+}
+
+impl Drop for Askpass {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+            log::error!(
+                "could not remove the SSH password at {:?}: {error}",
+                self.dir
+            );
+        }
+    }
 }
 
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
+/// One readiness check of the master; it answers at once once it is up.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 /// A control command asks the local master only; it never needs long.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 /// What is kept of the master's error output, the end of it, for saying why it failed.
@@ -103,7 +179,20 @@ impl SshTunnel {
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
         let arguments = ssh_arguments(settings, &control)?;
-        let mut master = Command::new("ssh")
+        let askpass = match &settings.password {
+            Some(password) if !password.0.is_empty() => Some(Askpass::create(&password.0)?),
+            _ => None,
+        };
+        let mut master = Command::new("ssh");
+        if let Some(askpass) = &askpass {
+            // ssh takes the first value it is given for an option, so these win over the
+            // shared BatchMode=yes for the master alone; control commands still never ask.
+            master
+                .args(["-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1"])
+                .env("SSH_ASKPASS", askpass.program())
+                .env("SSH_ASKPASS_REQUIRE", "force");
+        }
+        let mut master = master
             // The master stays this process, whatever ~/.ssh/config says, so closing the
             // session ends it.
             .args([
@@ -150,7 +239,10 @@ impl SshTunnel {
             drain: tokio::sync::Mutex::new(Some(drain)),
             forwards: Default::default(),
         });
-        tunnel.wait_ready().await?;
+        let ready = tunnel.wait_ready().await;
+        // Signed in or given up: either way ssh asks for the password no more.
+        drop(askpass);
+        ready?;
         Ok(tunnel)
     }
 
@@ -174,10 +266,11 @@ impl SshTunnel {
                 let reason = self.master_error().await;
                 bail!("The SSH connection failed ({status}): {reason}");
             }
-            // Bounded by what is left of the startup deadline, so a master that stalls while
-            // answering cannot hold the connection past it.
+            // Short, so one check that stalls is retried (and the master's exit seen) instead
+            // of using up the whole startup deadline; never past that deadline either.
             let left = READY_TIMEOUT
                 .saturating_sub(started.elapsed())
+                .min(CHECK_TIMEOUT)
                 .max(Duration::from_millis(100));
             let check = tokio::time::timeout(
                 left,
@@ -329,7 +422,115 @@ mod tests {
             user: std::env::var("VILO_TEST_SSH_USER").ok()?,
             key_file: Some(std::env::var("VILO_TEST_SSH_KEY").ok()?.into()),
             known_hosts: Some(known_hosts),
+            password: None,
         })
+    }
+
+    fn askpass_dirs() -> Vec<PathBuf> {
+        std::fs::read_dir(std::env::temp_dir())
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| {
+                        path.file_name()
+                            .is_some_and(|name| name.to_string_lossy().starts_with("vilo-askpass-"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn test_an_ssh_password_is_never_saved_or_shown() {
+        let settings = SshSettings {
+            host: "bastion".into(),
+            password: Some(SshPassword("s3cret".into())),
+            ..SshSettings::default()
+        };
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(
+            !saved.contains("s3cret") && !saved.contains("password"),
+            "{saved}"
+        );
+        assert!(!format!("{settings:?}").contains("s3cret"));
+        let read: SshSettings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(read.password, None);
+        let arguments = ssh_arguments(&settings, std::path::Path::new("/tmp/c")).unwrap();
+        assert!(!arguments.iter().any(|argument| argument.contains("s3cret")));
+    }
+
+    #[tokio::test]
+    async fn test_a_jump_host_that_takes_a_password() {
+        let (Ok(address), Ok(user), Ok(password_file), Ok(url)) = (
+            std::env::var("VILO_TEST_SSH_PASSWORD_HOST"),
+            std::env::var("VILO_TEST_SSH_PASSWORD_USER"),
+            std::env::var("VILO_TEST_SSH_PASSWORD_FILE"),
+            std::env::var("VILO_TEST_SSH_REDIS"),
+        ) else {
+            return;
+        };
+        let password = std::fs::read_to_string(password_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        let (host, port) = address.rsplit_once(':').unwrap();
+        let known_hosts =
+            std::env::temp_dir().join(format!("vilo-known-hosts-pw-{}", std::process::id()));
+        let settings = |password: &str| SshSettings {
+            host: host.to_string(),
+            port: port.parse().ok(),
+            user: user.clone(),
+            key_file: None,
+            known_hosts: Some(known_hosts.clone()),
+            password: Some(SshPassword(password.to_string())),
+        };
+        let session = RedisSession::connect_with(&url, None, None, Some(&settings(&password)))
+            .await
+            .unwrap();
+        let pong = session.call("PING", Vec::new()).await.unwrap();
+        assert_eq!(pong.as_string().as_deref(), Some("PONG"));
+        assert!(
+            askpass_dirs().is_empty(),
+            "the password is off the disk once signed in: {:?}",
+            askpass_dirs()
+        );
+        let tunnel = session.tunnel.clone().unwrap();
+        assert!(
+            !tunnel
+                .arguments
+                .iter()
+                .any(|argument| argument.contains(&password))
+        );
+        let (redis_host, redis_port) = url.trim_start_matches("redis://").rsplit_once(':').unwrap();
+        // Forwards after sign-in ask the master only, never for the password again.
+        tunnel
+            .forward(redis_host, redis_port.parse().unwrap())
+            .await
+            .unwrap();
+        drop(tunnel);
+        drop(session);
+
+        let refused = RedisSession::connect_with(&url, None, None, Some(&settings("wrong")))
+            .await
+            .err()
+            .expect("a wrong password is refused");
+        assert!(
+            format!("{refused:#}").contains("Permission denied"),
+            "{refused:#}"
+        );
+        assert!(askpass_dirs().is_empty(), "removed after a refusal too");
+
+        let no_password = SshSettings {
+            password: None,
+            ..settings("")
+        };
+        assert!(
+            RedisSession::connect_with(&url, None, None, Some(&no_password))
+                .await
+                .is_err(),
+            "without the password ssh does not prompt and the connection fails"
+        );
+        std::fs::remove_file(&known_hosts).ok();
     }
 
     #[tokio::test]
