@@ -16,23 +16,44 @@ use vilo_database_core::redis_insight::{
 
 use crate::{Connection, DatabaseView, Kind, Level};
 
-/// Writes `text` to a new file readable only by the user.
+/// Writes `text` to a file readable only by the user. It goes to a new private file first and
+/// replaces the target whole, so an existing file's looser permissions never see the text.
 fn write_private(path: &Path, text: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let parent = path.parent().context("The file has no folder")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".vilo-{}.tmp",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("Could not write {}", path.display()))?;
-    file.write_all(text.as_bytes())?;
+    let written = options
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if let Err(error) = written {
+        // Nothing half-written is left behind; the original error is what matters.
+        std::fs::remove_file(&temporary).ok();
+        return Err(error).with_context(|| format!("Could not write {}", path.display()));
+    }
     Ok(())
+}
+
+/// The files `store_files` may have written for a connection, removed when it is not added.
+fn remove_files(id: &str) {
+    let folder = paths::config_dir().join("database_certificates");
+    for suffix in ["ca", "client", "client-key", "ssh-key"] {
+        // Most of these were never written; a missing file is the usual case.
+        std::fs::remove_file(folder.join(format!("{id}-{suffix}.pem"))).ok();
+    }
 }
 
 /// Stores an imported connection's PEM texts as files and points its settings at them.
@@ -151,10 +172,13 @@ impl DatabaseView {
                             notes.extend(imported.notes.iter().map(|note| format!("{}: {note}", imported.name)));
                             added.push(connection);
                         }
-                        Err(error) => notes.push(format!(
-                            "{}: not imported, the keychain refused its connection string ({error:#})",
-                            imported.name
-                        )),
+                        Err(error) => {
+                            remove_files(&connection.id);
+                            notes.push(format!(
+                                "{}: not imported, the keychain refused its connection string ({error:#})",
+                                imported.name
+                            ))
+                        }
                     },
                     None => return,
                 }
@@ -298,6 +322,18 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret");
+        // An existing readable file is replaced by a private one, not written in place.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let open = dir.join("export.json");
+            std::fs::write(&open, "old").unwrap();
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o644)).unwrap();
+            write_private(&open, "passwords").unwrap();
+            let mode = std::fs::metadata(&open).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            assert_eq!(std::fs::read_to_string(&open).unwrap(), "passwords");
+        }
         std::fs::remove_dir_all(&dir).ok();
 
         let notes = (0..10).map(|n| format!("note {n}")).collect::<Vec<_>>();

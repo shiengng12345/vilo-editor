@@ -318,9 +318,51 @@ fn import_one(item: &Value) -> Result<Imported> {
 }
 
 /// A PEM file's text for the export, or a note saying why it is missing.
-fn read_pem(path: &Path, what: &str, notes: &mut Vec<String>, name: &str) -> Option<String> {
+/// The PEM blocks of `text` whose label contains `kind` ("CERTIFICATE" or "PRIVATE KEY"), so a
+/// file holding a certificate and its key together never puts the key in a certificate field.
+fn pem_blocks(text: &str, kind: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("-----BEGIN ") {
+        let block = &rest[start..];
+        let Some(label_end) = block["-----BEGIN ".len()..].find("-----") else {
+            break;
+        };
+        let label = &block["-----BEGIN ".len().."-----BEGIN ".len() + label_end];
+        let end_marker = format!("-----END {label}-----");
+        let Some(end) = block.find(&end_marker) else {
+            break;
+        };
+        let whole = &block[..end + end_marker.len()];
+        if label.contains(kind) {
+            out.push_str(whole);
+            out.push('\n');
+        }
+        rest = &block[end + end_marker.len()..];
+    }
+    out
+}
+
+/// The blocks of `kind` in a PEM file, or a note saying why there are none.
+fn read_pem(
+    path: &Path,
+    what: &str,
+    kind: &str,
+    notes: &mut Vec<String>,
+    name: &str,
+) -> Option<String> {
     match std::fs::read_to_string(path) {
-        Ok(text) => Some(text),
+        Ok(text) => {
+            let blocks = pem_blocks(&text, kind);
+            if blocks.is_empty() {
+                notes.push(format!(
+                    "{name}: its {what} {} holds no {kind}",
+                    path.display()
+                ));
+                return None;
+            }
+            Some(blocks)
+        }
         Err(error) => {
             notes.push(format!(
                 "{name}: its {what} {} could not be read ({error})",
@@ -348,11 +390,11 @@ pub fn export(connections: &[ToExport], with_secrets: bool) -> Result<(String, V
         } else {
             "STANDALONE"
         };
+        // Percent-decoding only: in a URL's user information `+` is a plus, not a space.
         let decode = |text: &str| {
-            url::form_urlencoded::parse(format!("x={text}").as_bytes())
-                .next()
-                .map(|(_, value)| value.into_owned())
-                .unwrap_or_default()
+            urlencoding::decode(text)
+                .map(|text| text.into_owned())
+                .unwrap_or_else(|_| text.to_string())
         };
         let parameter = |name: &str| {
             url.query_pairs()
@@ -375,7 +417,17 @@ pub fn export(connections: &[ToExport], with_secrets: bool) -> Result<(String, V
                     .unwrap_or(if kind == "SENTINEL" { 26379 } else { 6379 })
             ),
         );
-        let database = url.path().trim_matches('/').parse::<u8>().unwrap_or(0);
+        let path = url.path().trim_matches('/');
+        let database = if path.is_empty() {
+            0
+        } else {
+            path.parse::<u8>().with_context(|| {
+                format!(
+                    "{}: its database {path} is not a number from 0 to 255",
+                    connection.name
+                )
+            })?
+        };
         item.insert("db".into(), json!(database));
         item.insert("connectionType".into(), json!(kind));
         if kind == "SENTINEL" {
@@ -412,7 +464,13 @@ pub fn export(connections: &[ToExport], with_secrets: bool) -> Result<(String, V
             let settings = connection.tls.cloned().unwrap_or_default();
             item.insert("verifyServerCert".into(), json!(settings.verify));
             if let Some(path) = &settings.ca_file
-                && let Some(pem) = read_pem(path, "CA certificate", &mut notes, connection.name)
+                && let Some(pem) = read_pem(
+                    path,
+                    "CA certificate",
+                    "CERTIFICATE",
+                    &mut notes,
+                    connection.name,
+                )
             {
                 item.insert(
                     "caCert".into(),
@@ -420,16 +478,35 @@ pub fn export(connections: &[ToExport], with_secrets: bool) -> Result<(String, V
                 );
             }
             if let Some(path) = &settings.cert_file
-                && let Some(pem) = read_pem(path, "client certificate", &mut notes, connection.name)
+                && let Some(pem) = read_pem(
+                    path,
+                    "client certificate",
+                    "CERTIFICATE",
+                    &mut notes,
+                    connection.name,
+                )
             {
                 let mut client = Map::new();
                 client.insert("name".into(), json!(format!("{} client", connection.name)));
                 client.insert("certificate".into(), json!(pem));
-                if with_secrets
-                    && let Some(path) = &settings.key_file
-                    && let Some(key) = read_pem(path, "client key", &mut notes, connection.name)
-                {
-                    client.insert("key".into(), json!(key));
+                if with_secrets {
+                    match &settings.key_file {
+                        Some(path) => {
+                            if let Some(key) = read_pem(
+                                path,
+                                "client key",
+                                "PRIVATE KEY",
+                                &mut notes,
+                                connection.name,
+                            ) {
+                                client.insert("key".into(), json!(key));
+                            }
+                        }
+                        None => notes.push(format!(
+                            "{}: its client certificate has no key file, so none was exported",
+                            connection.name
+                        )),
+                    }
                 }
                 item.insert("clientCert".into(), Value::Object(client));
             }
@@ -444,7 +521,13 @@ pub fn export(connections: &[ToExport], with_secrets: bool) -> Result<(String, V
             }
             if with_secrets
                 && let Some(path) = &ssh.key_file
-                && let Some(key) = read_pem(path, "SSH private key", &mut notes, connection.name)
+                && let Some(key) = read_pem(
+                    path,
+                    "SSH private key",
+                    "PRIVATE KEY",
+                    &mut notes,
+                    connection.name,
+                )
             {
                 options.insert("privateKey".into(), json!(key));
             }
@@ -617,7 +700,7 @@ mod tests {
             ToExport {
                 id: "1",
                 name: "plain",
-                uri: "redis://u:secret@h:6379/3",
+                uri: "redis://u%2Bx:se+cr%26et@h:6379/3",
                 tls: None,
                 ssh: None,
             },
@@ -636,8 +719,18 @@ mod tests {
                 ssh: None,
             },
         ];
+        // A certificate file that also holds its key: the key is never a certificate.
+        std::fs::write(
+            &dir.join("client.pem"),
+            "-----BEGIN CERTIFICATE-----\nC\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nK\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
         let (plain, notes) = export(&connections, false).unwrap();
-        for secret in ["secret", "dpw", "spw", "PRIVATE KEY"] {
+        assert!(
+            plain.contains("\"u+x\""),
+            "a + in a user name stays a plus:\n{plain}"
+        );
+        for secret in ["cr&et", "dpw", "spw", "PRIVATE KEY"] {
             assert!(
                 !plain.contains(secret),
                 "{secret} left out by default:\n{plain}"
@@ -651,7 +744,17 @@ mod tests {
 
         let (full, _) = export(&connections, true).unwrap();
         let back = parse_export(&full).unwrap();
-        assert_eq!(back[0].uri, "redis://u:secret@h:6379/3");
+        let plain_back = url::Url::parse(&back[0].uri).unwrap();
+        assert_eq!(
+            (
+                urlencoding::decode(plain_back.username()).unwrap().as_ref(),
+                urlencoding::decode(plain_back.password().unwrap())
+                    .unwrap()
+                    .as_ref()
+            ),
+            ("u+x", "se+cr&et")
+        );
+        assert_eq!(plain_back.path(), "/3");
         assert_eq!(back[1].uri, "rediss-cluster://h:7000");
         assert!(back[1].client_key_pem.is_some());
         assert_eq!(
