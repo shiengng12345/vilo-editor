@@ -1278,14 +1278,14 @@ impl DatabaseView {
                         // A fresh read shows what an unknown write did to the documents it
                         // returned, so only their locks can go.
                         if let Some(active) = &active {
-                            for key in locks_cleared_by(
+                            for (key, version) in locks_cleared_by(
                                 &locked_before,
                                 active,
                                 &database,
                                 &collection,
                                 &page.documents,
                             ) {
-                                crate::shared_unknown_writes().remove(&key);
+                                crate::shared_unknown_writes().remove_if(&key, version);
                                 unlocked = true;
                             }
                         }
@@ -1852,17 +1852,20 @@ impl DatabaseView {
 
 /// The unknown-write locks a read clears: those of documents it returned, taken before it started.
 fn locks_cleared_by(
-    locked_before: &std::collections::BTreeSet<String>,
+    locked_before: &std::collections::BTreeMap<String, u64>,
     connection: &str,
     database: &str,
     collection: &str,
     documents: &[Document],
-) -> Vec<String> {
+) -> Vec<(String, u64)> {
     documents
         .iter()
         .filter_map(|document| document.get("_id"))
         .map(|id| crate::mongo_write::target_key(connection, database, collection, id))
-        .filter(|key| locked_before.contains(key))
+        .filter_map(|key| {
+            let version = *locked_before.get(&key)?;
+            Some((key, version))
+        })
         .collect()
 }
 
@@ -3919,7 +3922,7 @@ mod tests {
     #[test]
     fn test_a_read_clears_only_locks_of_documents_it_returned() {
         let key = |id: i32| crate::mongo_write::target_key("c", "db", "coll", &Bson::Int32(id));
-        let locked_before = [key(1), key(2)].into_iter().collect();
+        let locked_before = [(key(1), 7), (key(2), 8)].into_iter().collect();
         let documents = [
             doc! { "_id": 1 },
             doc! { "_id": 3 },
@@ -3927,7 +3930,7 @@ mod tests {
         ];
         assert_eq!(
             locks_cleared_by(&locked_before, "c", "db", "coll", &documents),
-            vec![key(1)],
+            vec![(key(1), 7)],
             "2 was not returned, and 3 was locked only after the read started"
         );
         assert!(

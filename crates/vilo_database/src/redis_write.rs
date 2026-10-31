@@ -283,11 +283,12 @@ impl DatabaseView {
         self.redis().map_or(0, |session| session.database())
     }
 
-    pub(crate) fn clear_redis_lock(&mut self, key: &[u8]) {
-        if let Some(connection) = &self.active {
-            self.unknown_writes
-                .remove(&lock_key(connection, self.redis_database(), key));
-        }
+    /// The key's lock as a read starting now sees it, to clear once that read succeeds.
+    pub(crate) fn redis_lock_seen(&self, key: &[u8]) -> Option<(String, u64)> {
+        let connection = self.active.as_ref()?;
+        let lock = lock_key(connection, self.redis_database(), key);
+        let version = self.unknown_writes.version(&lock)?;
+        Some((lock, version))
     }
 
     /// `prefill` fills the inputs in order (a row's field and value, a string's value); it must be

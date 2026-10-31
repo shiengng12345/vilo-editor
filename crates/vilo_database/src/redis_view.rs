@@ -1397,6 +1397,7 @@ impl DatabaseView {
             return;
         };
         let connection = self.generation;
+        let lock_seen = self.redis_lock_seen(&key);
         let Some(state) = self.redis_state() else {
             return;
         };
@@ -1489,7 +1490,9 @@ impl DatabaseView {
                 }
                 // A fresh read shows what an unknown write did, so the key's lock can go.
                 if result.is_ok() {
-                    this.clear_redis_lock(&key);
+                    if let Some((lock, version)) = &lock_seen {
+                        crate::shared_unknown_writes().remove_if(lock, *version);
+                    }
                     this.write_notice = None;
                 }
                 if let Some(state) = this.redis_state()

@@ -221,8 +221,10 @@ fn write_names(level: Level, names: Vec<String>, cx: &mut App) {
     .detach_and_log_err(cx);
 }
 
-static UNKNOWN_WRITES: std::sync::Mutex<std::collections::BTreeSet<String>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+/// Each lock with the version it was taken at.
+static UNKNOWN_WRITES: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static LOCK_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UNLOGGED_WRITES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 static ADMIN_TO_CHECK: std::sync::Mutex<std::collections::BTreeSet<String>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
@@ -232,7 +234,7 @@ static ADMIN_TO_CHECK: std::sync::Mutex<std::collections::BTreeSet<String>> =
 pub(crate) struct SharedChecks<T: 'static>(&'static std::sync::Mutex<T>);
 
 // For write tasks that finish after their window closed: they record here, not on the view.
-pub(crate) fn shared_unknown_writes() -> SharedChecks<std::collections::BTreeSet<String>> {
+pub(crate) fn shared_unknown_writes() -> SharedChecks<std::collections::BTreeMap<String, u64>> {
     SharedChecks(&UNKNOWN_WRITES)
 }
 
@@ -264,13 +266,34 @@ impl SharedChecks<std::collections::BTreeSet<String>> {
     pub(crate) fn insert(&self, key: String) {
         self.with(|keys| keys.insert(key));
     }
+}
 
-    pub(crate) fn remove(&self, key: &str) {
-        self.with(|keys| keys.remove(key));
+impl SharedChecks<std::collections::BTreeMap<String, u64>> {
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.with(|locks| locks.contains_key(key))
     }
 
-    pub(crate) fn snapshot(&self) -> std::collections::BTreeSet<String> {
-        self.with(|keys| keys.clone())
+    /// Takes the lock anew, so reads that started before it cannot clear it.
+    pub(crate) fn insert(&self, key: String) {
+        let version = LOCK_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.with(|locks| locks.insert(key, version));
+    }
+
+    pub(crate) fn version(&self, key: &str) -> Option<u64> {
+        self.with(|locks| locks.get(key).copied())
+    }
+
+    /// Clears the lock only if it is still the one a read saw when it started.
+    pub(crate) fn remove_if(&self, key: &str, version: u64) {
+        self.with(|locks| {
+            if locks.get(key) == Some(&version) {
+                locks.remove(key);
+            }
+        });
+    }
+
+    pub(crate) fn snapshot(&self) -> std::collections::BTreeMap<String, u64> {
+        self.with(|locks| locks.clone())
     }
 }
 
@@ -564,7 +587,7 @@ pub struct DatabaseView {
     /// Production connections with writes switched on for this run of Vilo only.
     session_writes: collections::HashSet<String>,
     /// Documents whose last write has an unknown outcome; writing to them waits for a refresh.
-    unknown_writes: SharedChecks<std::collections::BTreeSet<String>>,
+    unknown_writes: SharedChecks<std::collections::BTreeMap<String, u64>>,
     /// The write log was read since start, so locks of unsettled publishes are restored.
     write_log_checked: bool,
     write_notice: Option<SharedString>,
@@ -2800,11 +2823,25 @@ mod tests {
             second.contains(&key),
             "a lock taken in one window holds in another"
         );
-        second.remove(&key);
+        let seen = first.version(&key).unwrap();
+        second.remove_if(&key, seen);
         assert!(
             !first.contains(&key),
             "a lock cleared in one window is gone everywhere"
         );
+
+        // A read saw the first lock; the key was cleared and locked again before it finished.
+        first.insert(key.clone());
+        let seen = first.version(&key).unwrap();
+        second.remove_if(&key, seen);
+        second.insert(key.clone());
+        first.remove_if(&key, seen);
+        assert!(
+            first.contains(&key),
+            "an older read does not clear a newer lock"
+        );
+        let newer = first.version(&key).unwrap();
+        first.remove_if(&key, newer);
 
         let (first, second) = (
             SharedChecks(&UNLOGGED_WRITES),
