@@ -2414,6 +2414,7 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let key = format!("vilo_test:failover:{}", std::process::id());
         let after = loop {
             assert!(
@@ -2441,9 +2442,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            format!("{announced:?}").contains(after.as_deref().unwrap_or_default()),
-            "the session's master is the one Sentinel announces: {announced:?}"
+        assert_eq!(
+            announced.into_array().get(1).and_then(Value::as_string),
+            after,
+            "the session's master is the one Sentinel announces"
         );
     }
 
