@@ -2393,7 +2393,7 @@ mod tests {
     async fn test_a_real_sentinel_failover_is_followed() {
         // A native Sentinel (one in a VM whose clock jumps stays in TILT mode and never fails over).
         // Sentinel refuses a second failover of one master within twice its failover-timeout,
-        // so back-to-back runs need that gap.
+        // so the request is retried until the deadline.
         let (Ok(url), Ok(sentinel_url)) = (
             std::env::var("VILO_TEST_NATIVE_SENTINEL"),
             std::env::var("VILO_TEST_NATIVE_SENTINEL_ADMIN"),
@@ -2403,35 +2403,47 @@ mod tests {
         let before = tcp_port(&RedisSession::connect(&url).await.unwrap()).await;
         assert!(before.is_some(), "the master reports its port");
         let sentinel = RedisSession::connect(&sentinel_url).await.unwrap();
-        sentinel
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while let Err(error) = sentinel
             .call("SENTINEL", vec!["FAILOVER".into(), "native".into()])
             .await
-            .unwrap();
-        let mut after = None;
-        for _ in 0..150 {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Ok(session) = RedisSession::connect(&url).await
-                && tcp_port(&session).await != before
-                && session
-                    .call(
-                        "SET",
-                        vec![
-                            "vilo_test:failover".into(),
-                            "1".into(),
-                            "PX".into(),
-                            "10000".into(),
-                        ],
-                    )
-                    .await
-                    .is_ok()
-            {
-                after = tcp_port(&session).await;
-                break;
-            }
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Sentinel keeps refusing the failover: {error:#}"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
+        let key = format!("vilo_test:failover:{}", std::process::id());
+        let after = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no new session reached a promoted master"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let Ok(session) = RedisSession::connect(&url).await else {
+                continue;
+            };
+            let port = tcp_port(&session).await;
+            if port.is_none() || port == before {
+                continue;
+            }
+            let write = vec![key.clone().into(), "1".into(), "PX".into(), "10000".into()];
+            if session.call("SET", write).await.is_ok() {
+                session.call("DEL", vec![key.clone().into()]).await.unwrap();
+                break port;
+            }
+        };
+        let announced = sentinel
+            .call(
+                "SENTINEL",
+                vec!["GET-MASTER-ADDR-BY-NAME".into(), "native".into()],
+            )
+            .await
+            .unwrap();
         assert!(
-            after.is_some() && after != before,
-            "a new session reaches the promoted master"
+            format!("{announced:?}").contains(after.as_deref().unwrap_or_default()),
+            "the session's master is the one Sentinel announces: {announced:?}"
         );
     }
 
