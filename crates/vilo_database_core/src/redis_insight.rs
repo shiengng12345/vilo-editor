@@ -235,6 +235,7 @@ fn import_one(item: &Value) -> Result<Imported> {
         key_file: None,
         known_hosts: None,
         password: None,
+        passphrase: None,
     });
     let (ssh_key_pem, ssh_key_path) = pem_or_path(text(
         item,
@@ -250,17 +251,13 @@ fn import_one(item: &Value) -> Result<Imported> {
         ..ssh
     });
     let ssh = ssh.map(|mut ssh| {
-        let password = text(item, &["sshOptions.password", "ssh_password", "sshPassword"]);
-        let passphrase = text(item, &["sshOptions.passphrase", "sshKeyPassphrase"]);
-        // Vilo answers whatever ssh asks with one secret: the password, or the key's passphrase.
-        if let (Some(password), Some(passphrase)) = (&password, &passphrase)
-            && password != passphrase
-        {
-            notes.push(
-                "its SSH key passphrase was not imported, only its SSH password; add the key to the agent instead".into(),
-            );
-        }
-        ssh.password = password.or(passphrase).map(SshPassword);
+        ssh.password = text(
+            item,
+            &["sshOptions.password", "ssh_password", "sshPassword"],
+        )
+        .map(SshPassword);
+        ssh.passphrase =
+            text(item, &["sshOptions.passphrase", "sshKeyPassphrase"]).map(SshPassword);
         ssh
     });
     if ssh.is_none() && text(item, &["ssh_agent_path"]).is_some() {
@@ -555,6 +552,9 @@ pub fn export(connections: &[ToExport], with_secrets: bool) -> Result<(String, V
             if with_secrets && let Some(password) = &ssh.password {
                 options.insert("password".into(), json!(password.0));
             }
+            if with_secrets && let Some(passphrase) = &ssh.passphrase {
+                options.insert("passphrase".into(), json!(passphrase.0));
+            }
             if ssh.key_file.is_none() && ssh.password.is_none() {
                 notes.push(format!(
                     "{}: signs in to SSH with the agent, which RedisInsight cannot use from the file",
@@ -755,20 +755,11 @@ mod tests {
         )
         .unwrap();
         let ssh = both[0].ssh.as_ref().unwrap();
-        assert_eq!(ssh.password, Some(SshPassword("p".into())));
-        assert!(
-            both[0].notes.iter().any(|note| note.contains("passphrase")),
-            "one secret answers ssh, so a different passphrase is reported: {:?}",
-            both[0].notes
-        );
-        let passphrase =
-            parse_export(r#"[{"host":"h","ssh":true,"sshOptions":{"host":"b","passphrase":"q"}}]"#)
-                .unwrap();
         assert_eq!(
-            passphrase[0].ssh.as_ref().unwrap().password,
-            Some(SshPassword("q".into()))
+            (ssh.password.clone(), ssh.passphrase.clone()),
+            (Some(SshPassword("p".into())), Some(SshPassword("q".into())))
         );
-        assert!(passphrase[0].notes.is_empty(), "{:?}", passphrase[0].notes);
+        assert!(both[0].notes.is_empty(), "{:?}", both[0].notes);
         let unnamed = parse_export(r#"[{"host":"h"}]"#).unwrap();
         assert_eq!(
             (unnamed[0].name.as_str(), unnamed[0].uri.as_str()),
@@ -831,6 +822,7 @@ mod tests {
             key_file: None,
             known_hosts: None,
             password: Some(SshPassword("ssh-secret".into())),
+            passphrase: Some(SshPassword("key-phrase".into())),
         };
         let agent_only = SshSettings {
             host: "agent-host".into(),
@@ -871,7 +863,14 @@ mod tests {
             plain.contains("\"u+x\""),
             "a + in a user name stays a plus:\n{plain}"
         );
-        for secret in ["cr&et", "dpw", "spw", "PRIVATE KEY", "ssh-secret"] {
+        for secret in [
+            "cr&et",
+            "dpw",
+            "spw",
+            "PRIVATE KEY",
+            "ssh-secret",
+            "key-phrase",
+        ] {
             assert!(
                 !plain.contains(secret),
                 "{secret} left out by default:\n{plain}"
@@ -911,6 +910,10 @@ mod tests {
             back[1].ssh.as_ref().and_then(|ssh| ssh.password.clone()),
             Some(SshPassword("ssh-secret".into())),
             "the SSH password goes out only when asked"
+        );
+        assert_eq!(
+            back[1].ssh.as_ref().and_then(|ssh| ssh.passphrase.clone()),
+            Some(SshPassword("key-phrase".into()))
         );
         let sentinel = url::Url::parse(&back[2].uri).unwrap();
         assert_eq!(

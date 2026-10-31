@@ -201,11 +201,15 @@ impl DatabaseView {
                     Some(task) => match task.await {
                         Ok(()) => {
                             notes.extend(imported.notes.iter().map(|note| format!("{}: {note}", imported.name)));
-                            if let Some(password) = imported.ssh.as_ref().and_then(|ssh| ssh.password.clone()) {
+                            let secrets = imported.ssh.as_ref().map(crate::SshSecrets::of).unwrap_or_default();
+                            if !secrets.is_empty() {
                                 let url = connection.ssh_credential_url();
-                                let saved = match cx.update(|_, cx| crate::write_credential(cx, &url, "SSH", password.0.as_bytes())) {
-                                    Ok(task) => task.await,
-                                    Err(_) => return,
+                                let saved = match secrets.to_bytes() {
+                                    Ok(secrets) => match cx.update(|_, cx| crate::write_credential(cx, &url, "SSH", &secrets)) {
+                                        Ok(task) => task.await,
+                                        Err(_) => return,
+                                    },
+                                    Err(error) => Err(error),
                                 };
                                 if let Err(error) = saved {
                                     notes.push(format!(
@@ -293,18 +297,21 @@ impl DatabaseView {
                         return;
                     };
                     match saved.await {
-                        Ok(Some((_, password))) => {
-                            if let (Some(ssh), Ok(password)) =
-                                (connection.redis_ssh.as_mut(), String::from_utf8(password))
-                            {
-                                // Without passwords only the fact that it has one is kept.
-                                ssh.password = Some(vilo_database_core::redis_ssh::SshPassword(
-                                    if with_secrets {
-                                        password
-                                    } else {
-                                        String::new()
-                                    },
-                                ));
+                        Ok(Some((_, secrets))) => {
+                            if let (Some(ssh), Ok(mut secrets)) = (
+                                connection.redis_ssh.as_mut(),
+                                crate::SshSecrets::from_bytes(secrets),
+                            ) {
+                                // Without passwords only the fact that there are some is kept.
+                                if !with_secrets {
+                                    for secret in [&mut secrets.password, &mut secrets.passphrase]
+                                        .into_iter()
+                                        .flatten()
+                                    {
+                                        secret.clear();
+                                    }
+                                }
+                                secrets.apply(ssh);
                             }
                         }
                         Ok(None) => {}

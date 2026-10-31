@@ -371,8 +371,9 @@ struct RedisFields {
     ssh_user: Entity<Editor>,
     ssh_key: Entity<Editor>,
     ssh_password: Entity<Editor>,
-    /// The saved SSH password was read into its field (or there is none), so an empty field
-    /// means no password rather than one not loaded yet.
+    ssh_passphrase: Entity<Editor>,
+    /// The saved SSH password and passphrase were read into their fields (or there are none),
+    /// so empty fields mean none rather than not loaded yet.
     ssh_password_loaded: bool,
 }
 
@@ -384,6 +385,7 @@ impl RedisFields {
         let key = text(&self.ssh_key);
         // Not trimmed: spaces can be part of a password.
         let password = self.ssh_password.read(cx).text(cx);
+        let passphrase = self.ssh_passphrase.read(cx).text(cx);
         let settings = vilo_database_core::redis_ssh::SshSettings {
             host: text(&self.ssh_host),
             port: if port.is_empty() {
@@ -397,6 +399,8 @@ impl RedisFields {
             known_hosts: cfg!(test).then(|| paths::config_dir().join("test_known_hosts")),
             password: (!password.is_empty())
                 .then(|| vilo_database_core::redis_ssh::SshPassword(password)),
+            passphrase: (!passphrase.is_empty())
+                .then(|| vilo_database_core::redis_ssh::SshPassword(passphrase)),
         };
         anyhow::ensure!(!settings.host.is_empty(), "Fill in the SSH host.");
         anyhow::ensure!(settings.port != Some(0), "SSH port must be from 1 to 65535");
@@ -728,23 +732,75 @@ async fn forget_credential(url: &str, cx: &mut AsyncApp) -> Result<()> {
     Ok(())
 }
 
-/// Fills in the SSH password saved in the keychain when the connection has none in hand.
+/// The SSH password and the key's passphrase, kept together in one keychain entry.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SshSecrets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) passphrase: Option<String>,
+}
+
+impl SshSecrets {
+    pub(crate) fn of(ssh: &vilo_database_core::redis_ssh::SshSettings) -> Self {
+        let given = |secret: &Option<vilo_database_core::redis_ssh::SshPassword>| {
+            secret
+                .as_ref()
+                .map(|secret| secret.0.clone())
+                .filter(|secret| !secret.is_empty())
+        };
+        Self {
+            password: given(&ssh.password),
+            passphrase: given(&ssh.passphrase),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.password.is_none() && self.passphrase.is_none()
+    }
+
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    /// An entry that is not this JSON is a password alone, as saved before passphrases were.
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        if let Ok(secrets) = serde_json::from_slice(&bytes) {
+            return Ok(secrets);
+        }
+        let password = String::from_utf8(bytes).context("The saved SSH password is unreadable")?;
+        Ok(Self {
+            password: Some(password),
+            passphrase: None,
+        })
+    }
+
+    pub(crate) fn apply(self, ssh: &mut vilo_database_core::redis_ssh::SshSettings) {
+        ssh.password = self
+            .password
+            .map(vilo_database_core::redis_ssh::SshPassword);
+        ssh.passphrase = self
+            .passphrase
+            .map(vilo_database_core::redis_ssh::SshPassword);
+    }
+}
+
+/// Fills in the SSH password and passphrase saved in the keychain when the connection has
+/// neither in hand.
 async fn fill_ssh_password(connection: &mut Connection, cx: &mut AsyncApp) -> Result<()> {
     let url = connection.ssh_credential_url();
     let Some(ssh) = connection.redis_ssh.as_mut() else {
         return Ok(());
     };
-    if ssh.password.is_some() {
+    if ssh.password.is_some() || ssh.passphrase.is_some() {
         return Ok(());
     }
     let saved = cx
         .update(|cx| crate::read_credential(cx, &url))
         .await
         .context("Could not read the SSH password from the keychain")?;
-    if let Some((_, password)) = saved {
-        let password =
-            String::from_utf8(password).context("The saved SSH password is unreadable")?;
-        ssh.password = Some(vilo_database_core::redis_ssh::SshPassword(password));
+    if let Some((_, secrets)) = saved {
+        SshSecrets::from_bytes(secrets)?.apply(ssh);
     }
     Ok(())
 }
@@ -1382,6 +1438,13 @@ impl DatabaseView {
                         window,
                         cx,
                     ),
+                    ssh_passphrase: editor(
+                        "Only for a private key that has one",
+                        "",
+                        true,
+                        window,
+                        cx,
+                    ),
                     ssh_password_loaded: saved_ssh.is_none(),
                     ssh_key: editor(
                         "Private key file; empty uses the agent and ~/.ssh/config",
@@ -1429,13 +1492,20 @@ impl DatabaseView {
                     match saved {
                         Ok(saved) => {
                             if let Some(redis) = form.redis.as_mut() {
-                                // What the user typed meanwhile wins over the saved password.
-                                let typed = !redis.ssh_password.read(cx).text(cx).is_empty();
-                                if let (Some((_, password)), false) = (saved, typed) {
-                                    let password = String::from_utf8_lossy(&password).to_string();
-                                    redis.ssh_password.update(cx, |editor, cx| {
-                                        editor.set_text(password, window, cx)
-                                    });
+                                let secrets = saved
+                                    .and_then(|(_, secrets)| SshSecrets::from_bytes(secrets).ok())
+                                    .unwrap_or_default();
+                                for (field, secret) in [
+                                    (&redis.ssh_password, secrets.password),
+                                    (&redis.ssh_passphrase, secrets.passphrase),
+                                ] {
+                                    // What the user typed meanwhile wins over what was saved.
+                                    let typed = !field.read(cx).text(cx).is_empty();
+                                    if let (Some(secret), false) = (secret, typed) {
+                                        field.update(cx, |editor, cx| {
+                                            editor.set_text(secret, window, cx)
+                                        });
+                                    }
                                 }
                                 redis.ssh_password_loaded = true;
                             }
@@ -1570,7 +1640,9 @@ impl DatabaseView {
         // A cleared password field forgets the saved one, but only once it was read into it.
         let forget_ssh_password = match &form.redis {
             Some(redis) if redis.ssh => {
-                redis.ssh_password_loaded && redis.ssh_password.read(cx).text(cx).is_empty()
+                redis.ssh_password_loaded
+                    && redis.ssh_password.read(cx).text(cx).is_empty()
+                    && redis.ssh_passphrase.read(cx).text(cx).is_empty()
             }
             Some(_) => true,
             None => false,
@@ -1646,21 +1718,20 @@ impl DatabaseView {
                     .update(|cx| crate::read_credential(cx, &ssh_url))
                     .await
                     .context("Could not read the SSH password from the keychain")?;
-                match connection
+                let secrets = connection
                     .redis_ssh
                     .as_ref()
-                    .and_then(|ssh| ssh.password.clone())
-                {
-                    Some(password) => cx
-                        .update(|cx| {
-                            crate::write_credential(cx, &ssh_url, "SSH", password.0.as_bytes())
-                        })
+                    .map(SshSecrets::of)
+                    .unwrap_or_default();
+                if !secrets.is_empty() {
+                    let secrets = secrets.to_bytes()?;
+                    cx.update(|cx| crate::write_credential(cx, &ssh_url, "SSH", &secrets))
                         .await
-                        .context("Vilo could not save the SSH password to the keychain")?,
-                    None if forget_ssh_password => forget_credential(&ssh_url, cx)
+                        .context("Vilo could not save the SSH password to the keychain")?;
+                } else if forget_ssh_password {
+                    forget_credential(&ssh_url, cx)
                         .await
-                        .context("Vilo could not remove the SSH password from the keychain")?,
-                    None => {}
+                        .context("Vilo could not remove the SSH password from the keychain")?;
                 }
                 if !uri.is_empty() {
                     let url = connection.credential_url();
@@ -2578,6 +2649,7 @@ impl DatabaseView {
                             h_flex()
                                 .gap_3()
                                 .child(div().flex_1().child(input("SSH private key", &redis.ssh_key, cx)))
+                                .child(div().flex_1().child(input("Key passphrase", &redis.ssh_passphrase, cx)))
                                 .child(div().flex_1().child(input("SSH password", &redis.ssh_password, cx))),
                         )
                     })
@@ -3118,7 +3190,8 @@ mod tests {
             Ok(password_file),
             Ok(key_address),
             Ok(key_user),
-            Ok(key_file),
+            Ok(locked_key),
+            Ok(passphrase_file),
             Ok(private_redis),
             Ok(direct_redis),
         ) = (
@@ -3127,7 +3200,8 @@ mod tests {
             std::env::var("VILO_TEST_SSH_PASSWORD_FILE"),
             std::env::var("VILO_TEST_SSH"),
             std::env::var("VILO_TEST_SSH_USER"),
-            std::env::var("VILO_TEST_SSH_KEY"),
+            std::env::var("VILO_TEST_SSH_LOCKED_KEY"),
+            std::env::var("VILO_TEST_SSH_PASSPHRASE_FILE"),
             std::env::var("VILO_TEST_SSH_REDIS"),
             std::env::var("VILO_TEST_REDIS"),
         )
@@ -3184,8 +3258,8 @@ mod tests {
 
         struct Typed {
             redis: [String; 2],
-            /// Host, port, user, key and password; none turns SSH off.
-            ssh: Option<[String; 5]>,
+            /// Host, port, user, key, key passphrase and password; none turns SSH off.
+            ssh: Option<[String; 6]>,
         }
         // The form as the user fills it, new or edited; editing waits for the saved values to be
         // read in first, as the user would see them.
@@ -3216,12 +3290,13 @@ mod tests {
                     (&redis.port, port.as_str()),
                 ];
                 redis.ssh = typed.ssh.is_some();
-                if let Some([host, port, user, key, password]) = &typed.ssh {
+                if let Some([host, port, user, key, passphrase, password]) = &typed.ssh {
                     fields.extend([
                         (&redis.ssh_host, host.as_str()),
                         (&redis.ssh_port, port.as_str()),
                         (&redis.ssh_user, user.as_str()),
                         (&redis.ssh_key, key.as_str()),
+                        (&redis.ssh_passphrase, passphrase.as_str()),
                         (&redis.ssh_password, password.as_str()),
                     ]);
                 }
@@ -3247,14 +3322,20 @@ mod tests {
                 password_port.clone(),
                 password_user.clone(),
                 String::new(),
+                String::new(),
                 typed.to_string(),
             ]),
         };
-        let ssh_entry = |id: &str| {
+        let ssh_secrets = |id: &str| {
             gpui_test::keychain()
                 .get(&format!("vilo-database-ssh://{id}"))
-                .map(|(_, secret)| String::from_utf8_lossy(secret).to_string())
+                .map(|(_, secrets)| SshSecrets::from_bytes(secrets.clone()).unwrap())
         };
+        let ssh_entry = |id: &str| ssh_secrets(id).and_then(|secrets| secrets.password);
+        let passphrase = std::fs::read_to_string(&passphrase_file)
+            .unwrap()
+            .trim()
+            .to_string();
 
         // A wrong password: refused by the jump host while saving, so nothing is kept.
         let refused = save(None, through_password("not-the-password"), &mut cx);
@@ -3328,13 +3409,43 @@ mod tests {
         );
         assert_eq!(ssh_entry(&id).as_deref(), Some(password.as_str()));
 
-        // A cleared password, now signing in with a key on another jump host: removed.
+        // A cleared password, now signing in on another jump host with a key that has a
+        // passphrase: the password goes, the passphrase is kept, and editing shows it again.
         let with_key = Typed {
             redis: private.clone(),
-            ssh: Some([key_host, key_port, key_user, key_file, String::new()]),
+            ssh: Some([
+                key_host,
+                key_port,
+                key_user,
+                locked_key,
+                passphrase.clone(),
+                String::new(),
+            ]),
         };
         assert_eq!(save(Some(id.clone()), with_key, &mut cx), None);
-        assert_eq!(ssh_entry(&id), None, "a cleared password is forgotten");
+        assert_eq!(
+            ssh_secrets(&id),
+            Some(SshSecrets {
+                password: None,
+                passphrase: Some(passphrase.clone()),
+            }),
+            "a cleared password is forgotten, the passphrase kept"
+        );
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_form(Some(id.clone()), window, cx)
+        });
+        gpui_test::wait_until(&mut cx, "the saved passphrase was read in", |cx| {
+            view.read_with(cx, |view, cx| {
+                view.form
+                    .as_ref()
+                    .and_then(|form| form.redis.as_ref())
+                    .is_some_and(|redis| {
+                        redis.ssh_passphrase.read(cx).text(cx) == passphrase
+                            && redis.ssh_password.read(cx).text(cx).is_empty()
+                    })
+            })
+        });
+        view.update(&mut cx, |view, _| view.form = None);
 
         // Back to the password, then SSH turned off for a server reached directly: removed.
         assert_eq!(
@@ -3404,6 +3515,30 @@ mod tests {
         );
         drop(view);
         cx.run_until_parked();
+    }
+
+    #[test]
+    fn test_ssh_secrets_round_trip_and_read_a_bare_password() {
+        let both = SshSecrets {
+            password: Some("p w".into()),
+            passphrase: Some("{\"q\"}".into()),
+        };
+        assert_eq!(
+            SshSecrets::from_bytes(both.to_bytes().unwrap()).unwrap(),
+            both
+        );
+        assert_eq!(
+            SshSecrets::from_bytes(b"plain old".to_vec()).unwrap(),
+            SshSecrets {
+                password: Some("plain old".into()),
+                passphrase: None,
+            },
+            "an entry from before passphrases were kept is a password"
+        );
+        let mut ssh = vilo_database_core::redis_ssh::SshSettings::default();
+        assert!(SshSecrets::of(&ssh).is_empty());
+        ssh.passphrase = Some(vilo_database_core::redis_ssh::SshPassword(String::new()));
+        assert!(SshSecrets::of(&ssh).is_empty(), "an empty field is none");
     }
 
     #[test]

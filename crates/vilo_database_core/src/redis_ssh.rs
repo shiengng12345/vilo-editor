@@ -32,6 +32,9 @@ pub struct SshSettings {
     /// Kept in the keychain, never in the saved settings.
     #[serde(skip)]
     pub password: Option<SshPassword>,
+    /// The private key's passphrase, kept like the password.
+    #[serde(skip)]
+    pub passphrase: Option<SshPassword>,
 }
 
 /// An SSH password; its Debug output does not show it.
@@ -44,30 +47,37 @@ impl std::fmt::Debug for SshPassword {
     }
 }
 
-/// ssh's askpass helper, in a directory only this user can open, and the pipe it reads the
-/// password from. The password goes through the pipe from a thread of Vilo's and is never written
-/// to disk, nor put on ssh's command line or in its environment; if Vilo exits, nothing of it is
-/// left behind.
+/// ssh's askpass helper, in a directory only this user can open, and the pipes it reads the
+/// secrets from: the password, and the passphrase of the key. Each goes through its pipe from a
+/// thread of Vilo's and is never written to disk, nor put on ssh's command line or in its
+/// environment; if Vilo exits, nothing of them is left behind.
 struct Askpass {
     dir: PathBuf,
-    writer: Option<std::thread::JoinHandle<()>>,
+    /// The pipes made, each with the thread writing its secret.
+    writers: Vec<(PathBuf, std::thread::JoinHandle<()>)>,
 }
+
+/// The pipe for a key's passphrase; the password has its own.
+const PASSPHRASE_PIPE: &str = "passphrase";
+const PASSWORD_PIPE: &str = "password";
 
 impl Askpass {
     #[cfg(not(unix))]
-    fn create(_password: &str) -> Result<Self> {
+    fn create(_password: Option<&str>, _passphrase: Option<&str>) -> Result<Self> {
         bail!("SSH passwords are only supported on macOS and Linux; use a key or the agent.")
     }
 
     #[cfg(unix)]
-    fn create(password: &str) -> Result<Self> {
+    fn create(password: Option<&str>, passphrase: Option<&str>) -> Result<Self> {
         use std::io::Write as _;
-        // Fits any pipe's buffer, so the writer never waits on a reader once one has opened.
-        anyhow::ensure!(
-            password.len() <= MAX_PASSWORD_BYTES,
-            "The SSH password is longer than {MAX_PASSWORD_BYTES} bytes."
-        );
         use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+        for secret in [password, passphrase].into_iter().flatten() {
+            // Fits any pipe's buffer, so a writer never waits on a reader once one has opened.
+            anyhow::ensure!(
+                secret.len() <= MAX_PASSWORD_BYTES,
+                "The SSH password or passphrase is longer than {MAX_PASSWORD_BYTES} bytes."
+            );
+        }
         // Short and fixed in shape, so the helper's path needs no quoting in ssh's environment.
         let dir = std::env::temp_dir().join(format!(
             "vilo-askpass-{}",
@@ -77,7 +87,10 @@ impl Askpass {
             .mode(0o700)
             .create(&dir)
             .context("Could not prepare the SSH password")?;
-        let mut askpass = Self { dir, writer: None };
+        let mut askpass = Self {
+            dir,
+            writers: Vec::new(),
+        };
         remove_stale_askpass(&askpass.dir);
         let mut helper = std::fs::OpenOptions::new()
             .write(true)
@@ -85,47 +98,55 @@ impl Askpass {
             .mode(0o700)
             .open(askpass.program())
             .context("Could not prepare the SSH password")?;
+        // ssh passes its prompt: "Enter passphrase for key …" for a key, "…'s password:" for
+        // the password. A secret not given has no pipe, so that ask fails at once.
         helper
-            .write_all(b"#!/bin/sh\nexec cat \"$(dirname \"$0\")/password\"\n")
+            .write_all(
+                b"#!/bin/sh\nd=$(dirname \"$0\")\ncase \"$1\" in\n*passphrase*) exec cat \"$d/passphrase\" ;;\n*) exec cat \"$d/password\" ;;\nesac\n",
+            )
             .context("Could not prepare the SSH password")?;
         drop(helper);
-        let pipe = askpass.pipe();
-        nix::unistd::mkfifo(
-            &pipe,
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )
-        .context("Could not prepare the SSH password")?;
-        let password = password.to_string();
-        askpass.writer = Some(std::thread::spawn(move || {
-            // Waits until ssh runs the helper, or until drop opens the reading end itself.
-            let written = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&pipe)
-                .and_then(|mut end| end.write_all(password.as_bytes()));
-            if let Err(error) = written
-                && error.kind() != std::io::ErrorKind::BrokenPipe
-            {
-                log::error!("could not hand the SSH password to ssh: {error}");
-            }
-        }));
+        for (name, secret) in [(PASSWORD_PIPE, password), (PASSPHRASE_PIPE, passphrase)] {
+            let Some(secret) = secret else {
+                continue;
+            };
+            let pipe = askpass.dir.join(name);
+            nix::unistd::mkfifo(
+                &pipe,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )
+            .context("Could not prepare the SSH password")?;
+            let secret = secret.to_string();
+            let writer = std::thread::spawn({
+                let pipe = pipe.clone();
+                move || {
+                    // Waits until ssh runs the helper, or until drop opens the reading end.
+                    let written = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&pipe)
+                        .and_then(|mut end| end.write_all(secret.as_bytes()));
+                    if let Err(error) = written
+                        && error.kind() != std::io::ErrorKind::BrokenPipe
+                    {
+                        log::error!("could not hand an SSH secret to ssh: {error}");
+                    }
+                }
+            });
+            askpass.writers.push((pipe, writer));
+        }
         Ok(askpass)
     }
 
     fn program(&self) -> PathBuf {
         self.dir.join("askpass")
     }
-
-    fn pipe(&self) -> PathBuf {
-        self.dir.join("password")
-    }
 }
 
 impl Drop for Askpass {
     fn drop(&mut self) {
         #[cfg(unix)]
-        {
+        for (pipe, writer) in self.writers.drain(..) {
             use std::os::unix::fs::OpenOptionsExt as _;
-            let pipe = self.pipe();
             let end = |write: bool| {
                 std::fs::OpenOptions::new()
                     .read(!write)
@@ -138,11 +159,8 @@ impl Drop for Askpass {
             // open fails when nobody waits, which is fine.
             let reader = end(false).ok();
             // Without the reading end the writer could wait forever; it is left to the process.
-            if let Some(writer) = self.writer.take()
-                && reader.is_some()
-                && writer.join().is_err()
-            {
-                log::error!("the SSH password writer panicked");
+            if reader.is_some() && writer.join().is_err() {
+                log::error!("an SSH secret writer panicked");
             }
             drop(end(true).ok());
             drop(reader);
@@ -266,9 +284,17 @@ impl SshTunnel {
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
         let arguments = ssh_arguments(settings, &control)?;
-        let askpass = match &settings.password {
-            Some(password) if !password.0.is_empty() => Some(Askpass::create(&password.0)?),
-            _ => None,
+        fn given(secret: &Option<SshPassword>) -> Option<&str> {
+            secret
+                .as_ref()
+                .map(|secret| secret.0.as_str())
+                .filter(|secret| !secret.is_empty())
+        }
+        let (password, passphrase) = (given(&settings.password), given(&settings.passphrase));
+        let askpass = if password.is_some() || passphrase.is_some() {
+            Some(Askpass::create(password, passphrase)?)
+        } else {
+            None
         };
         let mut master = Command::new("ssh");
         if let Some(askpass) = &askpass {
@@ -512,6 +538,7 @@ mod tests {
             key_file: Some(std::env::var("VILO_TEST_SSH_KEY").ok()?.into()),
             known_hosts: Some(known_hosts),
             password: None,
+            passphrase: None,
         })
     }
 
@@ -533,23 +560,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_the_askpass_helper_hands_the_password_over_a_pipe() {
+    async fn test_the_askpass_helper_hands_each_secret_over_its_pipe() {
         use std::os::unix::fs::FileTypeExt as _;
         let _serial = ASKPASS_TESTS.lock().await;
-        let askpass = Askpass::create("s3cret pass").unwrap();
-        let pipe = std::fs::metadata(askpass.pipe()).unwrap();
-        assert!(
-            pipe.file_type().is_fifo() && pipe.len() == 0,
-            "nothing of the password is on disk"
-        );
-        let first = Command::new(askpass.program()).output().await.unwrap();
-        assert_eq!(String::from_utf8_lossy(&first.stdout), "s3cret pass");
-        // Asked a second time, the helper waits; dropping releases it with nothing.
-        let second = Command::new(askpass.program())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
+        let ask = |askpass: &Askpass, prompt: &str| {
+            let mut command = Command::new(askpass.program());
+            command
+                .arg(prompt)
+                .stdout(Stdio::piped())
+                .kill_on_drop(true);
+            command
+        };
+        let askpass = Askpass::create(Some("s3cret pass"), Some("key phrase")).unwrap();
+        for name in [PASSWORD_PIPE, PASSPHRASE_PIPE] {
+            let pipe = std::fs::metadata(askpass.dir.join(name)).unwrap();
+            assert!(
+                pipe.file_type().is_fifo() && pipe.len() == 0,
+                "nothing of {name} is on disk"
+            );
+        }
+        let password = ask(&askpass, "vboth@bastion's password: ")
+            .output()
+            .await
             .unwrap();
+        assert_eq!(String::from_utf8_lossy(&password.stdout), "s3cret pass");
+        let passphrase = ask(&askpass, "Enter passphrase for key '/k/id': ")
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&passphrase.stdout), "key phrase");
+        // Asked a second time, the helper waits; dropping releases it with nothing.
+        let second = ask(&askpass, "vboth@bastion's password: ").spawn().unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         let dir = askpass.dir.clone();
         drop(askpass);
@@ -559,14 +600,28 @@ mod tests {
             .unwrap();
         assert!(second.stdout.is_empty());
         assert!(!dir.exists());
+
+        // A secret not given is not waited for.
+        let askpass = Askpass::create(Some("only a password"), None).unwrap();
+        let passphrase = tokio::time::timeout(
+            Duration::from_secs(5),
+            ask(&askpass, "Enter passphrase for key '/k/id': ").output(),
+        )
+        .await
+        .expect("an ask for a secret not given fails at once")
+        .unwrap();
+        assert!(!passphrase.status.success() && passphrase.stdout.is_empty());
+        drop(askpass);
     }
 
     #[tokio::test]
     async fn test_an_askpass_never_asked_is_removed_without_waiting() {
         let _serial = ASKPASS_TESTS.lock().await;
-        assert!(Askpass::create(&"x".repeat(MAX_PASSWORD_BYTES + 1)).is_err());
+        assert!(Askpass::create(Some(&"x".repeat(MAX_PASSWORD_BYTES + 1)), None).is_err());
+        assert!(Askpass::create(None, Some(&"x".repeat(MAX_PASSWORD_BYTES + 1))).is_err());
         // The longest password allowed, so its write cannot outgrow the pipe nobody reads.
-        let askpass = Askpass::create(&"x".repeat(MAX_PASSWORD_BYTES)).unwrap();
+        let longest = "x".repeat(MAX_PASSWORD_BYTES);
+        let askpass = Askpass::create(Some(&longest), Some(&longest)).unwrap();
         let dir = askpass.dir.clone();
         let dropped = tokio::task::spawn_blocking(move || drop(askpass));
         tokio::time::timeout(Duration::from_secs(5), dropped)
@@ -590,7 +645,7 @@ mod tests {
             .unwrap()
             .set_modified(old)
             .unwrap();
-        let askpass = Askpass::create("new").unwrap();
+        let askpass = Askpass::create(Some("new"), None).unwrap();
         assert!(!stale.exists(), "one left by an exited Vilo goes");
         assert!(fresh.exists(), "one a sign-in may still use stays");
         drop(askpass);
@@ -643,6 +698,7 @@ mod tests {
             key_file: None,
             known_hosts: Some(known_hosts.clone()),
             password: Some(SshPassword(password.to_string())),
+            passphrase: None,
         };
         let session = RedisSession::connect_with(&url, None, None, Some(&settings(&password)))
             .await
@@ -691,6 +747,96 @@ mod tests {
                 .await
                 .is_err(),
             "without the password ssh does not prompt and the connection fails"
+        );
+        std::fs::remove_file(&known_hosts).ok();
+    }
+
+    #[tokio::test]
+    async fn test_a_key_with_a_passphrase_and_a_host_that_also_wants_a_password() {
+        let (
+            Ok(key_address),
+            Ok(key_user),
+            Ok(locked_key),
+            Ok(passphrase_file),
+            Ok(both_address),
+            Ok(password_file),
+            Ok(url),
+        ) = (
+            std::env::var("VILO_TEST_SSH"),
+            std::env::var("VILO_TEST_SSH_USER"),
+            std::env::var("VILO_TEST_SSH_LOCKED_KEY"),
+            std::env::var("VILO_TEST_SSH_PASSPHRASE_FILE"),
+            std::env::var("VILO_TEST_SSH_PASSWORD_HOST"),
+            std::env::var("VILO_TEST_SSH_PASSWORD_FILE"),
+            std::env::var("VILO_TEST_SSH_REDIS"),
+        )
+        else {
+            return;
+        };
+        let _serial = ASKPASS_TESTS.lock().await;
+        let read = |path: &str| std::fs::read_to_string(path).unwrap().trim().to_string();
+        let (passphrase, password) = (read(&passphrase_file), read(&password_file));
+        let known_hosts =
+            std::env::temp_dir().join(format!("vilo-known-hosts-phrase-{}", std::process::id()));
+        let settings =
+            |address: &str, user: &str, password: Option<&str>, passphrase: Option<&str>| {
+                let (host, port) = address.rsplit_once(':').unwrap();
+                SshSettings {
+                    host: host.to_string(),
+                    port: port.parse().ok(),
+                    user: user.to_string(),
+                    key_file: Some(locked_key.clone().into()),
+                    known_hosts: Some(known_hosts.clone()),
+                    password: password.map(|password| SshPassword(password.to_string())),
+                    passphrase: passphrase.map(|passphrase| SshPassword(passphrase.to_string())),
+                }
+            };
+        let reaches = |settings: SshSettings| {
+            let url = url.clone();
+            async move {
+                let started = Instant::now();
+                let session = RedisSession::connect_with(&url, None, None, Some(&settings)).await;
+                let reached = match session {
+                    Ok(session) => session
+                        .call("PING", Vec::new())
+                        .await
+                        .is_ok_and(|pong| pong.as_string().as_deref() == Some("PONG")),
+                    Err(_) => false,
+                };
+                (reached, started.elapsed())
+            }
+        };
+
+        // A key with a passphrase on a host that takes keys.
+        let (reached, _) =
+            reaches(settings(&key_address, &key_user, None, Some(&passphrase))).await;
+        assert!(reached, "the passphrase unlocks the key");
+        let (reached, took) = reaches(settings(&key_address, &key_user, None, None)).await;
+        assert!(
+            !reached && took < Duration::from_secs(15),
+            "no passphrase fails at once ({took:?})"
+        );
+
+        // A host that wants the key and then the password: both are answered.
+        let (reached, _) = reaches(settings(
+            &both_address,
+            "vboth",
+            Some(&password),
+            Some(&passphrase),
+        ))
+        .await;
+        assert!(reached, "the passphrase and then the password");
+        let (reached, took) =
+            reaches(settings(&both_address, "vboth", Some(&password), None)).await;
+        assert!(
+            !reached && took < Duration::from_secs(15),
+            "without the passphrase it fails at once ({took:?})"
+        );
+        let (reached, took) =
+            reaches(settings(&both_address, "vboth", None, Some(&passphrase))).await;
+        assert!(
+            !reached && took < Duration::from_secs(15),
+            "without the password it fails at once ({took:?})"
         );
         std::fs::remove_file(&known_hosts).ok();
     }
