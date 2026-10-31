@@ -702,7 +702,7 @@ pub(crate) fn write_credential(
 ) -> Task<Result<()>> {
     #[cfg(test)]
     {
-        if gpui_test::failing().contains(url) {
+        if gpui_test::failing().remove(url) {
             return Task::ready(Err(anyhow!("the test keychain refused {url}")));
         }
         let mut keychain = gpui_test::keychain();
@@ -721,21 +721,45 @@ pub(crate) fn write_credential(
 pub(crate) fn delete_credential(cx: &App, url: &str) -> Task<Result<()>> {
     #[cfg(test)]
     {
-        if gpui_test::failing().contains(url) {
-            return Task::ready(Err(anyhow!("the test keychain refused {url}")));
+        // As Linux's secret service: one entry at a time.
+        let mut keychain = gpui_test::keychain();
+        if let Some(entries) = keychain.get_mut(url) {
+            if !entries.is_empty() {
+                entries.remove(0);
+            }
+            if entries.is_empty() {
+                keychain.remove(url);
+            }
         }
-        gpui_test::keychain().remove(url);
         Task::ready(Ok(()))
     }
     #[cfg(not(test))]
     cx.delete_credentials(url)
 }
 
-/// Removes a keychain entry if there is one. Deleting one that is missing fails, so it is read
-/// first; a real failure to delete is returned.
+/// Removes every keychain entry of a URL. Deleting one that is missing fails, so each is read
+/// first; Linux keeps one entry per account and deletes one at a time, hence the loop. A real
+/// failure to delete is returned.
 async fn forget_credential(url: &str, cx: &mut AsyncApp) -> Result<()> {
-    if cx.update(|cx| read_credential(cx, url)).await?.is_some() {
+    for _ in 0..8 {
+        if cx.update(|cx| read_credential(cx, url)).await?.is_none() {
+            return Ok(());
+        }
         cx.update(|cx| delete_credential(cx, url)).await?;
+    }
+    anyhow::bail!("the keychain still holds an entry for {url}")
+}
+
+/// Puts a URL's keychain entry back as it was: nothing, or the entry under its own account.
+async fn restore_credential(
+    url: &str,
+    previous: &Option<(String, Vec<u8>)>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    forget_credential(url, cx).await?;
+    if let Some((account, secret)) = previous {
+        cx.update(|cx| write_credential(cx, url, account, secret))
+            .await?;
     }
     Ok(())
 }
@@ -1766,11 +1790,23 @@ impl DatabaseView {
                             .context("Vilo could not replace the saved SSH password")?;
                     }
                     let secrets = secrets.to_bytes()?;
-                    cx.update(|cx| {
-                        crate::write_credential(cx, &ssh_url, SshSecrets::ACCOUNT, &secrets)
-                    })
-                    .await
-                    .context("Vilo could not save the SSH password to the keychain")?;
+                    let written = cx
+                        .update(|cx| {
+                            crate::write_credential(cx, &ssh_url, SshSecrets::ACCOUNT, &secrets)
+                        })
+                        .await;
+                    if let Err(error) = written {
+                        // The old entry may be gone already; it is put back.
+                        let restored = restore_credential(&ssh_url, &previous_ssh, cx).await;
+                        let error =
+                            error.context("Vilo could not save the SSH password to the keychain");
+                        return Err(match restored {
+                            Ok(()) => error,
+                            Err(restore) => error.context(format!(
+                                "putting the previous SSH password back also failed ({restore:#})"
+                            )),
+                        });
+                    }
                 } else if forget_ssh_password {
                     forget_credential(&ssh_url, cx)
                         .await
@@ -1790,15 +1826,7 @@ impl DatabaseView {
                         .await;
                     if let Err(error) = written {
                         // The saved connection stays as it was, so its SSH password must too.
-                        let restored = match &previous_ssh {
-                            Some((username, secret)) => {
-                                cx.update(|cx| {
-                                    crate::write_credential(cx, &ssh_url, username, secret)
-                                })
-                                .await
-                            }
-                            None => forget_credential(&ssh_url, cx).await,
-                        };
+                        let restored = restore_credential(&ssh_url, &previous_ssh, cx).await;
                         let error = error
                             .context("Vilo could not save the connection string to the keychain");
                         return Err(match restored {
@@ -3161,7 +3189,7 @@ pub(crate) mod gpui_test {
     type Entries = std::collections::BTreeMap<String, Vec<(String, Vec<u8>)>>;
 
     /// The keychain while testing, shared like the real one by every view of the process.
-    /// Keychain entries whose writes and deletions fail while testing, to test what follows.
+    /// Keychain URLs whose next write fails while testing, to test what follows.
     pub(crate) fn failing() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<String>> {
         static FAILING: std::sync::Mutex<std::collections::BTreeSet<String>> =
             std::sync::Mutex::new(std::collections::BTreeSet::new());
@@ -3435,6 +3463,32 @@ mod tests {
             assert_eq!(error, None);
             assert_eq!(view.redis().map(|session| session.database()), Some(1));
         });
+
+        // Moving an entry saved before passphrases were kept fails partway: either way the old
+        // entry is all that is left, under its own account and unchanged.
+        let ssh_url = format!("vilo-database-ssh://{id}");
+        let legacy = vec![("SSH".to_string(), password.as_bytes().to_vec())];
+        for (refusing, says) in [
+            (ssh_url.clone(), "SSH password"),
+            (format!("vilo-database://{id}"), "connection string"),
+        ] {
+            gpui_test::keychain().insert(ssh_url.clone(), legacy.clone());
+            gpui_test::failing().insert(refusing);
+            let refused = save(Some(id.clone()), through_password(&password), &mut cx);
+            gpui_test::failing().clear();
+            assert!(
+                refused
+                    .as_ref()
+                    .is_some_and(|message| message.contains(says)),
+                "{refused:?}"
+            );
+            assert_eq!(
+                gpui_test::keychain().get(&ssh_url).cloned(),
+                Some(legacy.clone()),
+                "after a refused {says}"
+            );
+            view.update(&mut cx, |view, _| view.form = None);
+        }
 
         // An entry saved before passphrases were kept is replaced, not left beside the new one.
         gpui_test::keychain().insert(
