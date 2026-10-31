@@ -616,8 +616,8 @@ mod tests {
             assert_eq!(pong.as_string().as_deref(), Some("PONG"));
         }
         if let Ok(port) = std::env::var("VILO_TEST_IPV6_TLS_PORT") {
-            // The test certificate names 127.0.0.1, not ::1; with the check off the handshake
-            // still has to take the bracket-free IPv6 name.
+            // The test certificate names 127.0.0.1, not ::1, so verification is off; this proves
+            // the bracketed host still becomes a valid TLS server name and the handshake completes.
             let settings = RedisTls {
                 verify: false,
                 ..RedisTls::default()

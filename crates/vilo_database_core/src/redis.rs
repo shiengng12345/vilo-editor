@@ -2401,6 +2401,7 @@ mod tests {
             return;
         };
         let before = tcp_port(&RedisSession::connect(&url).await.unwrap()).await;
+        assert!(before.is_some(), "the master reports its port");
         let sentinel = RedisSession::connect(&sentinel_url).await.unwrap();
         sentinel
             .call("SENTINEL", vec!["FAILOVER".into(), "native".into()])
@@ -2412,15 +2413,19 @@ mod tests {
             if let Ok(session) = RedisSession::connect(&url).await
                 && tcp_port(&session).await != before
                 && session
-                    .call("SET", vec!["vilo_test:failover".into(), "1".into()])
+                    .call(
+                        "SET",
+                        vec![
+                            "vilo_test:failover".into(),
+                            "1".into(),
+                            "PX".into(),
+                            "10000".into(),
+                        ],
+                    )
                     .await
                     .is_ok()
             {
                 after = tcp_port(&session).await;
-                session
-                    .call("DEL", vec!["vilo_test:failover".into()])
-                    .await
-                    .unwrap();
                 break;
             }
         }
