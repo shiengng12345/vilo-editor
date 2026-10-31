@@ -1069,19 +1069,7 @@ impl DatabaseView {
                     return;
                 }
                 match result {
-                    Ok(session) => {
-                        this.status = None;
-                        let mongo = matches!(session, Session::Mongo(_));
-                        this.session = Some(session);
-                        if mongo {
-                            this.load_databases(cx);
-                        } else {
-                            this.redis_state = Some(RedisState::new());
-                            this.start_redis_stats(cx);
-                            this.scan(true, cx);
-                            this.load_redis_databases(cx);
-                        }
-                    }
+                    Ok(session) => this.session_opened(session, cx),
                     Err(error) => this.status = Some(format!("{error:#}").into()),
                 }
                 cx.notify();
@@ -1089,6 +1077,20 @@ impl DatabaseView {
             .ok();
         }));
         cx.notify();
+    }
+
+    fn session_opened(&mut self, session: Session, cx: &mut Context<Self>) {
+        self.status = None;
+        let mongo = matches!(session, Session::Mongo(_));
+        self.session = Some(session);
+        if mongo {
+            self.load_databases(cx);
+        } else {
+            self.redis_state = Some(RedisState::new());
+            self.start_redis_stats(cx);
+            self.scan(true, cx);
+            self.load_redis_databases(cx);
+        }
     }
 
     fn mongo(&self) -> Option<Arc<MongoSession>> {

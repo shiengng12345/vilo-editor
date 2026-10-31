@@ -1386,7 +1386,7 @@ impl DatabaseView {
         }
     }
 
-    fn open_key_matching(
+    pub(crate) fn open_key_matching(
         &mut self,
         key: Bytes,
         pattern: Option<Bytes>,

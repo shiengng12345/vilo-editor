@@ -1079,6 +1079,204 @@ impl DatabaseView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Connection, Kind, Session};
+    use gpui_tokio::Tokio;
+    use std::sync::Arc;
+    use vilo_database_core::redis::RedisSession;
+
+    /// One inline command to a test server, for what the session API does not send (CLIENT PAUSE).
+    fn send_inline(address: &str, line: &str) -> String {
+        use std::io::{BufRead as _, Write as _};
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.write_all(format!("{line}\r\n").as_bytes()).unwrap();
+        let mut reply = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut reply)
+            .unwrap();
+        reply.trim_end().to_string()
+    }
+
+    /// Pumps the test executor while Tokio does the network work, until `done` or a minute passes.
+    fn wait_until(
+        cx: &mut gpui::VisualTestContext,
+        what: &str,
+        mut done: impl FnMut(&mut gpui::VisualTestContext) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting: {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[gpui::test]
+    async fn test_an_unknown_write_locks_the_key_in_every_window_even_after_its_window_closed(
+        app: &mut gpui::TestAppContext,
+    ) {
+        // A server of its own: the test pauses its writes, which would stall other tests.
+        let Ok(url) = std::env::var("VILO_TEST_REDIS_PAUSABLE") else {
+            return;
+        };
+        let address = url
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .to_string();
+        static DATA_DIR: std::sync::Once = std::sync::Once::new();
+        DATA_DIR.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("vilo-ui-test-{}", std::process::id()));
+            paths::set_custom_data_dir(&dir.to_string_lossy());
+        });
+        app.executor().allow_parking();
+        app.update(|cx| {
+            workspace::AppState::test(cx);
+            editor::init(cx);
+            gpui_tokio::init(cx);
+        });
+        let project = project::Project::test(fs::FakeFs::new(app.executor()), [], app).await;
+        let key = format!("vilo_test:ui_unknown:{}", std::process::id());
+        assert_eq!(send_inline(&address, &format!("SET {key} before")), "+OK");
+
+        let connection = Connection {
+            id: "ui-test-pausable".into(),
+            name: "UI test".into(),
+            kind: Kind::Redis,
+            site: String::new(),
+            environment: "TEST".into(),
+            allow_writes: true,
+            redis_tls: None,
+            redis_ssh: None,
+        };
+        // Two views, as two Vilo windows hold; one test window, since a second test workspace
+        // would register its collaboration handlers again.
+        let window = app.add_window({
+            let project = project.clone();
+            |window, cx| workspace::MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace = window
+            .read_with(app, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), app);
+        let mut views = Vec::new();
+        for _ in 0..2 {
+            let view = cx.update(|window, cx| {
+                cx.new(|cx| DatabaseView::new(workspace.downgrade(), window, cx))
+            });
+            let session = cx
+                .update(|_, cx| {
+                    let url = url.clone();
+                    Tokio::spawn(cx, async move { RedisSession::connect(&url).await })
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            view.update(&mut cx, |view, cx| {
+                view.connections.push(connection.clone());
+                view.active = Some(connection.id.clone());
+                view.session_opened(Session::Redis(Arc::new(session)), cx);
+            });
+            views.push(view);
+        }
+        let view_b = views.pop().unwrap();
+        let view_a = views.pop().unwrap();
+
+        // Window A edits the string and confirms; the server then holds every write.
+        view_a.update_in(&mut cx, |view, window, cx| {
+            view.start_redis_write(
+                RedisOp::EditString,
+                key.clone().into_bytes(),
+                vec![b"before".to_vec()],
+                None,
+                window,
+                cx,
+            );
+        });
+        view_a.update_in(&mut cx, |view, window, cx| {
+            let form = view.redis_write.as_ref().expect("the edit form opened");
+            form.inputs[0]
+                .1
+                .update(cx, |editor, cx| editor.set_text("after", window, cx));
+            view.review_redis_write(cx);
+        });
+        wait_until(&mut cx, "the write was reviewed", |cx| {
+            view_a.read_with(cx, |view, _| {
+                view.redis_write
+                    .as_ref()
+                    .is_some_and(|form| form.planned.is_some())
+            })
+        });
+        assert_eq!(send_inline(&address, "CLIENT PAUSE 40000 WRITE"), "+OK");
+        view_a.update(&mut cx, |view, cx| view.send_redis_write(cx));
+        assert!(view_a.read_with(&cx, |view, _| {
+            view.redis_write.as_ref().is_some_and(|form| form.sending)
+        }));
+
+        // View A goes, as when its window closes, while its write waits for an answer.
+        drop(view_a);
+        cx.run_until_parked();
+        let lock = lock_key(&connection.id, 0, key.as_bytes());
+        wait_until(&mut cx, "the write timed out as unknown", |_| {
+            crate::shared_unknown_writes().contains(&lock)
+        });
+
+        // Window B may not edit the key until it has read it again.
+        view_b.update_in(&mut cx, |view, window, cx| {
+            view.start_redis_write(
+                RedisOp::EditString,
+                key.clone().into_bytes(),
+                vec![b"before".to_vec()],
+                None,
+                window,
+                cx,
+            );
+        });
+        view_b.read_with(&cx, |view, _| {
+            assert!(
+                view.redis_write.is_none(),
+                "the locked key opened an edit form"
+            );
+            assert!(
+                view.write_notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.contains("unknown outcome")),
+                "{:?}",
+                view.write_notice
+            );
+        });
+
+        assert_eq!(send_inline(&address, "CLIENT UNPAUSE"), "+OK");
+        view_b.update(&mut cx, |view, cx| {
+            view.open_key_matching(key.clone().into_bytes(), None, None, cx)
+        });
+        wait_until(&mut cx, "reading the key again cleared its lock", |_| {
+            !crate::shared_unknown_writes().contains(&lock)
+        });
+        view_b.update_in(&mut cx, |view, window, cx| {
+            view.start_redis_write(
+                RedisOp::EditString,
+                key.clone().into_bytes(),
+                vec![b"after".to_vec()],
+                None,
+                window,
+                cx,
+            );
+        });
+        view_b.read_with(&cx, |view, _| {
+            assert!(
+                view.redis_write.is_some(),
+                "after the read the key can be edited"
+            );
+        });
+        assert_eq!(send_inline(&address, &format!("DEL {key}")), ":1");
+    }
 
     fn values(texts: &[&str]) -> Vec<String> {
         texts.iter().map(|text| text.to_string()).collect()

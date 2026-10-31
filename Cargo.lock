@@ -20214,6 +20214,7 @@ dependencies = [
  "chrono",
  "collections",
  "editor",
+ "fs",
  "futures 0.3.34",
  "gpui",
  "gpui_tokio",
