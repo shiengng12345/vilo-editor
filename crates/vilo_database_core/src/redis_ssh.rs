@@ -44,60 +44,108 @@ impl std::fmt::Debug for SshPassword {
     }
 }
 
-/// ssh's askpass helper and the password it answers with, in a directory only this user can
-/// open. Removed once the master has signed in, so the password is never on ssh's command line
-/// or in its environment, and does not stay on disk.
+/// ssh's askpass helper, in a directory only this user can open, and the pipe it reads the
+/// password from. The password goes through the pipe from a thread of Vilo's and is never written
+/// to disk, nor put on ssh's command line or in its environment; if Vilo exits, nothing of it is
+/// left behind.
 struct Askpass {
     dir: PathBuf,
+    writer: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Askpass {
+    #[cfg(not(unix))]
+    fn create(_password: &str) -> Result<Self> {
+        bail!("SSH passwords are only supported on macOS and Linux; use a key or the agent.")
+    }
+
+    #[cfg(unix)]
     fn create(password: &str) -> Result<Self> {
         use std::io::Write as _;
-        // Elsewhere the file could not be kept to this user.
-        anyhow::ensure!(
-            cfg!(unix),
-            "SSH passwords are only supported on macOS and Linux; use a key or the agent."
-        );
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
         // Short and fixed in shape, so the helper's path needs no quoting in ssh's environment.
         let dir = std::env::temp_dir().join(format!(
             "vilo-askpass-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder
+        std::fs::DirBuilder::new()
+            .mode(0o700)
             .create(&dir)
             .context("Could not prepare the SSH password")?;
-        let askpass = Self { dir };
+        let mut askpass = Self { dir, writer: None };
         remove_stale_askpass(&askpass.dir);
-        let write = |name: &str, mode: u32, contents: &[u8]| -> Result<()> {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
-            #[cfg(not(unix))]
-            drop(mode);
-            let mut file = options.open(askpass.dir.join(name))?;
-            file.write_all(contents)?;
-            Ok(())
-        };
-        // The helper deletes the password as it hands it over, so it is on disk only until ssh
-        // asks, even if Vilo exits before this directory is removed.
-        write(
-            "askpass",
-            0o700,
-            b"#!/bin/sh\nd=$(dirname \"$0\")\ncat \"$d/password\" && rm -f \"$d/password\"\n",
+        let mut helper = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(askpass.program())
+            .context("Could not prepare the SSH password")?;
+        helper
+            .write_all(b"#!/bin/sh\nexec cat \"$(dirname \"$0\")/password\"\n")
+            .context("Could not prepare the SSH password")?;
+        drop(helper);
+        let pipe = askpass.pipe();
+        nix::unistd::mkfifo(
+            &pipe,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
         )
         .context("Could not prepare the SSH password")?;
-        write("password", 0o600, password.as_bytes())
-            .context("Could not prepare the SSH password")?;
+        let password = password.to_string();
+        askpass.writer = Some(std::thread::spawn(move || {
+            // Waits until ssh runs the helper, or until drop opens the reading end itself.
+            let written = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&pipe)
+                .and_then(|mut end| end.write_all(password.as_bytes()));
+            if let Err(error) = written
+                && error.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                log::error!("could not hand the SSH password to ssh: {error}");
+            }
+        }));
         Ok(askpass)
     }
 
     fn program(&self) -> PathBuf {
         self.dir.join("askpass")
+    }
+
+    fn pipe(&self) -> PathBuf {
+        self.dir.join("password")
+    }
+}
+
+impl Drop for Askpass {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let pipe = self.pipe();
+            let end = |write: bool| {
+                std::fs::OpenOptions::new()
+                    .read(!write)
+                    .write(write)
+                    .custom_flags(nix::libc::O_NONBLOCK)
+                    .open(&pipe)
+            };
+            // Opening an end without waiting releases whoever still waits at the other: the
+            // writer when ssh never asked, a helper still reading when ssh asked twice. Either
+            // open fails when nobody waits, which is fine.
+            let reader = end(false).ok();
+            if let Some(writer) = self.writer.take()
+                && writer.join().is_err()
+            {
+                log::error!("the SSH password writer panicked");
+            }
+            drop(end(true).ok());
+            drop(reader);
+        }
+        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+            log::error!(
+                "could not remove the SSH askpass helper at {:?}: {error}",
+                self.dir
+            );
+        }
     }
 }
 
@@ -130,17 +178,6 @@ fn remove_stale_askpass(ours: &std::path::Path) {
             if stale && let Err(error) = std::fs::remove_dir_all(&path) {
                 log::error!("could not remove a stale SSH password at {path:?}: {error}");
             }
-        }
-    }
-}
-
-impl Drop for Askpass {
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
-            log::error!(
-                "could not remove the SSH password at {:?}: {error}",
-                self.dir
-            );
         }
     }
 }
@@ -230,6 +267,8 @@ impl SshTunnel {
             // shared BatchMode=yes for the master alone; control commands still never ask.
             master
                 .args(["-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1"])
+                // Says how far signing in got, for the error shown when it does not finish.
+                .args(["-o", "LogLevel=VERBOSE"])
                 .env("SSH_ASKPASS", askpass.program())
                 .env("SSH_ASKPASS_REQUIRE", "force");
         }
@@ -485,19 +524,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_the_askpass_helper_hands_the_password_over_once() {
+    async fn test_the_askpass_helper_hands_the_password_over_a_pipe() {
+        use std::os::unix::fs::FileTypeExt as _;
         let _serial = ASKPASS_TESTS.lock().await;
         let askpass = Askpass::create("s3cret pass").unwrap();
+        let pipe = std::fs::metadata(askpass.pipe()).unwrap();
+        assert!(
+            pipe.file_type().is_fifo() && pipe.len() == 0,
+            "nothing of the password is on disk"
+        );
         let first = Command::new(askpass.program()).output().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&first.stdout), "s3cret pass");
-        assert!(
-            !askpass.dir.join("password").exists(),
-            "the password is gone from disk once handed over"
-        );
-        let second = Command::new(askpass.program()).output().await.unwrap();
-        assert!(!second.status.success() && second.stdout.is_empty());
+        // Asked a second time, the helper waits; dropping releases it with nothing.
+        let second = Command::new(askpass.program())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let dir = askpass.dir.clone();
         drop(askpass);
+        let second = tokio::time::timeout(Duration::from_secs(5), second.wait_with_output())
+            .await
+            .expect("the waiting helper was released")
+            .unwrap();
+        assert!(second.stdout.is_empty());
+        assert!(!dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_an_askpass_never_asked_is_removed_without_waiting() {
+        let _serial = ASKPASS_TESTS.lock().await;
+        let askpass = Askpass::create("unused").unwrap();
+        let dir = askpass.dir.clone();
+        let dropped = tokio::task::spawn_blocking(move || drop(askpass));
+        tokio::time::timeout(Duration::from_secs(5), dropped)
+            .await
+            .expect("dropping does not wait for a reader")
+            .unwrap();
         assert!(!dir.exists());
     }
 
@@ -574,10 +638,9 @@ mod tests {
             .unwrap();
         let pong = session.call("PING", Vec::new()).await.unwrap();
         assert_eq!(pong.as_string().as_deref(), Some("PONG"));
-        assert_eq!(
-            askpass_dirs(),
-            before,
-            "the password is off the disk once signed in"
+        assert!(
+            askpass_dirs().is_subset(&before),
+            "nothing of the password stays once signed in"
         );
         let tunnel = session.tunnel.clone().unwrap();
         assert!(
@@ -603,7 +666,10 @@ mod tests {
             format!("{refused:#}").contains("Permission denied"),
             "{refused:#}"
         );
-        assert_eq!(askpass_dirs(), before, "removed after a refusal too");
+        assert!(
+            askpass_dirs().is_subset(&before),
+            "removed after a refusal too"
+        );
 
         let no_password = SshSettings {
             password: None,

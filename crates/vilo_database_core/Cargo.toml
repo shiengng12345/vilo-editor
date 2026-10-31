@@ -31,6 +31,10 @@ serde_json.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["time", "macros", "sync", "net", "io-util", "process"] }
 
+[target.'cfg(unix)'.dependencies]
+# mkfifo, so the SSH password is handed to ssh's askpass through a pipe, never a file.
+nix = { workspace = true, features = ["fs"] }
+
 [dev-dependencies]
 rmpv = "1.3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

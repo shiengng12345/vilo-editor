@@ -20248,6 +20248,7 @@ dependencies = [
  "futures 0.3.34",
  "log",
  "mongodb",
+ "nix",
  "rmpv",
  "rustls",
  "rustls-native-certs",
