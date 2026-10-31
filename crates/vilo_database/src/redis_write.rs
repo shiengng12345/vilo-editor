@@ -1127,6 +1127,30 @@ mod tests {
         key: String,
         lock: String,
         data_dir: std::path::PathBuf,
+        /// Set once a write was sent; until its result is logged the data must stay.
+        sent: std::cell::Cell<bool>,
+    }
+
+    impl Cleanup {
+        /// The sent write logged both its intent and a result, whatever the result was.
+        fn sent_write_finished(&self) -> bool {
+            let Ok(log) = std::fs::read_to_string(mongo_write::audit_path()) else {
+                return false;
+            };
+            let entries = log
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .collect::<Vec<_>>();
+            let phase_of = |phase: &str| {
+                entries
+                    .iter()
+                    .filter(|entry| entry["phase"] == phase)
+                    .filter_map(|entry| entry["operation"].as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let intents = phase_of("intent");
+            !intents.is_empty() && intents.is_subset(&phase_of("result"))
+        }
     }
 
     impl Drop for Cleanup {
@@ -1134,12 +1158,12 @@ mod tests {
             if let Err(error) = send_inline(&self.address, "CLIENT UNPAUSE") {
                 eprintln!("cleanup `CLIENT UNPAUSE` failed: {error}");
             }
-            // A write still in flight logs its result once it is answered; removing the data
-            // directory before that would let the late log line create it again.
+            // A sent write logs its intent and then its result from its own task; removing the
+            // key or the data directory before both are written would let them come back.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
-            while !mongo_write::read_dangling_writes().is_ok_and(|open| open.is_empty()) {
+            while self.sent.get() && !self.sent_write_finished() {
                 if std::time::Instant::now() >= deadline {
-                    eprintln!("cleanup: a write had no logged result after 40 s");
+                    eprintln!("cleanup: the sent write logged no result within 40 s");
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1184,11 +1208,12 @@ mod tests {
             redis_ssh: None,
         };
         let lock = lock_key(&connection.id, 0, key.as_bytes());
-        let _cleanup = Cleanup {
+        let cleanup = Cleanup {
             address: address.clone(),
             key: key.clone(),
             lock: lock.clone(),
             data_dir,
+            sent: std::cell::Cell::new(false),
         };
         assert_eq!(
             send_inline(&address, &format!("SET {key} before EX 600")).unwrap(),
@@ -1268,6 +1293,7 @@ mod tests {
             send_inline(&address, "CLIENT PAUSE 120000 WRITE").unwrap(),
             "+OK"
         );
+        cleanup.sent.set(true);
         view_a.update(&mut cx_a, |view, cx| view.send_redis_write(cx));
         assert!(view_a.read_with(&cx_a, |view, _| {
             view.redis_write.as_ref().is_some_and(|form| form.sending)

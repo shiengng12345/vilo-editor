@@ -95,7 +95,7 @@ pub(crate) fn target_key(connection: &str, database: &str, collection: &str, id:
 }
 
 /// Appends one line to the write log; a write is not sent if its intent cannot be logged.
-fn audit_path() -> std::path::PathBuf {
+pub(crate) fn audit_path() -> std::path::PathBuf {
     paths::config_dir().join("database_audit.log")
 }
 
