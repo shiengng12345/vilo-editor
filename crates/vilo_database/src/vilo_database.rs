@@ -1522,8 +1522,7 @@ impl DatabaseView {
             .items_center()
             .border_r_1()
             .border_color(colors.border)
-            .bg(colors.panel_background)
-            .children(self.rail_padding(usize::from(self.kind_view == Kind::Redis)));
+            .bg(colors.panel_background);
         for (kind, icon, color) in [
             (Kind::MongoDb, "icons/vilo/mongodb.svg", 0x00ED64),
             (Kind::Redis, "icons/vilo/redis.svg", 0xFF4438),
@@ -1600,36 +1599,10 @@ impl DatabaseView {
     }
 
     /// A column as narrow as the kind icons; adding and renaming happen in a form in the page.
-    /// The row the rail's three selections share: the lowest of them, so the others are moved
-    /// down to it and the choices read across as one line.
-    fn rail_row(&self) -> usize {
-        let kind = usize::from(self.kind_view == Kind::Redis);
-        [Level::Site, Level::Environment]
-            .into_iter()
-            .map(|level| {
-                let current = self.current(level);
-                self.names(level)
-                    .iter()
-                    .position(|name| *name == current)
-                    .unwrap_or(0)
-            })
-            .fold(kind, usize::max)
-    }
-
-    /// Empty rows above a column's selection, so it sits on the shared row.
-    fn rail_padding(&self, selected: usize) -> impl Iterator<Item = gpui::Div> {
-        (selected..self.rail_row()).map(|_| div().h(px(36.)).flex_none())
-    }
-
     fn render_names(&self, level: Level, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let noun = level.noun();
         let current = self.current(level);
-        let selected_row = self
-            .names(level)
-            .iter()
-            .position(|name| *name == current)
-            .unwrap_or(0);
         let mut column = v_flex()
             .id(SharedString::from(format!("database-{noun}s")))
             .w(px(48.))
@@ -1640,8 +1613,7 @@ impl DatabaseView {
             .overflow_y_scroll()
             .border_r_1()
             .border_color(colors.border)
-            .bg(colors.panel_background)
-            .children(self.rail_padding(selected_row));
+            .bg(colors.panel_background);
         for name in self.names(level) {
             let selected = current == name;
             let select_name = name.clone();
