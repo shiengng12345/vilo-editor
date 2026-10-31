@@ -2389,6 +2389,47 @@ impl RedisSession {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn test_a_real_sentinel_failover_is_followed() {
+        // A native Sentinel (one in a VM whose clock jumps stays in TILT mode and never fails over).
+        // Sentinel refuses a second failover of one master within twice its failover-timeout,
+        // so back-to-back runs need that gap.
+        let (Ok(url), Ok(sentinel_url)) = (
+            std::env::var("VILO_TEST_NATIVE_SENTINEL"),
+            std::env::var("VILO_TEST_NATIVE_SENTINEL_ADMIN"),
+        ) else {
+            return;
+        };
+        let before = tcp_port(&RedisSession::connect(&url).await.unwrap()).await;
+        let sentinel = RedisSession::connect(&sentinel_url).await.unwrap();
+        sentinel
+            .call("SENTINEL", vec!["FAILOVER".into(), "native".into()])
+            .await
+            .unwrap();
+        let mut after = None;
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if let Ok(session) = RedisSession::connect(&url).await
+                && tcp_port(&session).await != before
+                && session
+                    .call("SET", vec!["vilo_test:failover".into(), "1".into()])
+                    .await
+                    .is_ok()
+            {
+                after = tcp_port(&session).await;
+                session
+                    .call("DEL", vec!["vilo_test:failover".into()])
+                    .await
+                    .unwrap();
+                break;
+            }
+        }
+        assert!(
+            after.is_some() && after != before,
+            "a new session reaches the promoted master"
+        );
+    }
+
     async fn tcp_port(session: &RedisSession) -> Option<String> {
         session
             .call("INFO", vec!["server".into()])

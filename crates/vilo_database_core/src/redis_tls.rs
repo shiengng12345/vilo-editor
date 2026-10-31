@@ -604,6 +604,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ipv6_servers_connect() {
+        use crate::redis::RedisSession;
+        // Native servers listening on ::1 only (containers here do not forward IPv6).
+        if let Ok(port) = std::env::var("VILO_TEST_IPV6_PORT") {
+            let imported =
+                crate::redis_insight::parse_export(&format!(r#"[{{"host":"::1","port":{port}}}]"#))
+                    .unwrap();
+            let session = RedisSession::connect(&imported[0].uri).await.unwrap();
+            let pong = session.call("PING", Vec::new()).await.unwrap();
+            assert_eq!(pong.as_string().as_deref(), Some("PONG"));
+        }
+        if let Ok(port) = std::env::var("VILO_TEST_IPV6_TLS_PORT") {
+            // The test certificate names 127.0.0.1, not ::1; with the check off the handshake
+            // still has to take the bracket-free IPv6 name.
+            let settings = RedisTls {
+                verify: false,
+                ..RedisTls::default()
+            };
+            let session = RedisSession::connect_with(
+                &format!("rediss://[::1]:{port}"),
+                None,
+                Some(&settings),
+                None,
+            )
+            .await
+            .unwrap();
+            let pong = session.call("PING", Vec::new()).await.unwrap();
+            assert_eq!(pong.as_string().as_deref(), Some("PONG"));
+        }
+    }
+
+    #[tokio::test]
     async fn test_a_plain_cluster_is_found_from_one_node() {
         use crate::redis::RedisSession;
         let Ok(url) = std::env::var("VILO_TEST_REDIS_CLUSTER") else {
