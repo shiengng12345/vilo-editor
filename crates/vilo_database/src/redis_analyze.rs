@@ -102,7 +102,6 @@ pub(crate) struct AdminWriteForm {
     /// One line per node once sent.
     results: Vec<(String, Result<(), String>)>,
     message: Option<SharedString>,
-    _task: Option<gpui::Task<()>>,
 }
 
 impl AdminWriteForm {
@@ -656,7 +655,6 @@ impl DatabaseView {
             sending: false,
             results: Vec::new(),
             message: None,
-            _task: None,
         });
         cx.notify();
     }
@@ -814,18 +812,19 @@ impl DatabaseView {
             }
             anyhow::Ok(outcomes)
         });
-        form._task = Some(cx.spawn(async move |this, cx| {
+        // Detached, not owned by the form: the outcome must be recorded even if the form or its
+        // window closes first, and dropping the task would cancel the write itself.
+        cx.spawn(async move |this, cx| {
             let result = task.await;
-            this.update(cx, |this, cx| {
-                // Recorded even if the page moved on, like key writes.
-                if let Ok(outcomes) = &result {
-                    for outcome in outcomes {
-                        if let Some(entry) = outcome.unlogged.clone() {
-                            this.admin_to_check.insert(entry.0.clone());
-                            this.unlogged_writes.push(entry);
-                        }
+            if let Ok(outcomes) = &result {
+                for outcome in outcomes {
+                    if let Some(entry) = outcome.unlogged.clone() {
+                        crate::shared_admin_to_check().insert(entry.0.clone());
+                        crate::shared_unlogged_writes().push(entry);
                     }
                 }
+            }
+            this.update(cx, |this, cx| {
                 let same_session = this.generation == generation;
                 let Some(form) = &mut this.admin_write else {
                     cx.notify();
@@ -858,7 +857,8 @@ impl DatabaseView {
                 cx.notify();
             })
             .ok();
-        }));
+        })
+        .detach();
         cx.notify();
     }
 

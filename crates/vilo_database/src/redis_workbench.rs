@@ -336,6 +336,22 @@ impl DatabaseView {
                             // The task itself failed, possibly after sending.
                             Err(error) => Ok((Err(WriteError::Unknown(format!("{error:#}"))), None)),
                         };
+                        if let Ok((_, Some(error))) = &result {
+                            crate::shared_unlogged_writes().push((
+                                operation.clone(),
+                                format!("{summary} · its result is not in the log: {error}"),
+                            ));
+                        }
+                        if let Ok((Err(WriteError::Unknown(_)), _)) = &result {
+                            // The connection it was sent on, whatever is active now.
+                            for key in &write.keys {
+                                crate::shared_unknown_writes().insert(crate::redis_write::lock_key(
+                                    &connection.id,
+                                    database,
+                                    key,
+                                ));
+                            }
+                        }
                         let alive = this
                             .update(cx, |this, cx| {
                                 let shown = match &result {
@@ -353,21 +369,7 @@ impl DatabaseView {
                                 if let Some(state) = this.redis_state.as_mut() {
                                     state.workbench.push((line.clone(), shown));
                                 }
-                                if let Ok((_, Some(error))) = &result {
-                                    this.unlogged_writes.push((
-                                        operation.clone(),
-                                        format!("{summary} · its result is not in the log: {error}"),
-                                    ));
-                                }
                                 if let Ok((Err(WriteError::Unknown(message)), _)) = &result {
-                                    // The connection it was sent on, whatever is active now.
-                                    for key in &write.keys {
-                                        this.unknown_writes.insert(crate::redis_write::lock_key(
-                                            &connection.id,
-                                            database,
-                                            key,
-                                        ));
-                                    }
                                     this.write_notice = Some(
                                         format!("The outcome of {summary} is unknown ({message}). Refresh its keys to check them before writing again.")
                                             .into(),

@@ -777,15 +777,22 @@ impl DatabaseView {
             if let Some(lock) = &group_lock {
                 crate::redis_pubsub::settle_operation_lock(lock, &operation_id, unknown);
             }
+            // Recorded on the connection it was sent on, so the next write from any window checks.
+            if let Some(error) = logged {
+                crate::shared_unlogged_writes().push((
+                    operation_id.clone(),
+                    format!("{summary} · its result is not in the log: {error}"),
+                ));
+            }
+            if unknown && group_lock.is_none() {
+                crate::shared_unknown_writes().insert(lock_key(
+                    &connection.id,
+                    database,
+                    planned.key(),
+                ));
+            }
             this.update(cx, |this, cx| {
                 let key = planned.key().to_vec();
-                // Recorded even if the page moved on meanwhile, so the next write still has to check.
-                if let Some(error) = logged {
-                    this.unlogged_writes.push((
-                        operation_id.clone(),
-                        format!("{summary} · its result is not in the log: {error}"),
-                    ));
-                }
                 if let Ok(Err(WriteError::Unknown(message))) = &result {
                     if group_lock.is_some() {
                         this.write_notice = Some(
@@ -793,10 +800,6 @@ impl DatabaseView {
                                 .into(),
                         );
                     } else {
-                        if let Some(connection) = &this.active {
-                            this.unknown_writes
-                                .insert(lock_key(connection, database, &key));
-                        }
                         this.write_notice = Some(
                             format!("The outcome of {summary} is unknown ({message}). Refresh the key to check it before writing again.")
                                 .into(),

@@ -74,7 +74,6 @@ pub(crate) struct DocWrite {
     show_values: bool,
     sending: bool,
     message: Option<SharedString>,
-    _task: Option<gpui::Task<()>>,
 }
 
 impl DocWrite {
@@ -355,7 +354,6 @@ impl DatabaseView {
             show_values: false,
             sending: false,
             message: None,
-            _task: None,
         };
         if op == DocOp::Delete {
             match write.original.as_ref().map(build_delete) {
@@ -564,23 +562,24 @@ impl DatabaseView {
             .map(|error| format!("{error:#}"));
             Ok((outcome, logged))
         });
-        write._task = Some(cx.spawn(async move |this, cx| {
+        // Detached, not owned by the form: the outcome must be recorded even if the form or its
+        // window closes first, and dropping the task would cancel the write itself.
+        cx.spawn(async move |this, cx| {
             let (result, logged) = match task.await {
                 Ok((outcome, logged)) => (Ok(outcome), logged),
                 Err(error) => (Err(error), None),
             };
+            if let Some(error) = logged {
+                crate::shared_unlogged_writes().push((
+                    operation_id,
+                    format!("{summary} · its result is not in the log: {error}"),
+                ));
+            }
+            if let (Ok(Err(WriteError::Unknown(_))), Some(key)) = (&result, &key) {
+                crate::shared_unknown_writes().insert(key.clone());
+            }
             this.update(cx, |this, cx| {
-                // Recorded even if the page moved on meanwhile, so the next write still has to check.
-                if let Some(error) = logged {
-                    this.unlogged_writes.push((
-                        operation_id,
-                        format!("{summary} · its result is not in the log: {error}"),
-                    ));
-                }
                 if let Ok(Err(WriteError::Unknown(message))) = &result {
-                    if let Some(key) = &key {
-                        this.unknown_writes.insert(key.clone());
-                    }
                     this.write_notice = Some(
                         format!("The outcome of {summary} is unknown ({message}). Refresh the page to check it before writing again.")
                             .into(),
@@ -617,7 +616,8 @@ impl DatabaseView {
                 cx.notify();
             })
             .ok();
-        }));
+        })
+        .detach();
         cx.notify();
     }
 

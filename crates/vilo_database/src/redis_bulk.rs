@@ -344,14 +344,14 @@ impl DatabaseView {
                     }
                     _ => {}
                 }
+                if let Ok((_, Some((error, true)))) = &result {
+                    crate::shared_unlogged_writes().push((
+                        operation.clone(),
+                        format!("{summary} · its result is not in the log: {error}"),
+                    ));
+                }
                 let alive = this
                     .update(cx, |this, cx| {
-                        if let Ok((_, Some((error, true)))) = &result {
-                            this.unlogged_writes.push((
-                                operation.clone(),
-                                format!("{summary} · its result is not in the log: {error}"),
-                            ));
-                        }
                         if let Some(run) = this.bulk_delete.as_mut().and_then(|form| form.run.as_mut()) {
                             run.done = index + 1;
                             if let Ok((Ok(deleted), _)) = &result {

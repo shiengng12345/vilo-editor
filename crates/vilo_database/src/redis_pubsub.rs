@@ -554,16 +554,16 @@ impl DatabaseView {
                     locks.settled.insert(operation.clone());
                 }
             }
+            if let Ok((_, Some(error))) = &result {
+                crate::shared_unlogged_writes().push((
+                    operation.clone(),
+                    format!("{summary} · its result is not in the log: {error}"),
+                ));
+            }
             this.update(cx, |this, cx| {
                 let mut locked = None;
                 let message = match result {
-                    Ok((outcome, logged)) => {
-                        if let Some(error) = logged {
-                            this.unlogged_writes.push((
-                                operation.clone(),
-                                format!("{summary} · its result is not in the log: {error}"),
-                            ));
-                        }
+                    Ok((outcome, _)) => {
                         match outcome {
                             // PUBLISH and SPUBLISH count only the node that took it; a Cluster forwards to the others.
                             Ok(count) if clustered => (true, format!("Published; {count} subscribers on the node that took it received it. Subscribers on other nodes (or the shard's replicas) are not counted.")),

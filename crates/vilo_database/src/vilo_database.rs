@@ -231,6 +231,19 @@ static ADMIN_TO_CHECK: std::sync::Mutex<std::collections::BTreeSet<String>> =
 /// window is locked in all of them.
 pub(crate) struct SharedChecks<T: 'static>(&'static std::sync::Mutex<T>);
 
+// For write tasks that finish after their window closed: they record here, not on the view.
+pub(crate) fn shared_unknown_writes() -> SharedChecks<std::collections::BTreeSet<String>> {
+    SharedChecks(&UNKNOWN_WRITES)
+}
+
+pub(crate) fn shared_unlogged_writes() -> SharedChecks<Vec<(String, String)>> {
+    SharedChecks(&UNLOGGED_WRITES)
+}
+
+pub(crate) fn shared_admin_to_check() -> SharedChecks<std::collections::BTreeSet<String>> {
+    SharedChecks(&ADMIN_TO_CHECK)
+}
+
 impl<T> SharedChecks<T> {
     fn with<R>(&self, change: impl FnOnce(&mut T) -> R) -> R {
         // Every change is a single insert, push or retain, so the data stays usable after a panic.
