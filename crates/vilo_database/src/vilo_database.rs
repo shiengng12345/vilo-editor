@@ -393,7 +393,8 @@ impl RedisFields {
             },
             user: text(&self.ssh_user),
             key_file: (!key.is_empty()).then(|| PathBuf::from(key)),
-            known_hosts: None,
+            // Tests remember their jump hosts in their own data, not in the user's known_hosts.
+            known_hosts: cfg!(test).then(|| paths::config_dir().join("test_known_hosts")),
             password: (!password.is_empty())
                 .then(|| vilo_database_core::redis_ssh::SshPassword(password)),
         };
@@ -694,6 +695,9 @@ pub(crate) fn write_credential(
 ) -> Task<Result<()>> {
     #[cfg(test)]
     {
+        if gpui_test::failing().contains(url) {
+            return Task::ready(Err(anyhow!("the test keychain refused {url}")));
+        }
         gpui_test::keychain().insert(url.to_string(), (username.to_string(), secret.to_vec()));
         Task::ready(Ok(()))
     }
@@ -705,6 +709,9 @@ pub(crate) fn write_credential(
 pub(crate) fn delete_credential(cx: &App, url: &str) -> Task<Result<()>> {
     #[cfg(test)]
     {
+        if gpui_test::failing().contains(url) {
+            return Task::ready(Err(anyhow!("the test keychain refused {url}")));
+        }
         gpui_test::keychain().remove(url);
         Task::ready(Ok(()))
     }
@@ -1633,8 +1640,12 @@ impl DatabaseView {
                     connect(&connection, uri.clone(), cx).await?;
                 }
                 // The SSH password first: if it cannot be saved or removed, nothing else changes
-                // and the user sees why.
+                // and the user sees why. What it was is kept, to put back if a later step fails.
                 let ssh_url = connection.ssh_credential_url();
+                let previous_ssh = cx
+                    .update(|cx| crate::read_credential(cx, &ssh_url))
+                    .await
+                    .context("Could not read the SSH password from the keychain")?;
                 match connection
                     .redis_ssh
                     .as_ref()
@@ -1653,11 +1664,36 @@ impl DatabaseView {
                 }
                 if !uri.is_empty() {
                     let url = connection.credential_url();
-                    cx.update(|cx| {
-                        crate::write_credential(cx, &url, connection.kind.label(), uri.as_bytes())
-                    })
-                    .await
-                    .context("Vilo could not save the connection string to the keychain")?;
+                    let written = cx
+                        .update(|cx| {
+                            crate::write_credential(
+                                cx,
+                                &url,
+                                connection.kind.label(),
+                                uri.as_bytes(),
+                            )
+                        })
+                        .await;
+                    if let Err(error) = written {
+                        // The saved connection stays as it was, so its SSH password must too.
+                        let restored = match &previous_ssh {
+                            Some((username, secret)) => {
+                                cx.update(|cx| {
+                                    crate::write_credential(cx, &ssh_url, username, secret)
+                                })
+                                .await
+                            }
+                            None => forget_credential(&ssh_url, cx).await,
+                        };
+                        let error = error
+                            .context("Vilo could not save the connection string to the keychain");
+                        return Err(match restored {
+                            Ok(()) => error,
+                            Err(restore) => error.context(format!(
+                                "putting the previous SSH password back also failed ({restore:#})"
+                            )),
+                        });
+                    }
                 }
                 let persist = this.update(cx, |this, cx| {
                     match this.connections.iter_mut().find(|c| c.id == connection.id) {
@@ -3008,6 +3044,15 @@ pub(crate) mod gpui_test {
     type Entries = std::collections::BTreeMap<String, (String, Vec<u8>)>;
 
     /// The keychain while testing, shared like the real one by every view of the process.
+    /// Keychain entries whose writes and deletions fail while testing, to test what follows.
+    pub(crate) fn failing() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<String>> {
+        static FAILING: std::sync::Mutex<std::collections::BTreeSet<String>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        FAILING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub(crate) fn keychain() -> std::sync::MutexGuard<'static, Entries> {
         static KEYCHAIN: std::sync::Mutex<Entries> =
             std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -3104,52 +3149,17 @@ mod tests {
         let (key_host, key_port) = host_port(&key_address);
         let (private_host, private_port) = host_port(&private_redis);
         let (direct_host, direct_port) = host_port(&direct_redis);
-        // The form has no known_hosts field, so ssh remembers the test hosts in the user's file;
-        // only the lines it adds for them are taken out again when the test ends.
-        struct Cleanup {
-            known_hosts: std::path::PathBuf,
-            before: std::collections::BTreeSet<String>,
-            test_hosts: Vec<String>,
-            data_dir: std::path::PathBuf,
-        }
+        struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                if let Ok(now) = std::fs::read_to_string(&self.known_hosts) {
-                    let kept = now
-                        .lines()
-                        .filter(|line| {
-                            self.before.contains(*line)
-                                || !self.test_hosts.iter().any(|host| line.starts_with(host))
-                        })
-                        .map(|line| format!("{line}\n"))
-                        .collect::<String>();
-                    if kept != now
-                        && let Err(error) = std::fs::write(&self.known_hosts, kept)
-                    {
-                        eprintln!("could not restore {:?}: {error}", self.known_hosts);
-                    }
-                }
-                if let Err(error) = std::fs::remove_dir_all(&self.data_dir)
+                if let Err(error) = std::fs::remove_dir_all(&self.0)
                     && error.kind() != std::io::ErrorKind::NotFound
                 {
-                    eprintln!("cleanup of {:?} failed: {error}", self.data_dir);
+                    eprintln!("cleanup of {:?} failed: {error}", self.0);
                 }
             }
         }
-        let known_hosts = paths::home_dir().join(".ssh").join("known_hosts");
-        let _cleanup = Cleanup {
-            before: std::fs::read_to_string(&known_hosts)
-                .unwrap_or_default()
-                .lines()
-                .map(str::to_string)
-                .collect(),
-            known_hosts,
-            test_hosts: vec![
-                format!("[{password_host}]:{password_port} "),
-                format!("[{key_host}]:{key_port} "),
-            ],
-            data_dir,
-        };
+        let _cleanup = Cleanup(data_dir);
         let password = std::fs::read_to_string(password_file)
             .unwrap()
             .trim()
@@ -3305,6 +3315,30 @@ mod tests {
             None
         );
         assert_eq!(ssh_entry(&id).as_deref(), Some(password.as_str()));
+        // A save whose connection string the keychain refuses changes nothing: the SSH password
+        // that was already removed for it is put back.
+        gpui_test::failing().insert(format!("vilo-database://{id}"));
+        let refused = save(
+            Some(id.clone()),
+            Typed {
+                redis: [direct_host.clone(), direct_port.clone()],
+                ssh: None,
+            },
+            &mut cx,
+        );
+        gpui_test::failing().clear();
+        assert!(
+            refused
+                .as_ref()
+                .is_some_and(|message| message.contains("connection string")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            ssh_entry(&id).as_deref(),
+            Some(password.as_str()),
+            "the previous SSH password was put back"
+        );
+        view.update(&mut cx, |view, _| view.form = None);
         let direct = Typed {
             redis: [direct_host, direct_port],
             ssh: None,
