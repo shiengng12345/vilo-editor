@@ -631,16 +631,7 @@ impl DatabaseView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .writes_to_check()
-            .iter()
-            .any(|(operation, _)| self.admin_to_check.contains(operation))
-        {
-            self.write_notice = Some(
-                "An earlier slow log change has an outcome to check. Check it, then mark it checked above."
-                    .into(),
-            );
-            cx.notify();
+        if self.admin_write_waits(cx) {
             return;
         }
         if self
@@ -684,7 +675,27 @@ impl DatabaseView {
         cx.notify();
     }
 
+    /// An administration write whose outcome is still to check, in any window, holds back new ones.
+    fn admin_write_waits(&mut self, cx: &mut Context<Self>) -> bool {
+        let waits = self
+            .writes_to_check()
+            .iter()
+            .any(|(operation, _)| self.admin_to_check.contains(operation));
+        if waits {
+            self.write_notice = Some(
+                "An earlier slow log change has an outcome to check. Check it, then mark it checked above."
+                    .into(),
+            );
+            cx.notify();
+        }
+        waits
+    }
+
     fn send_admin_write(&mut self, cx: &mut Context<Self>) {
+        // Checked again here: another window may have left one to check since this form opened.
+        if self.admin_write_waits(cx) {
+            return;
+        }
         let Some(session) = self.redis() else {
             return;
         };

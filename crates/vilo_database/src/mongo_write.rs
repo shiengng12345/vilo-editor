@@ -503,6 +503,18 @@ impl DatabaseView {
         let key = id
             .as_ref()
             .map(|id| target_key(&connection.id, &write.database, &write.collection, id));
+        // Checked again here: another window may have locked the document since this form opened.
+        if key
+            .as_ref()
+            .is_some_and(|key| self.unknown_writes.contains(key))
+        {
+            write.message = Some(
+                "A write to this document has an unknown outcome. Refresh the page to check it first."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         write.sending = true;
         write.message = Some("Sending…".into());
         let operation = uuid::Uuid::new_v4().simple().to_string();
