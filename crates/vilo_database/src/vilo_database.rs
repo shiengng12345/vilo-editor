@@ -6,6 +6,7 @@ mod redis_profiler;
 mod redis_pubsub;
 mod redis_search;
 mod redis_stream;
+mod redis_transfer;
 mod redis_view;
 mod redis_workbench;
 mod redis_write;
@@ -456,6 +457,8 @@ pub struct DatabaseView {
     collections: HashMap<String, Fetch<Vec<CollectionInfo>>>,
     /// MongoDB or Redis: the rail on the far left picks which kind the sidebar and page show.
     kind_view: Kind,
+    /// The outcome of the last import or export, shown under the connection list's search.
+    transfer_notice: Option<SharedString>,
     /// The site and environment whose connections the sidebar lists, by `Level`.
     selected: [Option<String>; 2],
     /// Sites and environments the user keeps, shared by MongoDB and Redis, by `Level`.
@@ -649,6 +652,7 @@ impl DatabaseView {
             databases: Fetch::Loaded(Vec::new()),
             collections: HashMap::default(),
             kind_view: Kind::MongoDb,
+            transfer_notice: None,
             selected: [None, None],
             names,
             name_edit: None,
@@ -2044,6 +2048,74 @@ impl DatabaseView {
                                         ),
                                 )
                             })
+                            .when(self.kind_view == Kind::Redis, |this| {
+                                let view = cx.entity().downgrade();
+                                this.child(
+                                    ui::PopoverMenu::new("database-redis-transfer")
+                                        .trigger(
+                                            IconButton::new(
+                                                "database-redis-transfer-button",
+                                                IconName::Ellipsis,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(
+                                                Tooltip::text(
+                                                    "Import or export RedisInsight connections",
+                                                ),
+                                            ),
+                                        )
+                                        .menu(move |window, cx| {
+                                            let view = view.clone();
+                                            Some(ContextMenu::build(
+                                                window,
+                                                cx,
+                                                move |menu, _, _| {
+                                                    let (import, plain, secret) =
+                                                        (view.clone(), view.clone(), view);
+                                                    menu.entry(
+                                                        "Import from RedisInsight…",
+                                                        None,
+                                                        move |window, cx| {
+                                                            import
+                                                                .update(cx, |this, cx| {
+                                                                    this.import_redis_insight(
+                                                                        window, cx,
+                                                                    )
+                                                                })
+                                                                .ok();
+                                                        },
+                                                    )
+                                                    .entry(
+                                                        "Export to RedisInsight…",
+                                                        None,
+                                                        move |window, cx| {
+                                                            plain
+                                                                .update(cx, |this, cx| {
+                                                                    this.export_redis_insight(
+                                                                        false, window, cx,
+                                                                    )
+                                                                })
+                                                                .ok();
+                                                        },
+                                                    )
+                                                    .entry(
+                                                        "Export with passwords and keys…",
+                                                        None,
+                                                        move |window, cx| {
+                                                            secret
+                                                                .update(cx, |this, cx| {
+                                                                    this.export_redis_insight(
+                                                                        true, window, cx,
+                                                                    )
+                                                                })
+                                                                .ok();
+                                                        },
+                                                    )
+                                                },
+                                            ))
+                                        }),
+                                )
+                            })
                             .child(
                                 IconButton::new("database-add-connection", IconName::Plus)
                                     .icon_size(IconSize::Small)
@@ -2055,6 +2127,30 @@ impl DatabaseView {
                     ),
             )
             .child(div().mx_2().mb_1().child(boxed(self.search.clone(), cx)))
+            .when_some(self.transfer_notice.clone(), |this, notice| {
+                this.child(
+                    h_flex()
+                        .mx_2()
+                        .mb_1()
+                        .gap_1()
+                        .items_start()
+                        .child(
+                            div().flex_1().child(
+                                Label::new(notice)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                        .child(
+                            IconButton::new("database-transfer-dismiss", IconName::Close)
+                                .icon_size(IconSize::XSmall)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.transfer_notice = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(
                 v_flex()
                     .id("database-tree")
