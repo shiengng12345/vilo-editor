@@ -63,12 +63,22 @@ const PASSWORD_PIPE: &str = "password";
 
 impl Askpass {
     #[cfg(not(unix))]
-    fn create(_password: Option<&str>, _passphrase: Option<&str>) -> Result<Self> {
+    fn create(
+        _password: Option<&str>,
+        _passphrase: Option<&str>,
+        _key_prompt: Option<&str>,
+    ) -> Result<Self> {
         bail!("SSH passwords are only supported on macOS and Linux; use a key or the agent.")
     }
 
+    /// `key_prompt` is ssh's prompt for the passphrase, word for word; only it gets the
+    /// passphrase.
     #[cfg(unix)]
-    fn create(password: Option<&str>, passphrase: Option<&str>) -> Result<Self> {
+    fn create(
+        password: Option<&str>,
+        passphrase: Option<&str>,
+        key_prompt: Option<&str>,
+    ) -> Result<Self> {
         use std::io::Write as _;
         use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
         for secret in [password, passphrase].into_iter().flatten() {
@@ -98,15 +108,27 @@ impl Askpass {
             .mode(0o700)
             .open(askpass.program())
             .context("Could not prepare the SSH password")?;
-        // ssh passes its prompt. Only its own prompt for unlocking a key, which starts so, gets
-        // the passphrase; a host name or a server's prompt saying "passphrase" elsewhere does not.
-        // A secret not given has no pipe, so that ask fails at once.
+        // ssh passes its prompt. Only its prompt for unlocking this key, word for word, gets the
+        // passphrase: it names the key's local path, which a server's keyboard-interactive
+        // prompt cannot know to copy. Any other key prompt gets nothing, so the password is never
+        // spent on a key; everything else gets the password. A secret not given has no pipe, so
+        // that ask fails at once.
         helper
             .write_all(
-                b"#!/bin/sh\nd=$(dirname \"$0\")\ncase \"$1\" in\n\"Enter passphrase for key '\"*) exec cat \"$d/passphrase\" ;;\n*) exec cat \"$d/password\" ;;\nesac\n",
+                b"#!/bin/sh\nd=$(dirname \"$0\")\ncase \"$1\" in\n\"Enter passphrase for key '\"*)\n  if [ -f \"$d/key_prompt\" ] && [ \"$1\" = \"$(cat \"$d/key_prompt\")\" ]; then exec cat \"$d/passphrase\"; fi\n  exit 1 ;;\nesac\nexec cat \"$d/password\"\n",
             )
             .context("Could not prepare the SSH password")?;
         drop(helper);
+        if let (Some(prompt), Some(_)) = (key_prompt, passphrase) {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(askpass.dir.join("key_prompt"))
+                .context("Could not prepare the SSH password")?;
+            file.write_all(prompt.as_bytes())
+                .context("Could not prepare the SSH password")?;
+        }
         for (name, secret) in [(PASSWORD_PIPE, password), (PASSPHRASE_PIPE, passphrase)] {
             let Some(secret) = secret else {
                 continue;
@@ -232,6 +254,34 @@ pub struct SshTunnel {
 }
 
 /// The options every ssh call of a tunnel shares, ending with `--` and the destination.
+/// The key file as given, with a leading `~/` made the home directory, so the path ssh is given
+/// is the one it names when it asks for the key's passphrase.
+fn key_path(key: &std::path::Path) -> String {
+    let text = key.display().to_string();
+    match (text.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest).display().to_string(),
+        _ => text,
+    }
+}
+
+/// ssh's prompt for the key's passphrase, word for word (it cuts the path at 100 bytes).
+fn key_prompt(key: &std::path::Path) -> Result<String> {
+    let path = key_path(key);
+    // ssh expands % tokens in key paths, so its prompt would name another path.
+    anyhow::ensure!(
+        !path.contains('%'),
+        "A key with a passphrase needs a path without %."
+    );
+    let mut end = path.len().min(100);
+    while !path.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(format!(
+        "Enter passphrase for key '{}': ",
+        path.get(..end).unwrap_or_default()
+    ))
+}
+
 fn ssh_arguments(settings: &SshSettings, control: &std::path::Path) -> Result<Vec<String>> {
     let host = settings.host.trim();
     let user = settings.user.trim();
@@ -263,7 +313,7 @@ fn ssh_arguments(settings: &SshSettings, control: &std::path::Path) -> Result<Ve
         arguments.extend(["-l".into(), user.to_string()]);
     }
     if let Some(key) = &settings.key_file {
-        arguments.extend(["-i".into(), key.display().to_string()]);
+        arguments.extend(["-i".into(), key_path(key)]);
         arguments.extend(["-o".into(), "IdentitiesOnly=yes".into()]);
     }
     if let Some(known_hosts) = &settings.known_hosts {
@@ -292,17 +342,21 @@ impl SshTunnel {
                 .filter(|secret| !secret.is_empty())
         }
         let (password, passphrase) = (given(&settings.password), given(&settings.passphrase));
+        let key_prompt = match (passphrase, &settings.key_file) {
+            (Some(_), Some(key)) => Some(key_prompt(key)?),
+            (Some(_), None) => bail!("A key passphrase needs the private key file."),
+            (None, _) => None,
+        };
         let askpass = if password.is_some() || passphrase.is_some() {
-            Some(Askpass::create(password, passphrase)?)
+            Some(Askpass::create(
+                password,
+                passphrase,
+                key_prompt.as_deref(),
+            )?)
         } else {
             None
         };
         let mut master = Command::new("ssh");
-        if passphrase.is_some() {
-            // A server's keyboard-interactive prompts reach the helper too; with a passphrase in
-            // it, only ssh's own password prompt may ask, so no server can word one to get it.
-            master.args(["-o", "KbdInteractiveAuthentication=no"]);
-        }
         if let Some(askpass) = &askpass {
             // ssh takes the first value it is given for an option, so these win over the
             // shared BatchMode=yes for the master alone; control commands still never ask.
@@ -577,7 +631,9 @@ mod tests {
                 .kill_on_drop(true);
             command
         };
-        let askpass = Askpass::create(Some("s3cret pass"), Some("key phrase")).unwrap();
+        let key_prompt = "Enter passphrase for key '/k/id': ";
+        let askpass =
+            Askpass::create(Some("s3cret pass"), Some("key phrase"), Some(key_prompt)).unwrap();
         for name in [PASSWORD_PIPE, PASSPHRASE_PIPE] {
             let pipe = std::fs::metadata(askpass.dir.join(name)).unwrap();
             assert!(
@@ -594,18 +650,28 @@ mod tests {
             "s3cret pass",
             "a host name with \"passphrase\" in it still gets the password"
         );
-        // A server could word a prompt like this; it never gets the key's passphrase.
-        let worded = Askpass::create(Some("server pw"), Some("key phrase")).unwrap();
-        let phished = ask(&worded, "Type your key passphrase: ")
-            .output()
-            .await
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&phished.stdout), "server pw");
-        drop(worded);
-        let passphrase = ask(&askpass, "Enter passphrase for key '/k/id': ")
-            .output()
-            .await
-            .unwrap();
+        // A server could word prompts like these. None gets the key's passphrase; one worded as
+        // another key's prompt gets nothing at all. Each is asked of a fresh helper, as each pipe
+        // hands its secret over once.
+        for (phishing, answer) in [
+            ("Type your key passphrase: ", "server pw"),
+            ("Enter passphrase for key '/home/me/.ssh/id_ed25519': ", ""),
+            ("Enter passphrase for key '/k/id': x", ""),
+        ] {
+            let worded =
+                Askpass::create(Some("server pw"), Some("key phrase"), Some(key_prompt)).unwrap();
+            let phished =
+                tokio::time::timeout(Duration::from_secs(5), ask(&worded, phishing).output())
+                    .await
+                    .expect("answered at once")
+                    .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&phished.stdout),
+                answer,
+                "{phishing}"
+            );
+        }
+        let passphrase = ask(&askpass, key_prompt).output().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&passphrase.stdout), "key phrase");
         // Asked a second time, the helper waits; dropping releases it with nothing.
         let second = ask(&askpass, "vboth@bastion's password: ").spawn().unwrap();
@@ -620,7 +686,7 @@ mod tests {
         assert!(!dir.exists());
 
         // A secret not given is not waited for.
-        let askpass = Askpass::create(Some("only a password"), None).unwrap();
+        let askpass = Askpass::create(Some("only a password"), None, None).unwrap();
         let passphrase = tokio::time::timeout(
             Duration::from_secs(5),
             ask(&askpass, "Enter passphrase for key '/k/id': ").output(),
@@ -635,11 +701,11 @@ mod tests {
     #[tokio::test]
     async fn test_an_askpass_never_asked_is_removed_without_waiting() {
         let _serial = ASKPASS_TESTS.lock().await;
-        assert!(Askpass::create(Some(&"x".repeat(MAX_PASSWORD_BYTES + 1)), None).is_err());
-        assert!(Askpass::create(None, Some(&"x".repeat(MAX_PASSWORD_BYTES + 1))).is_err());
+        assert!(Askpass::create(Some(&"x".repeat(MAX_PASSWORD_BYTES + 1)), None, None).is_err());
+        assert!(Askpass::create(None, Some(&"x".repeat(MAX_PASSWORD_BYTES + 1)), None).is_err());
         // The longest password allowed, so its write cannot outgrow the pipe nobody reads.
         let longest = "x".repeat(MAX_PASSWORD_BYTES);
-        let askpass = Askpass::create(Some(&longest), Some(&longest)).unwrap();
+        let askpass = Askpass::create(Some(&longest), Some(&longest), None).unwrap();
         let dir = askpass.dir.clone();
         let dropped = tokio::task::spawn_blocking(move || drop(askpass));
         tokio::time::timeout(Duration::from_secs(5), dropped)
@@ -663,11 +729,28 @@ mod tests {
             .unwrap()
             .set_modified(old)
             .unwrap();
-        let askpass = Askpass::create(Some("new"), None).unwrap();
+        let askpass = Askpass::create(Some("new"), None, None).unwrap();
         assert!(!stale.exists(), "one left by an exited Vilo goes");
         assert!(fresh.exists(), "one a sign-in may still use stays");
         drop(askpass);
         std::fs::remove_dir_all(&fresh).unwrap();
+    }
+
+    #[test]
+    fn test_the_key_prompt_is_ssh_s_own_words() {
+        assert_eq!(
+            key_prompt(std::path::Path::new("/k/id")).unwrap(),
+            "Enter passphrase for key '/k/id': "
+        );
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            key_prompt(std::path::Path::new("~/.ssh/id")).unwrap(),
+            format!("Enter passphrase for key '{home}/.ssh/id': ")
+        );
+        let long = format!("/{}", "é".repeat(80));
+        let prompt = key_prompt(std::path::Path::new(&long)).unwrap();
+        assert!(prompt.len() <= "Enter passphrase for key '': ".len() + 100);
+        assert!(key_prompt(std::path::Path::new("/k/%d")).is_err());
     }
 
     #[test]
@@ -856,6 +939,27 @@ mod tests {
             !reached && took < Duration::from_secs(15),
             "without the password it fails at once ({took:?})"
         );
+        // A host whose password is asked by keyboard-interactive (PAM): its own prompt gets the
+        // password, ssh's prompt for the key the passphrase.
+        if let Ok(kbd_address) = std::env::var("VILO_TEST_SSH_KBD_HOST") {
+            let (reached, _) = reaches(settings(
+                &kbd_address,
+                "vkbd",
+                Some(&password),
+                Some(&passphrase),
+            ))
+            .await;
+            assert!(
+                reached,
+                "the passphrase, then the password by keyboard-interactive"
+            );
+            let (reached, took) =
+                reaches(settings(&kbd_address, "vkbd", None, Some(&passphrase))).await;
+            assert!(
+                !reached && took < Duration::from_secs(15),
+                "without the password it fails at once ({took:?})"
+            );
+        }
         std::fs::remove_file(&known_hosts).ok();
     }
 
