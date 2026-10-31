@@ -1851,17 +1851,20 @@ impl DatabaseView {
                             .child(cell(value.clone(), None, Color::Default)),
                     );
                 }
-                // How the session came to be single, when there is more to it than a plain server.
-                let note = self
+                // A session with a connection note says it above, whatever loads here.
+                let explained = self
                     .redis()
-                    .and_then(|session| session.notice().map(str::to_string))
-                    .unwrap_or_else(|| "Single server (not a cluster).".into());
+                    .is_some_and(|session| session.notice().is_some());
                 v_flex()
                     .gap_2()
                     .child(
-                        Label::new(format!("{note} Replication:"))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        Label::new(if explained {
+                            "Replication:"
+                        } else {
+                            "Single server (not a cluster). Replication:"
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                     )
                     .child(table)
                     .into_any_element()
@@ -2064,20 +2067,27 @@ impl DatabaseView {
                                 })
                                 .ok();
                             })
-                            .child(div().w(px(depth as f32 * 18.)).flex_none())
+                            .child(div().w(px(depth as f32 * 18. + 4.)).flex_none())
+                            // The same width as a key's type badge, so folder and key names line up.
                             .child(
-                                Icon::new(if open {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                            )
-                            .child(
-                                Icon::new(IconName::Folder)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
+                                h_flex()
+                                    .w(px(64.))
+                                    .flex_none()
+                                    .gap_1()
+                                    .child(
+                                        Icon::new(if open {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Icon::new(IconName::Folder)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    ),
                             )
                             .child(
                                 div()
@@ -2477,6 +2487,14 @@ impl DatabaseView {
                                 .on_click(cx.listener(|this, _, _, cx| this.show_topology(cx))),
                             )
                             .child(close),
+                    )
+                    // How the session came to be set up as it is, shown even when INFO is refused.
+                    .when_some(
+                        self.redis()
+                            .and_then(|session| session.notice().map(SharedString::from)),
+                        |this, note| {
+                            this.child(Label::new(note).size(LabelSize::Small).color(Color::Muted))
+                        },
                     )
                     .child(
                         v_flex()
