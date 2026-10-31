@@ -66,7 +66,7 @@ impl Askpass {
     fn create(
         _password: Option<&str>,
         _passphrase: Option<&str>,
-        _key_prompt: Option<&str>,
+        _key_prompt: Option<&[u8]>,
     ) -> Result<Self> {
         bail!("SSH passwords are only supported on macOS and Linux; use a key or the agent.")
     }
@@ -77,7 +77,7 @@ impl Askpass {
     fn create(
         password: Option<&str>,
         passphrase: Option<&str>,
-        key_prompt: Option<&str>,
+        key_prompt: Option<&[u8]>,
     ) -> Result<Self> {
         use std::io::Write as _;
         use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
@@ -112,11 +112,32 @@ impl Askpass {
         // passphrase: it names the key's local path, which a server's keyboard-interactive
         // prompt cannot know to copy. Any other key prompt gets nothing, so the password is never
         // spent on a key; everything else gets the password. A secret not given has no pipe, so
-        // that ask fails at once.
+        // that ask fails at once. If Vilo exits before handing a secret over, nothing ever
+        // writes to the pipe, so a watchdog ends the reading after a while and ssh fails and
+        // exits too. The helper becomes the reader itself (ssh may have children reaped
+        // automatically, so it cannot wait for one). ssh leaves the write end of its pipe open in
+        // the helper under another descriptor and reads until every holder closes it, so the
+        // watchdog cannot sleep through the limit: it checks often and leaves as soon as the
+        // helper has ended (a zombie counts as ended, as ssh reaps it only after reading), and
+        // it only stops a process that is still this helper.
+        let script = format!(
+            "#!/bin/sh\n\
+             d=$(dirname \"$0\")\n\
+             secret=password\n\
+             case \"$1\" in\n\
+             \"Enter passphrase for key '\"*)\n\
+             \x20 if [ -f \"$d/key_prompt\" ] && [ \"$1\" = \"$(cat \"$d/key_prompt\")\" ]; then secret=passphrase; else exit 1; fi ;;\n\
+             esac\n\
+             ( start=$(date +%s)\n\
+             \x20 while :; do\n\
+             \x20   case \"$(ps -p $$ -o command= 2>/dev/null)\" in *\"$d\"*) ;; *) exit 0 ;; esac\n\
+             \x20   if [ $(( $(date +%s) - start )) -ge {HELPER_LIMIT_SECS} ]; then kill $$; exit 0; fi\n\
+             \x20   sleep 0.2 2>/dev/null || sleep 1\n\
+             \x20 done ) </dev/null >/dev/null 2>&1 &\n\
+             exec cat \"$d/$secret\"\n"
+        );
         helper
-            .write_all(
-                b"#!/bin/sh\nd=$(dirname \"$0\")\ncase \"$1\" in\n\"Enter passphrase for key '\"*)\n  if [ -f \"$d/key_prompt\" ] && [ \"$1\" = \"$(cat \"$d/key_prompt\")\" ]; then exec cat \"$d/passphrase\"; fi\n  exit 1 ;;\nesac\nexec cat \"$d/password\"\n",
-            )
+            .write_all(script.as_bytes())
             .context("Could not prepare the SSH password")?;
         drop(helper);
         if let (Some(prompt), Some(_)) = (key_prompt, passphrase) {
@@ -126,7 +147,7 @@ impl Askpass {
                 .mode(0o600)
                 .open(askpass.dir.join("key_prompt"))
                 .context("Could not prepare the SSH password")?;
-            file.write_all(prompt.as_bytes())
+            file.write_all(prompt)
                 .context("Could not prepare the SSH password")?;
         }
         for (name, secret) in [(PASSWORD_PIPE, password), (PASSPHRASE_PIPE, passphrase)] {
@@ -230,6 +251,9 @@ fn remove_stale_askpass(ours: &std::path::Path) {
     }
 }
 
+/// How long the askpass helper waits for a secret that never comes; past the readiness deadline.
+const HELPER_LIMIT_SECS: u64 = if cfg!(test) { 10 } else { 60 };
+
 /// POSIX guarantees pipes at least 4 KiB of buffer.
 const MAX_PASSWORD_BYTES: usize = 1024;
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -264,22 +288,20 @@ fn key_path(key: &std::path::Path) -> String {
     }
 }
 
-/// ssh's prompt for the key's passphrase, word for word (it cuts the path at 100 bytes).
-fn key_prompt(key: &std::path::Path) -> Result<String> {
+/// ssh's prompt for the key's passphrase, byte for byte: its "%.100s" keeps the first 100
+/// bytes of the path it was given, even when that splits a character.
+fn key_prompt(key: &std::path::Path) -> Result<Vec<u8>> {
     let path = key_path(key);
     // ssh expands % tokens in key paths, so its prompt would name another path.
     anyhow::ensure!(
         !path.contains('%'),
         "A key with a passphrase needs a path without %."
     );
-    let mut end = path.len().min(100);
-    while !path.is_char_boundary(end) {
-        end -= 1;
-    }
-    Ok(format!(
-        "Enter passphrase for key '{}': ",
-        path.get(..end).unwrap_or_default()
-    ))
+    let bytes = path.as_bytes();
+    let mut prompt = b"Enter passphrase for key '".to_vec();
+    prompt.extend_from_slice(bytes.get(..bytes.len().min(100)).unwrap_or(bytes));
+    prompt.extend_from_slice(b"': ");
+    Ok(prompt)
 }
 
 fn ssh_arguments(settings: &SshSettings, control: &std::path::Path) -> Result<Vec<String>> {
@@ -631,7 +653,7 @@ mod tests {
                 .kill_on_drop(true);
             command
         };
-        let key_prompt = "Enter passphrase for key '/k/id': ";
+        let key_prompt: &[u8] = b"Enter passphrase for key '/k/id': ";
         let askpass =
             Askpass::create(Some("s3cret pass"), Some("key phrase"), Some(key_prompt)).unwrap();
         for name in [PASSWORD_PIPE, PASSPHRASE_PIPE] {
@@ -671,7 +693,10 @@ mod tests {
                 "{phishing}"
             );
         }
-        let passphrase = ask(&askpass, key_prompt).output().await.unwrap();
+        let passphrase = ask(&askpass, std::str::from_utf8(key_prompt).unwrap())
+            .output()
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&passphrase.stdout), "key phrase");
         // Asked a second time, the helper waits; dropping releases it with nothing.
         let second = ask(&askpass, "vboth@bastion's password: ").spawn().unwrap();
@@ -695,6 +720,34 @@ mod tests {
         .expect("an ask for a secret not given fails at once")
         .unwrap();
         assert!(!passphrase.status.success() && passphrase.stdout.is_empty());
+        drop(askpass);
+    }
+
+    #[tokio::test]
+    async fn test_a_helper_nobody_answers_gives_up() {
+        let _serial = ASKPASS_TESTS.lock().await;
+        let askpass = Askpass::create(Some("once"), None, None).unwrap();
+        let first = Command::new(askpass.program())
+            .arg("me@host's password: ")
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&first.stdout), "once");
+        // Nothing writes to the pipe again, as when Vilo exited; the helper ends by itself.
+        let started = Instant::now();
+        let second = tokio::time::timeout(
+            Duration::from_secs(HELPER_LIMIT_SECS + 10),
+            Command::new(askpass.program())
+                .arg("me@host's password: ")
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the helper gave up and closed its output")
+        .unwrap();
+        assert!(!second.status.success() && second.stdout.is_empty());
+        assert!(started.elapsed() >= Duration::from_secs(HELPER_LIMIT_SECS - 1));
         drop(askpass);
     }
 
@@ -740,17 +793,35 @@ mod tests {
     fn test_the_key_prompt_is_ssh_s_own_words() {
         assert_eq!(
             key_prompt(std::path::Path::new("/k/id")).unwrap(),
-            "Enter passphrase for key '/k/id': "
+            b"Enter passphrase for key '/k/id': "
         );
         let home = std::env::var("HOME").unwrap();
         assert_eq!(
             key_prompt(std::path::Path::new("~/.ssh/id")).unwrap(),
-            format!("Enter passphrase for key '{home}/.ssh/id': ")
+            format!("Enter passphrase for key '{home}/.ssh/id': ").into_bytes()
         );
+        // 1 + 2 * 80 bytes: ssh keeps exactly 100, splitting the 50th "é".
+        let long = format!("/{}", "é".repeat(80));
+        let mut expected = b"Enter passphrase for key '".to_vec();
+        expected.extend_from_slice(&long.as_bytes()[..100]);
+        expected.extend_from_slice(b"': ");
+        assert_eq!(key_prompt(std::path::Path::new(&long)).unwrap(), expected);
+        assert!(key_prompt(std::path::Path::new("/k/%d")).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_a_prompt_cut_inside_a_character_still_matches() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let _serial = ASKPASS_TESTS.lock().await;
         let long = format!("/{}", "é".repeat(80));
         let prompt = key_prompt(std::path::Path::new(&long)).unwrap();
-        assert!(prompt.len() <= "Enter passphrase for key '': ".len() + 100);
-        assert!(key_prompt(std::path::Path::new("/k/%d")).is_err());
+        let askpass = Askpass::create(None, Some("key phrase"), Some(&prompt)).unwrap();
+        let answered = Command::new(askpass.program())
+            .arg(std::ffi::OsStr::from_bytes(&prompt))
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&answered.stdout), "key phrase");
     }
 
     #[test]
@@ -912,6 +983,27 @@ mod tests {
         let (reached, _) =
             reaches(settings(&key_address, &key_user, None, Some(&passphrase))).await;
         assert!(reached, "the passphrase unlocks the key");
+        // The same key at a path ssh cuts inside a character in its prompt.
+        let long_dir = std::env::temp_dir().join(format!(
+            "vilo-key-{}-{}",
+            std::process::id(),
+            "é".repeat(60)
+        ));
+        std::fs::create_dir_all(&long_dir).unwrap();
+        let long_key = long_dir.join("id");
+        std::fs::copy(&locked_key, &long_key).unwrap();
+        let mut at_long_path = settings(&key_address, &key_user, None, Some(&passphrase));
+        at_long_path.key_file = Some(long_key.clone());
+        let (reached, _) = reaches(at_long_path).await;
+        std::fs::remove_dir_all(&long_dir).unwrap();
+        assert!(
+            key_path(&long_key).len() > 100,
+            "the path is long enough to be cut"
+        );
+        assert!(
+            reached,
+            "the passphrase is given for a key at a path ssh cuts"
+        );
         let (reached, took) = reaches(settings(&key_address, &key_user, None, None)).await;
         assert!(
             !reached && took < Duration::from_secs(15),
