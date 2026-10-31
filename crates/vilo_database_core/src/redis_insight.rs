@@ -121,20 +121,27 @@ pub fn parse_export(content: &str) -> Result<Vec<Imported>> {
 fn import_one(item: &Value) -> Result<Imported> {
     anyhow::ensure!(item.is_object(), "it is not an object");
     let host = text(item, &["host"]).context("it has no host")?;
-    let port = number(item, &["port"]).unwrap_or(6379);
-    let port = u16::try_from(port)
-        .ok()
-        .filter(|port| *port > 0)
-        .context("its port is not valid")?;
+    // A field that is there must be valid; only one that is absent (or null, as RedisInsight
+    // writes unset fields) takes its default.
+    let given = |name: &str| item.get(name).is_some_and(|value| !value.is_null());
+    let port = if given("port") {
+        number(item, &["port"])
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port > 0)
+            .context("its port is not a number from 1 to 65535")?
+    } else {
+        6379
+    };
     let name = text(item, &["name", "connectionName"]).unwrap_or_else(|| format!("{host}:{port}"));
     let username = text(item, &["username"]);
     let password = text(item, &["password", "auth"]);
     // Only an absent database means 0; one given must be a database Vilo can open.
-    let database = match field(item, &["db"]) {
-        None => 0,
-        Some(_) => number(item, &["db"])
+    let database = if given("db") {
+        number(item, &["db"])
             .and_then(|database| u8::try_from(database).ok())
-            .context("its database is not a number from 0 to 255")?,
+            .context("its database is not a number from 0 to 255")?
+    } else {
+        0
     };
     let sentinel_master = text(
         item,
@@ -733,6 +740,11 @@ mod tests {
             );
             assert_eq!(url.port(), Some(6380));
         }
+        let nulls = parse_export(r#"[{"host":"h","port":null,"db":null}]"#).unwrap();
+        assert_eq!(
+            nulls[0].uri, "redis://h:6379",
+            "null is how RedisInsight writes unset fields"
+        );
         let unnamed = parse_export(r#"[{"host":"h"}]"#).unwrap();
         assert_eq!(
             (unnamed[0].name.as_str(), unnamed[0].uri.as_str()),
@@ -749,6 +761,11 @@ mod tests {
             r#"[{"host":"h","db":1.5}]"#,
             r#"[{"host":"h","db":256}]"#,
             r#"[{"host":"h","db":"two"}]"#,
+            r#"[{"host":"h","db":""}]"#,
+            r#"[{"host":"h","port":-1,"password":"secret"}]"#,
+            r#"[{"host":"h","port":1.5}]"#,
+            r#"[{"host":"h","port":"invalid"}]"#,
+            r#"[{"host":"h","port":""}]"#,
         ] {
             assert!(parse_export(bad).is_err(), "{bad}");
         }
